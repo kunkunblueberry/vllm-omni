@@ -487,6 +487,36 @@ class TestFullPayloadSendWithCustomFunc(unittest.TestCase):
         self.assertEqual(host._pending_full_payload_send, {})
         host.shutdown_omni_connectors()
 
+    def test_finalize_keeps_active_payload_while_other_requests_finish(self):
+        """Concurrent completion must not release an active request's payload."""
+        host = MixinHost()
+        host.init_omni_connectors(model_config=_make_model_config())
+        host._stage_id = 0
+        host.send_full_payload_outputs = MagicMock()
+        host._pending_full_payload_send.update(
+            {
+                "active": ({"hidden": torch.ones(1, 2)}, object()),
+                "complete-a": ({"hidden": torch.ones(1, 2)}, object()),
+                "complete-b": ({"hidden": torch.ones(1, 2)}, object()),
+                "aborted": ({"hidden": torch.ones(1, 2)}, object()),
+            }
+        )
+        requests = {
+            "active": SimpleNamespace(status=SimpleNamespace(name="WAITING")),
+            "complete-a": SimpleNamespace(status=SimpleNamespace(name="FINISHED_STOPPED")),
+            "complete-b": SimpleNamespace(status=SimpleNamespace(name="FINISHED_LENGTH_CAPPED")),
+            "aborted": SimpleNamespace(status=SimpleNamespace(name="FINISHED_ABORTED")),
+        }
+
+        host.finalize_full_payload_outputs({"complete-a", "complete-b", "aborted"}, requests)
+
+        self.assertEqual(
+            set(host.send_full_payload_outputs.call_args.kwargs["outputs"]),
+            {"complete-a", "complete-b"},
+        )
+        self.assertEqual(set(host._pending_full_payload_send), {"active"})
+        host.shutdown_omni_connectors()
+
 
 class TestKVSentReqIdsAccumulation(unittest.TestCase):
     """Test that kv_sent_req_ids accumulates results from send_kv_cache."""
