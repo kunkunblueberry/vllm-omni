@@ -12,6 +12,7 @@ set -euo pipefail
 REPO_ROOT="${REPO_ROOT:-$(git rev-parse --show-toplevel)}"
 PYTHON_BIN="${PYTHON_BIN:-/data/vllm-workspace/.venv/bin/python}"
 MODEL="${MODEL:-/data/vllm-workspace/models/MammothModa2-Preview}"
+DRIVER_SCRIPT="$REPO_ROOT/examples/offline_inference/text_to_image/text_to_image.py"
 PHASE1_COMMIT="${PHASE1_COMMIT:-$(git -C "$REPO_ROOT" log --format=%H --fixed-strings --grep='Optimize MammothModa2 request-end AR to DiT payload' -1)}"
 if [[ -z "$PHASE1_COMMIT" ]]; then
     echo "Set PHASE1_COMMIT or BASE_COMMIT: the Phase 1 implementation commit was not found." >&2
@@ -23,9 +24,21 @@ PROMPT="${PROMPT:-A small red cabin beside a quiet mountain lake at sunrise}"
 PROFILE_BACKEND="${PROFILE_BACKEND:-none}"
 PAYLOAD_STATS="${VLLM_OMNI_MAMMOTH_MODA2_PAYLOAD_STATS:-0}"
 REQUIRE_IDLE_GPUS="${REQUIRE_IDLE_GPUS:-1}"
+WARMUP_RUNS="${WARMUP_RUNS:-1}"
+MEASURED_RUNS="${MEASURED_RUNS:-5}"
 
 if [[ ! -x "$PYTHON_BIN" ]]; then
     echo "Python executable not found: $PYTHON_BIN" >&2
+    exit 1
+fi
+
+if [[ ! -f "$DRIVER_SCRIPT" ]]; then
+    echo "Repeated-run driver not found: $DRIVER_SCRIPT" >&2
+    exit 1
+fi
+
+if ! [[ "$WARMUP_RUNS" =~ ^[0-9]+$ ]] || ! [[ "$MEASURED_RUNS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "WARMUP_RUNS must be non-negative and MEASURED_RUNS must be positive." >&2
     exit 1
 fi
 
@@ -161,7 +174,9 @@ run_case() {
     local -a command=(
         env "CUDA_VISIBLE_DEVICES=0,1" "PYTHONPATH=$checkout" \
         "VLLM_OMNI_MAMMOTH_MODA2_PAYLOAD_STATS=$PAYLOAD_STATS" "$PYTHON_BIN"
-        "$checkout/examples/offline_inference/text_to_image/text_to_image.py"
+        # The current driver owns repeated same-engine measurement. PYTHONPATH
+        # selects the baseline or optimized implementation under test.
+        "$DRIVER_SCRIPT"
         --model "$MODEL"
         --deploy-config "$deploy_config"
         --prompt "$PROMPT"
@@ -169,6 +184,8 @@ run_case() {
         --num-inference-steps 20
         --guidance-scale 4.0
         --seed 42
+        --num-warmups "$WARMUP_RUNS"
+        --num-runs "$MEASURED_RUNS"
         --output "$output"
     )
 
@@ -223,10 +240,8 @@ fi
 git -C "$REPO_ROOT" rev-parse HEAD > "$RESULTS_DIR/optimized_commit.txt"
 git -C "$BASE_WORKTREE" rev-parse HEAD > "$RESULTS_DIR/baseline_commit.txt"
 
-# Warmups populate Triton caches. They are excluded from comparison artifacts.
-run_case baseline "$BASE_WORKTREE" warmup
-run_case optimized "$REPO_ROOT" warmup
-
+# Each invocation creates one engine, warms it in-process, and then collects
+# repeated timed requests. Do not add a separate process-level warmup here.
 run_case baseline "$BASE_WORKTREE" profile
 run_case optimized "$REPO_ROOT" profile
 
@@ -260,6 +275,42 @@ for label in baseline optimized; do
         done
     fi
 done
+
+"$PYTHON_BIN" - "$RESULTS_DIR" <<'PY'
+import json
+from pathlib import Path
+import re
+import sys
+
+results_dir = Path(sys.argv[1])
+time_re = re.compile(r"Total generation time: [^(]+\(([0-9.]+) ms\) \[run (\d+)/(\d+)\]")
+stage_prefix = "Stage timing summary: "
+
+def percentile(values, q):
+    values = sorted(values)
+    index = (len(values) - 1) * q
+    low, high = int(index), min(int(index) + 1, len(values) - 1)
+    return values[low] + (values[high] - values[low]) * (index - low)
+
+for label in ("baseline", "optimized"):
+    log_path = results_dir / f"{label}_profile.log"
+    lines = log_path.read_text(errors="replace").splitlines()
+    samples = [float(match.group(1)) for line in lines if (match := time_re.search(line))]
+    stage_summaries = [json.loads(line[len(stage_prefix):]) for line in lines if line.startswith(stage_prefix)]
+    if not samples:
+        raise SystemExit(f"No timed samples found in {log_path}")
+    if len(samples) != len(stage_summaries):
+        raise SystemExit(f"Timed sample/stage summary mismatch in {log_path}: {len(samples)} != {len(stage_summaries)}")
+    summary = {
+        "sample_count": len(samples),
+        "e2e_ms": {"min": min(samples), "p50": percentile(samples, 0.5), "p95": percentile(samples, 0.95), "max": max(samples)},
+        "samples_ms": samples,
+        "stage_summaries": stage_summaries,
+    }
+    output = results_dir / f"{label}_latency_summary.json"
+    output.write_text(json.dumps(summary, indent=2) + "\n")
+    print(f"[{label}] samples={len(samples)} p50={summary['e2e_ms']['p50']:.2f}ms p95={summary['e2e_ms']['p95']:.2f}ms")
+PY
 
 if [[ "$PROFILE_BACKEND" == "torch" ]]; then
 "$PYTHON_BIN" - "$RESULTS_DIR" <<'PY'

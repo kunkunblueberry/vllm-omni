@@ -80,6 +80,28 @@ def _normalize_images_for_save(images: list[Any]) -> list[Any]:
     return normalized
 
 
+def _stage_timing_summary(outputs: list[Any]) -> dict[str, dict[str, float]]:
+    """Extract stable per-stage timings for repeated offline measurements."""
+    for output in outputs:
+        metrics = getattr(output, "metrics", None)
+        stage_metrics = metrics.get("stage_metrics") if isinstance(metrics, dict) else None
+        if not isinstance(stage_metrics, dict):
+            continue
+        summary: dict[str, dict[str, float]] = {}
+        for stage_id, stage_metric in stage_metrics.items():
+            if not isinstance(stage_metric, dict):
+                continue
+            values = {
+                name: float(stage_metric[name])
+                for name in ("stage_gen_time_ms", "serving_time_to_first_output_ms", "image_time_to_first_output_ms")
+                if isinstance(stage_metric.get(name), (int, float))
+            }
+            if values:
+                summary[str(stage_id)] = values
+        return summary
+    return {}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate an image with supported diffusion models.")
     parser.add_argument(
@@ -139,6 +161,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=50,
         help="Number of denoising steps for the diffusion sampler.",
+    )
+    parser.add_argument(
+        "--num-warmups",
+        type=int,
+        default=0,
+        help="Number of untimed requests to run after engine initialization.",
+    )
+    parser.add_argument(
+        "--num-runs",
+        type=int,
+        default=1,
+        help="Number of timed requests to run on the same initialized engine.",
     )
     parser.add_argument(
         "--cache-backend",
@@ -383,6 +417,10 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
+    if args.num_warmups < 0:
+        raise ValueError("--num-warmups must be non-negative")
+    if args.num_runs < 1:
+        raise ValueError("--num-runs must be at least 1")
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
     use_nextstep = is_nextstep_model(args.model)
 
@@ -525,8 +563,6 @@ def main():
             lora_path=lora_path,
         )
 
-    generation_start = time.perf_counter()
-
     prompt_dict = build_text_to_image_prompt(
         prompt=args.prompt,
         negative_prompt=args.negative_prompt,
@@ -613,13 +649,25 @@ def main():
     if not diffusion_replaced and len(sampling_params_list) == 1:
         sampling_params_list = [diffusion_params]
 
-    outputs = omni.generate(prompt_dict, sampling_params_list=sampling_params_list)
+    if args.num_warmups:
+        print(f"Running {args.num_warmups} untimed warmup request(s)...")
+        for _ in range(args.num_warmups):
+            omni.generate(prompt_dict, sampling_params_list=sampling_params_list, use_tqdm=False)
 
-    generation_end = time.perf_counter()
-    generation_time = generation_end - generation_start
-
-    # Print profiling results
-    print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
+    outputs = None
+    for run_idx in range(args.num_runs):
+        generation_start = time.perf_counter()
+        outputs = omni.generate(
+            prompt_dict,
+            sampling_params_list=sampling_params_list,
+            use_tqdm=args.num_runs == 1,
+        )
+        generation_time = time.perf_counter() - generation_start
+        print(
+            f"Total generation time: {generation_time:.4f} seconds "
+            f"({generation_time * 1000:.2f} ms) [run {run_idx + 1}/{args.num_runs}]"
+        )
+        print(f"Stage timing summary: {json.dumps(_stage_timing_summary(outputs), sort_keys=True)}")
 
     if profiler_enabled:
         print("\n[Profiler] Stopping profiler and collecting results...")
