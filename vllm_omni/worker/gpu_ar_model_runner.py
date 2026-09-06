@@ -945,11 +945,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             for request in getattr(scheduler_output, "pending_input_registrations", []):
                 self.register_chunk_recv(request)
             self.recv_full_payload_inputs(scheduler_output)
-            if self._pending_full_payload_send:
-                flush_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
-                flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in self.requests})
-                if flush_ids:
-                    self.flush_full_payload_outputs(flush_ids)
+            self.finalize_full_payload_outputs(
+                set(getattr(scheduler_output, "finished_req_ids", set())),
+                self.requests,
+            )
 
         if self.omni_prefix_cache is not None and scheduler_output.finished_req_ids:
             self.omni_prefix_cache.commit_deferred_mm_outputs(
@@ -1968,7 +1967,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 for i, rid in enumerate(req_ids_output_copy):
                     req_state = self.requests.get(rid)
                     if req_state is not None and pooler_inter[i]:
-                        self.accumulate_full_payload_output(rid, pooler_inter[i], req_state)
+                        self.accumulate_full_payload_output(
+                            rid,
+                            pooler_inter[i],
+                            req_state,
+                            token_start=int(getattr(req_state, "num_computed_tokens", 0)),
+                        )
 
         with record_function_or_nullcontext("omni_output_builder:build_multimodal_outputs"):
             inter_stage_outputs, multimodal_outputs = self._build_omni_step_outputs(

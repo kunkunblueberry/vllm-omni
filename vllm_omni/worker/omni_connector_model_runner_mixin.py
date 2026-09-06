@@ -289,29 +289,11 @@ class OmniConnectorModelRunnerMixin:
         saves is added to ``_deferred_send_cleanup`` so the bg save's
         decrement path drains it without leaving orphans.
         """
-        # Force-flush any pending full-payload accumulator entry before
-        # cleanup proceeds.  Without this, finished requests with no
-        # downstream consumer (e.g. text-only on multi-modal arch) leave
-        # the entry orphaned in _pending_full_payload_send across requests,
-        # which empirically destabilises subsequent thinker forwards by
-        # making prefix-cache reuse observe stale accumulator state.  The
-        # flush is idempotent when the entry has already been flushed by the
-        # scheduler-driven path, but this cleanup path runs for every request,
-        # so skip it entirely when the request never accumulated a payload.
-        if req_id in self._pending_full_payload_send:
-            try:
-                self.flush_full_payload_outputs({req_id})
-            except Exception:
-                # Cleanup must still proceed regardless of flush errors here --
-                # we already gated on ``_omni_connector_initialized`` upstream,
-                # so any exception here reflects a real connector-side issue
-                # (shared memory corruption, background thread crash) worth
-                # surfacing rather than silently swallowing.
-                logger.warning(
-                    "flush_full_payload_outputs(%s) raised during cleanup; continuing tear-down.",
-                    req_id,
-                    exc_info=True,
-                )
+        # The runner flushes only successfully completed full payloads before
+        # request teardown. Cleanup is the terminal fallback, so it must drop
+        # rather than send any residual entry: an aborted request must never
+        # start downstream generation from a partial AR trajectory.
+        self._pending_full_payload_send.pop(req_id, None)
 
         ext_id = self._request_ids_mapping.pop(req_id, None)
         keys_to_clean: list[str] = [req_id]
@@ -895,11 +877,64 @@ class OmniConnectorModelRunnerMixin:
         )
         return self._full_payload_replace_keys_cached
 
+    def _resolve_full_payload_positional_keys(self) -> frozenset:
+        """Return model-declared tensors whose rows map to AR token positions."""
+        cached = getattr(self, "_full_payload_positional_keys_cached", None)
+        if cached is not None:
+            return cached
+        proc = getattr(self, "_custom_process_func", None)
+        module_name = getattr(proc, "__module__", None)
+        if module_name is None:
+            self._full_payload_positional_keys_cached = frozenset()
+            return self._full_payload_positional_keys_cached
+        try:
+            import sys as _sys
+
+            mod = _sys.modules.get(module_name) or importlib.import_module(module_name)
+            keys = getattr(mod, "_FULL_PAYLOAD_POSITIONAL_KEYS", frozenset())
+        except ImportError:
+            logger.debug(
+                "Could not import stage input processor module %s while resolving positional payload keys.",
+                module_name,
+                exc_info=True,
+            )
+            keys = frozenset()
+        if not isinstance(keys, (frozenset, set)):
+            logger.warning("Ignoring non-set _FULL_PAYLOAD_POSITIONAL_KEYS from %s", module_name)
+            keys = frozenset()
+        self._full_payload_positional_keys_cached = frozenset(keys)
+        return self._full_payload_positional_keys_cached
+
+    @staticmethod
+    def _truncate_full_payload_chunks(
+        chunks: dict[str, list[torch.Tensor]],
+        rows: dict[str, int],
+        positional_keys: frozenset,
+        token_start: int,
+    ) -> None:
+        """Discard positional rows that will be recomputed after a resume."""
+        for key in positional_keys:
+            tensors = chunks.get(key)
+            current_rows = rows.get(key, 0)
+            if not tensors or token_start >= current_rows:
+                continue
+            retained: list[torch.Tensor] = []
+            remaining = token_start
+            for tensor in tensors:
+                if remaining <= 0:
+                    break
+                keep = min(remaining, int(tensor.shape[0]))
+                retained.append(tensor[:keep])
+                remaining -= keep
+            chunks[key] = retained
+            rows[key] = token_start
+
     def accumulate_full_payload_output(
         self,
         req_id: str,
         pooler_output: Any,
         request: Any,
+        token_start: int | None = None,
     ) -> None:
         """Accumulate pooler_output for a request across steps (full_payload_mode).
 
@@ -914,8 +949,10 @@ class OmniConnectorModelRunnerMixin:
         sender-side ``t.any()`` scan also avoids a per-tensor GPU->CPU device
         sync that stalled the decode pipeline.
 
-        The data is actually sent when ``flush_full_payload_outputs`` is called
-        with the finished request IDs from the next scheduler cycle.
+        ``token_start`` is the scheduled global token offset for model-declared
+        positional tensors. On preemption/resume, vLLM can recompute a prefix;
+        any overlapping accumulated rows are discarded before the replacement
+        slice is appended. The data is sent only for successful completion.
         """
         replace_keys = self._resolve_full_payload_replace_keys()
         existing = self._pending_full_payload_send.get(req_id)
@@ -929,6 +966,14 @@ class OmniConnectorModelRunnerMixin:
             chunks, latest, rows = self._new_full_payload_accumulator(existing[0])
         else:
             chunks, latest, rows, _ = existing
+
+        if token_start is not None:
+            self._truncate_full_payload_chunks(
+                chunks,
+                rows,
+                self._resolve_full_payload_positional_keys(),
+                token_start,
+            )
 
         for k, v in pooler_output.items():
             if v is None:
@@ -960,6 +1005,31 @@ class OmniConnectorModelRunnerMixin:
                 latest[k] = v
 
         self._pending_full_payload_send[req_id] = (chunks, latest, rows, request)
+
+    @staticmethod
+    def _full_payload_request_is_aborted(request: Any) -> bool:
+        status = getattr(request, "status", None)
+        status_name = getattr(status, "name", str(status))
+        return status_name in {"FINISHED_ABORTED", "FINISHED_ERROR"}
+
+    def finalize_full_payload_outputs(self, finished_req_ids: set[str], requests: dict[str, Any]) -> None:
+        """Flush normal completion and discard aborted or orphaned payloads."""
+        pending_req_ids = set(self._pending_full_payload_send)
+        if not pending_req_ids:
+            return
+        finished_req_ids = set(finished_req_ids)
+        aborted_req_ids = {
+            req_id
+            for req_id in finished_req_ids
+            if (request := requests.get(req_id)) is None or self._full_payload_request_is_aborted(request)
+        }
+        completed_req_ids = finished_req_ids - aborted_req_ids
+        stale_req_ids = pending_req_ids - set(requests)
+        discard_req_ids = aborted_req_ids | stale_req_ids
+        for req_id in discard_req_ids:
+            self._pending_full_payload_send.pop(req_id, None)
+        if completed_req_ids:
+            self.flush_full_payload_outputs(completed_req_ids)
 
     def flush_full_payload_outputs(self, finished_req_ids: set[str]) -> None:
         """Send accumulated full_payload outputs for requests that just finished."""

@@ -463,6 +463,30 @@ class TestFullPayloadSendWithCustomFunc(unittest.TestCase):
         time.sleep(0.1)
         host.shutdown_omni_connectors()
 
+    def test_finalize_sends_only_success_and_discards_error_or_orphan(self):
+        """Terminal status must be resolved before full-payload delivery."""
+        host = MixinHost()
+        host.init_omni_connectors(model_config=_make_model_config())
+        host._stage_id = 0
+        host.send_full_payload_outputs = MagicMock()
+        host._pending_full_payload_send.update(
+            {
+                "complete": ({"hidden": torch.ones(1, 2)}, object()),
+                "error": ({"hidden": torch.ones(1, 2)}, object()),
+                "orphan": ({"hidden": torch.ones(1, 2)}, object()),
+            }
+        )
+        requests = {
+            "complete": SimpleNamespace(status=SimpleNamespace(name="FINISHED_STOPPED")),
+            "error": SimpleNamespace(status=SimpleNamespace(name="FINISHED_ERROR")),
+        }
+
+        host.finalize_full_payload_outputs({"complete", "error"}, requests)
+
+        self.assertEqual(set(host.send_full_payload_outputs.call_args.kwargs["outputs"]), {"complete"})
+        self.assertEqual(host._pending_full_payload_send, {})
+        host.shutdown_omni_connectors()
+
 
 class TestKVSentReqIdsAccumulation(unittest.TestCase):
     """Test that kv_sent_req_ids accumulates results from send_kv_cache."""
@@ -683,6 +707,18 @@ class TestCleanupFinishedRequest(unittest.TestCase):
         self.assertNotIn(req_id, host._get_req_chunk)
         self.assertNotIn(req_id, host._cached_ic)
 
+        host.shutdown_omni_connectors()
+
+    def test_cleanup_discards_residual_full_payload_without_sending(self):
+        """Terminal cleanup must not deliver a cancelled partial AR payload."""
+        host = self._make_host(stage_id=0)
+        host._pending_full_payload_send["req-1"] = ({"hidden": torch.ones(1, 2)}, object())
+        host.send_full_payload_outputs = MagicMock()
+
+        host.cleanup_finished_request("req-1")
+
+        self.assertNotIn("req-1", host._pending_full_payload_send)
+        host.send_full_payload_outputs.assert_not_called()
         host.shutdown_omni_connectors()
 
     def test_deferred_cleanup_removes_cached_ic(self):

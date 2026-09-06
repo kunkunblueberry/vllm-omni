@@ -2,9 +2,10 @@
 # Compare MammothModa2's pre-Phase-1 payload path with the request-end path.
 # Run from the optimized checkout on a two-GPU host.
 #
-# PROFILE_BACKEND=torch (default) writes child-worker PyTorch traces and reports
-# stage-0 aten::to call counts. PROFILE_BACKEND=nsys performs a separate Nsight
-# Systems run. Never enable both in one process tree: both subscribe to CUPTI.
+# PROFILE_BACKEND=none (default) performs a clean latency comparison.
+# PROFILE_BACKEND=torch writes child-worker PyTorch traces and reports stage-0
+# aten::to call counts. PROFILE_BACKEND=nsys performs a separate Nsight Systems
+# run. Never enable torch and nsys in one process tree: both subscribe to CUPTI.
 
 set -euo pipefail
 
@@ -19,7 +20,7 @@ fi
 BASE_COMMIT="${BASE_COMMIT:-${PHASE1_COMMIT}^}"
 RESULTS_DIR="${RESULTS_DIR:-$REPO_ROOT/results/mammoth_moda2_phase1_$(date +%Y%m%d_%H%M%S)}"
 PROMPT="${PROMPT:-A small red cabin beside a quiet mountain lake at sunrise}"
-PROFILE_BACKEND="${PROFILE_BACKEND:-torch}"
+PROFILE_BACKEND="${PROFILE_BACKEND:-none}"
 PAYLOAD_STATS="${VLLM_OMNI_MAMMOTH_MODA2_PAYLOAD_STATS:-0}"
 REQUIRE_IDLE_GPUS="${REQUIRE_IDLE_GPUS:-1}"
 
@@ -28,8 +29,8 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
     exit 1
 fi
 
-if [[ "$PROFILE_BACKEND" != "torch" && "$PROFILE_BACKEND" != "nsys" ]]; then
-    echo "PROFILE_BACKEND must be 'torch' or 'nsys', got: $PROFILE_BACKEND" >&2
+if [[ "$PROFILE_BACKEND" != "none" && "$PROFILE_BACKEND" != "torch" && "$PROFILE_BACKEND" != "nsys" ]]; then
+    echo "PROFILE_BACKEND must be 'none', 'torch', or 'nsys', got: $PROFILE_BACKEND" >&2
     exit 1
 fi
 
@@ -216,7 +217,7 @@ else
         echo "PROFILE_BACKEND=nsys requires an nsys executable on PATH." >&2
         exit 1
     fi
-    echo "PROFILE_BACKEND=torch; Nsight is intentionally disabled." | tee "$RESULTS_DIR/nsys_version.txt"
+    echo "PROFILE_BACKEND=$PROFILE_BACKEND; Nsight is intentionally disabled." | tee "$RESULTS_DIR/nsys_version.txt"
 fi
 
 git -C "$REPO_ROOT" rev-parse HEAD > "$RESULTS_DIR/optimized_commit.txt"
@@ -286,7 +287,7 @@ for label in ("baseline", "optimized"):
     summary.write_text("\n".join(lines) + "\n")
     print(f"[{label}] " + ", ".join(lines))
 PY
-else
+elif [[ "$PROFILE_BACKEND" == "nsys" ]]; then
 "$PYTHON_BIN" "$NSYS_ANALYZER" "$RESULTS_DIR"
 fi
 

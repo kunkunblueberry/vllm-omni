@@ -17,6 +17,11 @@ from vllm_omni.model_executor.models.mammoth_moda2.conditioning import (
 
 logger = init_logger(__name__)
 
+# Request-end replay reconciliation applies only to tensors whose rows map
+# one-to-one to scheduled AR token positions. Mammoth sends ``hidden`` this way;
+# sampling metadata remains latest-value state in the generic accumulator.
+_FULL_PAYLOAD_POSITIONAL_KEYS = frozenset({"hidden"})
+
 
 @contextmanager
 def _mammoth_nvtx_range(name: str):

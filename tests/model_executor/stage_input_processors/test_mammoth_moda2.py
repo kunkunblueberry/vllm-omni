@@ -71,6 +71,88 @@ def _accumulate_hidden_slices(slices: list[torch.Tensor]) -> torch.Tensor:
     return output["hidden"]
 
 
+def _full_payload_runner() -> OmniConnectorModelRunnerMixin:
+    runner = object.__new__(OmniConnectorModelRunnerMixin)
+    runner._custom_process_func = ar2dit_full_payload
+    runner._pending_full_payload_send = {}
+    runner._stage_id = 0
+    return runner
+
+
+def test_full_payload_resume_replaces_recomputed_mammoth_hidden_rows():
+    """A preemption replay must replace overlapping AR rows, not append them."""
+    runner = _full_payload_runner()
+    request = SimpleNamespace(output_token_ids=[])
+
+    OmniConnectorModelRunnerMixin.accumulate_full_payload_output(
+        runner,
+        "r1",
+        {"hidden": torch.tensor([[0.0], [1.0], [2.0]])},
+        request,
+        token_start=0,
+    )
+    OmniConnectorModelRunnerMixin.accumulate_full_payload_output(
+        runner,
+        "r1",
+        {"hidden": torch.tensor([[3.0], [4.0]])},
+        request,
+        token_start=3,
+    )
+
+    # Resume from preemption and replay the same five positions with new
+    # snapshots. The old append-only behavior produced nine rows here.
+    OmniConnectorModelRunnerMixin.accumulate_full_payload_output(
+        runner,
+        "r1",
+        {"hidden": torch.tensor([[10.0], [11.0], [12.0]])},
+        request,
+        token_start=0,
+    )
+    OmniConnectorModelRunnerMixin.accumulate_full_payload_output(
+        runner,
+        "r1",
+        {"hidden": torch.tensor([[13.0], [14.0]])},
+        request,
+        token_start=3,
+    )
+
+    output, _ = OmniConnectorModelRunnerMixin._materialize_full_payload_entry(
+        runner._pending_full_payload_send["r1"]
+    )
+    assert torch.equal(
+        output["hidden"],
+        torch.tensor([[10.0], [11.0], [12.0], [13.0], [14.0]]),
+    )
+
+
+def test_full_payload_abort_discards_retained_hidden_without_downstream_send():
+    """Cancellation releases retained AR state and never sends a partial payload."""
+    runner = _full_payload_runner()
+    request = SimpleNamespace(output_token_ids=[])
+    sent = {}
+    runner.send_full_payload_outputs = lambda *, scheduler_output, outputs: sent.update(  # type: ignore[method-assign]
+        outputs
+    )
+
+    for req_id in ("complete", "aborted"):
+        OmniConnectorModelRunnerMixin.accumulate_full_payload_output(
+            runner,
+            req_id,
+            {"hidden": torch.tensor([[1.0]])},
+            request,
+            token_start=0,
+        )
+
+    requests = {
+        "complete": SimpleNamespace(status=SimpleNamespace(name="FINISHED_STOPPED")),
+        "aborted": SimpleNamespace(status=SimpleNamespace(name="FINISHED_ABORTED")),
+    }
+    OmniConnectorModelRunnerMixin.finalize_full_payload_outputs(runner, set(requests), requests)
+
+    assert set(sent) == {"complete"}
+    assert runner._pending_full_payload_send == {}
+
+
 def test_ar2dit_full_payload_selects_bf16_conditions_before_one_time_d2h():
     """Device-resident slices -> selected BF16 conditions -> one request-end D2H."""
     device = "cuda" if torch.cuda.is_available() else "cpu"

@@ -500,7 +500,9 @@ def test_build_omni_output_uses_snapshots_and_connector_after_accumulation(monke
     monkeypatch.setattr(
         GPUARModelRunner,
         "accumulate_full_payload_output",
-        lambda self, rid, payload, request: events.append(f"accumulate:{rid}"),
+        lambda self, rid, payload, request, token_start=None: events.append(
+            f"accumulate:{rid}"
+        ),
     )
     monkeypatch.setattr(
         GPUARModelRunner,
@@ -650,6 +652,10 @@ def test_request_end_hidden_snapshot_keeps_device_tensor_in_accumulator(monkeypa
     """
     runner = _make_async_output_runner(engine_output_type="latent")
     runner.model = SimpleNamespace(has_postprocess=False, omni_payload_at_request_end=True)
+    runner.requests = {
+        "r1": SimpleNamespace(num_computed_tokens=7),
+        "r2": SimpleNamespace(num_computed_tokens=13),
+    }
     accumulated: dict[str, dict[str, torch.Tensor]] = {}
 
     monkeypatch.setattr(
@@ -667,7 +673,10 @@ def test_request_end_hidden_snapshot_keeps_device_tensor_in_accumulator(monkeypa
     monkeypatch.setattr(
         GPUARModelRunner,
         "accumulate_full_payload_output",
-        lambda self, rid, payload, request: accumulated.__setitem__(rid, payload),
+        lambda self, rid, payload, request, token_start: accumulated.__setitem__(
+            rid,
+            {**payload, "token_start": token_start},
+        ),
     )
     monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
     monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
@@ -702,6 +711,8 @@ def test_request_end_hidden_snapshot_keeps_device_tensor_in_accumulator(monkeypa
     # The accumulator received the per-request hidden slices on the input device.
     assert accumulated["r1"]["hidden"].device == hidden_buffer.device
     assert accumulated["r2"]["hidden"].device == hidden_buffer.device
+    assert accumulated["r1"]["token_start"] == 7
+    assert accumulated["r2"]["token_start"] == 13
     assert torch.equal(accumulated["r1"]["hidden"], torch.tensor([[1.0]]))
     assert torch.equal(accumulated["r2"]["hidden"], torch.tensor([[2.0], [3.0]]))
     if hidden_buffer.device.type == "cuda":
@@ -1079,7 +1090,7 @@ def test_build_omni_output_never_leaks_internal_pooler_output_on_wire(monkeypatc
     monkeypatch.setattr(
         GPUARModelRunner,
         "accumulate_full_payload_output",
-        lambda self, rid, payload, request: None,
+        lambda self, rid, payload, request, token_start=None: None,
     )
     monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
 
