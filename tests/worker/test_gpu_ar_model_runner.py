@@ -21,6 +21,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
+from vllm_omni.model_executor.stage_input_processors.mammoth_moda2 import ar2dit_full_payload
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker import gpu_ar_model_runner as gpu_ar_model_runner_module
 from vllm_omni.worker import sparse_audio
@@ -721,6 +722,80 @@ def test_request_end_hidden_snapshot_keeps_device_tensor_in_accumulator(monkeypa
         hidden_buffer[1:, 0] = 99.0
         assert torch.equal(accumulated["r1"]["hidden"], torch.tensor([[1.0]]))
         assert torch.equal(accumulated["r2"]["hidden"], torch.tensor([[2.0], [3.0]]))
+
+
+def test_request_end_hidden_snapshot_reconciles_scheduler_replay(monkeypatch):
+    """A preemption replay replaces rows through the runner snapshot bridge."""
+    runner = _make_async_output_runner(engine_output_type="latent")
+    runner.model = SimpleNamespace(has_postprocess=False, omni_payload_at_request_end=True)
+    runner.requests = {"r1": SimpleNamespace(num_computed_tokens=0)}
+    runner._custom_process_func = ar2dit_full_payload
+    runner._pending_full_payload_send = {}
+    runner._stage_id = 0
+
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "_resolve_pooler_payload_req_ids",
+        lambda self, req_ids: ("latent", req_ids),
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: True)
+    monkeypatch.setattr(GPUARModelRunner, "_should_defer_full_payload_d2h", lambda self: True)
+    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
+    monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
+
+    def snapshot(offset: int, hidden: torch.Tensor) -> OmniModelRunnerOutput:
+        runner.requests["r1"].num_computed_tokens = offset
+        return GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
+            runner,
+            scheduler_output=SimpleNamespace(
+                total_num_scheduled_tokens=hidden.shape[0],
+                num_scheduled_tokens={"r1": hidden.shape[0]},
+            ),
+            hidden_states=hidden,
+            staged_hidden_states_cpu=None,
+            multimodal_outputs={},
+            req_ids_output_copy=["r1"],
+            req_id_to_index_output_copy={"r1": 0},
+            valid_sampled_token_ids=[[]],
+            logprobs_lists=None,
+            prompt_logprobs_dict={},
+            num_nans_in_logits=None,
+            kv_connector_output=None,
+            ec_connector_output=None,
+            cudagraph_stats=None,
+            kv_extracted_req_ids=None,
+            num_scheduled_tokens_np=np.array([hidden.shape[0]], dtype=np.int32),
+            query_start_loc_cpu=torch.tensor([0], dtype=torch.long),
+        )
+
+    # The scheduler first advances to token position five. After preemption it
+    # restores the request at position zero and recomputes the same trajectory.
+    for offset, hidden in (
+        (0, torch.tensor([[0.0], [1.0], [2.0]])),
+        (3, torch.tensor([[3.0], [4.0]])),
+        (0, torch.tensor([[10.0], [11.0], [12.0]])),
+        (3, torch.tensor([[13.0], [14.0]])),
+    ):
+        output = snapshot(offset, hidden)
+        assert output.inter_stage_outputs is None
+
+    payload, _ = runner._materialize_full_payload_entry(runner._pending_full_payload_send["r1"])
+    assert torch.equal(
+        payload["hidden"],
+        torch.tensor([[10.0], [11.0], [12.0], [13.0], [14.0]]),
+    )
+
+
+def test_request_end_full_payload_defers_d2h_only_without_prefix_cache(monkeypatch):
+    """Prefix-cache mode retains its established per-step host staging path."""
+    runner = _make_async_output_runner(engine_output_type="latent")
+    runner.model = SimpleNamespace(omni_payload_at_request_end=True)
+    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: True)
+
+    assert GPUARModelRunner._should_defer_full_payload_d2h(runner)
+
+    runner.omni_prefix_cache = object()
+    assert not GPUARModelRunner._should_defer_full_payload_d2h(runner)
 
 
 def test_async_omni_output_guard_requires_safe_conditions():
