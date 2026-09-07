@@ -12,7 +12,6 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-
 STAGE_PID_RE = re.compile(r"StageEngineCoreProc_stage(?P<stage>\d+)_replica\d+ pid=(?P<pid>\d+)")
 STAGE_GPU_RE = re.compile(r"Stage (?P<stage>\d+) logical-to-physical device mapping: \d+->(?P<gpu>\d+)")
 DEVICE_MEMORY_KIND = 2

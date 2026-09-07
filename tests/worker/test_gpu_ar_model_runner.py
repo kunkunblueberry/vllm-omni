@@ -501,9 +501,7 @@ def test_build_omni_output_uses_snapshots_and_connector_after_accumulation(monke
     monkeypatch.setattr(
         GPUARModelRunner,
         "accumulate_full_payload_output",
-        lambda self, rid, payload, request, token_start=None: events.append(
-            f"accumulate:{rid}"
-        ),
+        lambda self, rid, payload, request, token_start=None: events.append(f"accumulate:{rid}"),
     )
     monkeypatch.setattr(
         GPUARModelRunner,

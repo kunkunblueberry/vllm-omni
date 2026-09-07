@@ -116,9 +116,7 @@ def test_full_payload_resume_replaces_recomputed_mammoth_hidden_rows():
         token_start=3,
     )
 
-    output, _ = OmniConnectorModelRunnerMixin._materialize_full_payload_entry(
-        runner._pending_full_payload_send["r1"]
-    )
+    output, _ = OmniConnectorModelRunnerMixin._materialize_full_payload_entry(runner._pending_full_payload_send["r1"])
     assert torch.equal(
         output["hidden"],
         torch.tensor([[10.0], [11.0], [12.0], [13.0], [14.0]]),
