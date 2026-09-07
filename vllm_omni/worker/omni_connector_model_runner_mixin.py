@@ -1007,29 +1007,37 @@ class OmniConnectorModelRunnerMixin:
         self._pending_full_payload_send[req_id] = (chunks, latest, rows, request)
 
     @staticmethod
-    def _full_payload_request_is_aborted(request: Any) -> bool:
+    def _full_payload_request_completed_successfully(request: Any) -> bool:
+        """Return whether a terminal AR status is safe to hand to the next stage.
+
+        A request-end payload is an all-or-nothing AR trajectory.  Conservatively
+        accept only the normal scheduler completion states.  In particular,
+        statuses such as ``FINISHED_IGNORED`` must not start downstream work from
+        an incomplete trajectory.
+        """
         status = getattr(request, "status", None)
         status_name = getattr(status, "name", str(status))
-        return status_name in {"FINISHED_ABORTED", "FINISHED_ERROR"}
+        return status_name in {"FINISHED_STOPPED", "FINISHED_LENGTH_CAPPED"}
 
     def finalize_full_payload_outputs(self, finished_req_ids: set[str], requests: dict[str, Any]) -> None:
-        """Flush normal completion and discard aborted or orphaned payloads."""
+        """Flush normal completion and discard all other terminal payloads."""
         pending_req_ids = set(self._pending_full_payload_send)
         if not pending_req_ids:
             return
         finished_req_ids = set(finished_req_ids)
-        aborted_req_ids = {
+        successful_req_ids = {
             req_id
             for req_id in finished_req_ids
-            if (request := requests.get(req_id)) is None or self._full_payload_request_is_aborted(request)
+            if (request := requests.get(req_id)) is not None
+            and self._full_payload_request_completed_successfully(request)
         }
-        completed_req_ids = finished_req_ids - aborted_req_ids
+        terminal_req_ids = finished_req_ids & pending_req_ids
         stale_req_ids = pending_req_ids - set(requests)
-        discard_req_ids = aborted_req_ids | stale_req_ids
+        discard_req_ids = (terminal_req_ids - successful_req_ids) | stale_req_ids
         for req_id in discard_req_ids:
             self._pending_full_payload_send.pop(req_id, None)
-        if completed_req_ids:
-            self.flush_full_payload_outputs(completed_req_ids)
+        if successful_req_ids:
+            self.flush_full_payload_outputs(successful_req_ids)
 
     def flush_full_payload_outputs(self, finished_req_ids: set[str]) -> None:
         """Send accumulated full_payload outputs for requests that just finished."""

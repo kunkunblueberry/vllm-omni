@@ -21,6 +21,8 @@ fi
 BASE_COMMIT="${BASE_COMMIT:-${PHASE1_COMMIT}^}"
 RESULTS_DIR="${RESULTS_DIR:-$REPO_ROOT/results/mammoth_moda2_phase1_$(date +%Y%m%d_%H%M%S)}"
 PROMPT="${PROMPT:-A small red cabin beside a quiet mountain lake at sunrise}"
+WIDTH="${WIDTH:-512}"
+HEIGHT="${HEIGHT:-512}"
 PROFILE_BACKEND="${PROFILE_BACKEND:-none}"
 PAYLOAD_STATS="${VLLM_OMNI_MAMMOTH_MODA2_PAYLOAD_STATS:-0}"
 REQUIRE_IDLE_GPUS="${REQUIRE_IDLE_GPUS:-1}"
@@ -39,6 +41,11 @@ fi
 
 if ! [[ "$WARMUP_RUNS" =~ ^[0-9]+$ ]] || ! [[ "$MEASURED_RUNS" =~ ^[1-9][0-9]*$ ]]; then
     echo "WARMUP_RUNS must be non-negative and MEASURED_RUNS must be positive." >&2
+    exit 1
+fi
+
+if ! [[ "$WIDTH" =~ ^[1-9][0-9]*$ ]] || ! [[ "$HEIGHT" =~ ^[1-9][0-9]*$ ]]; then
+    echo "WIDTH and HEIGHT must be positive integers." >&2
     exit 1
 fi
 
@@ -71,6 +78,14 @@ require_idle_gpus() {
 require_idle_gpus
 
 mkdir -p "$RESULTS_DIR"
+{
+    printf 'prompt=%s\n' "$PROMPT"
+    printf 'width=%s\n' "$WIDTH"
+    printf 'height=%s\n' "$HEIGHT"
+    printf 'warmup_runs=%s\n' "$WARMUP_RUNS"
+    printf 'measured_runs=%s\n' "$MEASURED_RUNS"
+    printf 'profile_backend=%s\n' "$PROFILE_BACKEND"
+} > "$RESULTS_DIR/run_config.txt"
 BASE_WORKTREE="$(mktemp -d /tmp/vllm-omni-mammoth-baseline.XXXXXX)"
 rmdir "$BASE_WORKTREE"
 
@@ -180,7 +195,7 @@ run_case() {
         --model "$MODEL"
         --deploy-config "$deploy_config"
         --prompt "$PROMPT"
-        --width 512 --height 512
+        --width "$WIDTH" --height "$HEIGHT"
         --num-inference-steps 20
         --guidance-scale 4.0
         --seed 42
@@ -292,6 +307,28 @@ def percentile(values, q):
     low, high = int(index), min(int(index) + 1, len(values) - 1)
     return values[low] + (values[high] - values[low]) * (index - low)
 
+def distribution(values):
+    return {
+        "min": min(values),
+        "p50": percentile(values, 0.5),
+        "p95": percentile(values, 0.95),
+        "max": max(values),
+    }
+
+def stage_timing_percentiles(stage_summaries):
+    aggregate = {}
+    for stage_summary in stage_summaries:
+        for stage_id, metrics in stage_summary.items():
+            for metric_name, value in metrics.items():
+                aggregate.setdefault(stage_id, {}).setdefault(metric_name, []).append(value)
+    return {
+        stage_id: {
+            metric_name: distribution(values)
+            for metric_name, values in sorted(metrics.items())
+        }
+        for stage_id, metrics in sorted(aggregate.items())
+    }
+
 for label in ("baseline", "optimized"):
     log_path = results_dir / f"{label}_profile.log"
     lines = log_path.read_text(errors="replace").splitlines()
@@ -303,9 +340,10 @@ for label in ("baseline", "optimized"):
         raise SystemExit(f"Timed sample/stage summary mismatch in {log_path}: {len(samples)} != {len(stage_summaries)}")
     summary = {
         "sample_count": len(samples),
-        "e2e_ms": {"min": min(samples), "p50": percentile(samples, 0.5), "p95": percentile(samples, 0.95), "max": max(samples)},
+        "e2e_ms": distribution(samples),
         "samples_ms": samples,
         "stage_summaries": stage_summaries,
+        "stage_timing_ms": stage_timing_percentiles(stage_summaries),
     }
     output = results_dir / f"{label}_latency_summary.json"
     output.write_text(json.dumps(summary, indent=2) + "\n")
@@ -321,9 +359,10 @@ import sys
 results_dir = Path(sys.argv[1])
 launch_counts = {}
 for label in ("baseline", "optimized"):
-    traces = sorted((results_dir / f"torch_{label}").rglob("*.json"))
-    traces.extend(sorted((results_dir / f"torch_{label}").rglob("*.json.gz")))
-    stage0_tables = sorted((results_dir / f"torch_{label}").glob("*_stage0_rank0_*/profiler_out_0.txt"))
+    trace_roots = sorted(results_dir.glob(f"torch_{label}_stage*"))
+    traces = [trace for root in trace_roots for trace in root.rglob("*.json")]
+    traces.extend(trace for root in trace_roots for trace in root.rglob("*.json.gz"))
+    stage0_tables = sorted((results_dir / f"torch_{label}_stage0").rglob("profiler_out_0.txt"))
     to_calls = None
     if len(stage0_tables) == 1:
         for line in stage0_tables[0].read_text(errors="replace").splitlines():

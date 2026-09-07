@@ -463,7 +463,7 @@ class TestFullPayloadSendWithCustomFunc(unittest.TestCase):
         time.sleep(0.1)
         host.shutdown_omni_connectors()
 
-    def test_finalize_sends_only_success_and_discards_error_or_orphan(self):
+    def test_finalize_sends_only_known_success_and_discards_terminal_failures(self):
         """Terminal status must be resolved before full-payload delivery."""
         host = MixinHost()
         host.init_omni_connectors(model_config=_make_model_config())
@@ -473,15 +473,17 @@ class TestFullPayloadSendWithCustomFunc(unittest.TestCase):
             {
                 "complete": ({"hidden": torch.ones(1, 2)}, object()),
                 "error": ({"hidden": torch.ones(1, 2)}, object()),
+                "ignored": ({"hidden": torch.ones(1, 2)}, object()),
                 "orphan": ({"hidden": torch.ones(1, 2)}, object()),
             }
         )
         requests = {
             "complete": SimpleNamespace(status=SimpleNamespace(name="FINISHED_STOPPED")),
             "error": SimpleNamespace(status=SimpleNamespace(name="FINISHED_ERROR")),
+            "ignored": SimpleNamespace(status=SimpleNamespace(name="FINISHED_IGNORED")),
         }
 
-        host.finalize_full_payload_outputs({"complete", "error"}, requests)
+        host.finalize_full_payload_outputs({"complete", "error", "ignored"}, requests)
 
         self.assertEqual(set(host.send_full_payload_outputs.call_args.kwargs["outputs"]), {"complete"})
         self.assertEqual(host._pending_full_payload_send, {})
@@ -515,6 +517,30 @@ class TestFullPayloadSendWithCustomFunc(unittest.TestCase):
             {"complete-a", "complete-b"},
         )
         self.assertEqual(set(host._pending_full_payload_send), {"active"})
+        host.shutdown_omni_connectors()
+
+    def test_replay_offset_is_a_noop_without_model_positional_opt_in(self):
+        """Models without positional keys retain the pre-existing append behavior."""
+        host = MixinHost()
+        host.init_omni_connectors(model_config=_make_model_config())
+        host._custom_process_func = lambda transfer_manager, pooling_output, request: pooling_output
+        request = _make_request("req-1")
+
+        host.accumulate_full_payload_output(
+            "req-1",
+            {"hidden": torch.tensor([[1.0], [2.0]])},
+            request,
+            token_start=0,
+        )
+        host.accumulate_full_payload_output(
+            "req-1",
+            {"hidden": torch.tensor([[3.0]])},
+            request,
+            token_start=0,
+        )
+
+        payload, _ = host._materialize_full_payload_entry(host._pending_full_payload_send["req-1"])
+        self.assertTrue(torch.equal(payload["hidden"], torch.tensor([[1.0], [2.0], [3.0]])))
         host.shutdown_omni_connectors()
 
 

@@ -520,10 +520,6 @@ def main():
     model_class_name = get_model_class_name(omni)
     declared_extra_body_params = get_extra_body_params(model_class_name)
 
-    if profiler_enabled:
-        print("[Profiler] Starting profiling...")
-        omni.start_profile()
-
     # Time profiling for generation
     print(f"\n{'=' * 60}")
     print("Generation Configuration:")
@@ -652,10 +648,16 @@ def main():
     if args.num_warmups:
         print(f"Running {args.num_warmups} untimed warmup request(s)...")
         for _ in range(args.num_warmups):
+            generator.manual_seed(args.seed)
             omni.generate(prompt_dict, sampling_params_list=sampling_params_list, use_tqdm=False)
+
+    if profiler_enabled:
+        print("[Profiler] Starting profiling...")
+        omni.start_profile()
 
     outputs = None
     for run_idx in range(args.num_runs):
+        generator.manual_seed(args.seed)
         generation_start = time.perf_counter()
         outputs = omni.generate(
             prompt_dict,
