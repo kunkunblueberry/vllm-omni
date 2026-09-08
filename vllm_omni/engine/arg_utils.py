@@ -518,7 +518,7 @@ class OrchestratorArgs:
 
     # === Config Files ===
     deploy_config: str | None = None
-    stage_overrides: str | None = None  # raw JSON string; parsed downstream
+    stage_overrides: dict[str, dict[str, Any]] | None = None
     # Optional composable-parallel strategy.yaml; orchestrator reads it, overlays
     # derived sizing onto merged stages, then drops it before per-stage engine args.
     strategy_config: str | None = None
@@ -572,6 +572,9 @@ class OrchestratorArgs:
     vae_use_tiling: bool = False
     enable_multithread_weight_load: bool = True
     num_weight_load_threads: int = 4
+    diffusion_offload_config: dict[str, Any] | None = None
+    # Compatibility aliases for existing callers and model-specific stage
+    # lifecycles that are broader than the compact dit/text_encoder selector.
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False

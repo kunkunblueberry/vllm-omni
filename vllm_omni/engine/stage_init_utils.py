@@ -53,7 +53,7 @@ from vllm_omni.config.stage_config import StageType
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
-from vllm_omni.entrypoints.utils import filter_dataclass_kwargs, resolve_model_config_path
+from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
 from vllm_omni.inputs.preprocess import OmniInputPreprocessor
 from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
@@ -1090,7 +1090,8 @@ def _project_omni_stage_engine_args(
         ),
         (
             stage_config.runtime_config,
-            frozenset({"devices", "num_replicas", "env", "num_gpus"}),
+            frozenset({"devices", "num_replicas", "env", "num_gpus"})
+            | (frozenset({"additional_config"}) if is_diffusion else frozenset()),
         ),
     ):
         engine_args.update(
@@ -1817,7 +1818,7 @@ def release_device_locks(lock_fds: list[int]) -> None:
 
 
 def load_omni_transfer_config_for_model(model: str, config_path: str | None) -> Any:
-    """Load omni transfer config from an explicit path or resolved model config.
+    """Load omni transfer config from the resolver-selected deploy config.
 
     Resolves ``base_config`` inheritance (CI overlay → base deploy YAML) so
     that connectors defined in the base config are visible to the transfer
@@ -1826,12 +1827,11 @@ def load_omni_transfer_config_for_model(model: str, config_path: str | None) -> 
     from vllm_omni.distributed.omni_connectors import load_omni_transfer_config
 
     try:
-        resolved_config_path = config_path or resolve_model_config_path(model)
-        if resolved_config_path is None:
+        if config_path is None:
             return None
         from vllm_omni.config.stage_config import resolve_deploy_yaml
 
-        resolved_dict = resolve_deploy_yaml(resolved_config_path)
+        resolved_dict = resolve_deploy_yaml(config_path)
         return load_omni_transfer_config(config_dict=resolved_dict)
     except Exception as e:
         logger.warning("[stage_init] Failed to load transfer config: %s", e)
