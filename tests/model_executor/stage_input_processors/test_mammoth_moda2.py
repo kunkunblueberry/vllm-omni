@@ -1,411 +1,133 @@
+# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Regression tests for the MammothModa2 AR -> DiT request-end full payload path."""
+"""CPU regression tests for MammothModa2's completed-AR to DiT bridge."""
 
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from vllm_omni.model_executor.models.mammoth_moda2.conditioning import (
-    conditioning_spec_from_config,
-    select_ar_conditions,
-)
+from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
 from vllm_omni.model_executor.models.mammoth_moda2.pipeline import MAMMOTH_MODA2_PIPELINE
-from vllm_omni.model_executor.stage_input_processors.mammoth_moda2 import (
-    ar2dit,
-    ar2dit_full_payload,
-    ar2dit_token_only,
-)
-from vllm_omni.worker.omni_connector_model_runner_mixin import (
-    OmniConnectorModelRunnerMixin,
-    should_accumulate_full_payload_output,
-)
+from vllm_omni.model_executor.stage_input_processors.mammoth_moda2 import ar2dit
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _transfer_manager() -> SimpleNamespace:
-    """Minimal runner shape matching the full-payload callback owner."""
+_PROMPT_TOKEN_IDS = [7, 8, 9]
+_GENERATED_TOKEN_IDS = [101, 102, 103]
+
+
+def _hidden_states(rows: int = 5) -> torch.Tensor:
+    return torch.arange(rows * 4, dtype=torch.bfloat16).reshape(rows, 4)
+
+
+def _ar_output(hidden_states: torch.Tensor | None = None) -> SimpleNamespace:
+    multimodal_output = {} if hidden_states is None else {"latent": hidden_states}
     return SimpleNamespace(
-        model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(
-                llm_config=SimpleNamespace(gen_vocab_start_index=10),
-                image_token_id=4,
-                video_token_id=5,
-                vision_start_token_id=6,
-                vision_end_token_id=7,
-            )
-        )
-    )
-
-
-def test_select_ar_conditions_matches_mammoth_token_categories():
-    config = _transfer_manager().model_config.hf_config
-    hidden = torch.arange(30, dtype=torch.bfloat16).reshape(5, 6)
-    text_cond, image_cond = select_ar_conditions(
-        hidden,
-        # The image placeholder in the question is discarded; only generated
-        # vocabulary ids after answer_start_index become image conditions.
-        [1, config.image_token_id, 2, 10, 11],
-        answer_start_index=3,
-        spec=conditioning_spec_from_config(config),
-    )
-
-    assert torch.equal(text_cond, hidden[[0, 2]])
-    assert torch.equal(image_cond, hidden[[3, 4]])
-
-
-def _accumulate_hidden_slices(slices: list[torch.Tensor]) -> torch.Tensor:
-    """Feed per-step hidden slices through the real full-payload accumulator.
-
-    Mirrors the runner: one pooler payload per step for the same request id,
-    concatenated at request end by ``_materialize_full_payload_entry``.
-    """
-    runner = object.__new__(OmniConnectorModelRunnerMixin)
-    runner._custom_process_func = ar2dit_full_payload
-    runner._pending_full_payload_send = {}
-    request = SimpleNamespace(output_token_ids=[])
-    for hidden_slice in slices:
-        OmniConnectorModelRunnerMixin.accumulate_full_payload_output(runner, "r1", {"hidden": hidden_slice}, request)
-    output, _ = OmniConnectorModelRunnerMixin._materialize_full_payload_entry(runner._pending_full_payload_send["r1"])
-    return output["hidden"]
-
-
-def _full_payload_runner() -> OmniConnectorModelRunnerMixin:
-    runner = object.__new__(OmniConnectorModelRunnerMixin)
-    runner._custom_process_func = ar2dit_full_payload
-    runner._pending_full_payload_send = {}
-    runner._stage_id = 0
-    return runner
-
-
-def test_full_payload_resume_replaces_recomputed_mammoth_hidden_rows():
-    """A preemption replay must replace overlapping AR rows, not append them."""
-    runner = _full_payload_runner()
-    request = SimpleNamespace(output_token_ids=[])
-
-    OmniConnectorModelRunnerMixin.accumulate_full_payload_output(
-        runner,
-        "r1",
-        {"hidden": torch.tensor([[0.0], [1.0], [2.0]])},
-        request,
-        token_start=0,
-    )
-    OmniConnectorModelRunnerMixin.accumulate_full_payload_output(
-        runner,
-        "r1",
-        {"hidden": torch.tensor([[3.0], [4.0]])},
-        request,
-        token_start=3,
-    )
-
-    # Resume from preemption and replay the same five positions with new
-    # snapshots. The old append-only behavior produced nine rows here.
-    OmniConnectorModelRunnerMixin.accumulate_full_payload_output(
-        runner,
-        "r1",
-        {"hidden": torch.tensor([[10.0], [11.0], [12.0]])},
-        request,
-        token_start=0,
-    )
-    OmniConnectorModelRunnerMixin.accumulate_full_payload_output(
-        runner,
-        "r1",
-        {"hidden": torch.tensor([[13.0], [14.0]])},
-        request,
-        token_start=3,
-    )
-
-    output, _ = OmniConnectorModelRunnerMixin._materialize_full_payload_entry(runner._pending_full_payload_send["r1"])
-    assert torch.equal(
-        output["hidden"],
-        torch.tensor([[10.0], [11.0], [12.0], [13.0], [14.0]]),
-    )
-
-
-def test_full_payload_abort_discards_retained_hidden_without_downstream_send():
-    """Cancellation releases retained AR state and never sends a partial payload."""
-    runner = _full_payload_runner()
-    request = SimpleNamespace(output_token_ids=[])
-    sent = {}
-    runner.send_full_payload_outputs = lambda *, scheduler_output, outputs: sent.update(  # type: ignore[method-assign]
-        outputs
-    )
-
-    for req_id in ("complete", "aborted"):
-        OmniConnectorModelRunnerMixin.accumulate_full_payload_output(
-            runner,
-            req_id,
-            {"hidden": torch.tensor([[1.0]])},
-            request,
-            token_start=0,
-        )
-
-    requests = {
-        "complete": SimpleNamespace(status=SimpleNamespace(name="FINISHED_STOPPED")),
-        "aborted": SimpleNamespace(status=SimpleNamespace(name="FINISHED_ABORTED")),
-    }
-    OmniConnectorModelRunnerMixin.finalize_full_payload_outputs(runner, set(requests), requests)
-
-    assert set(sent) == {"complete"}
-    assert runner._pending_full_payload_send == {}
-
-
-def test_ar2dit_full_payload_selects_bf16_conditions_before_one_time_d2h():
-    """Device-resident slices -> selected BF16 conditions -> one request-end D2H."""
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    prompt_token_ids = [1, 2, 3]
-    output_token_ids = [10, 11, 12, 13, 14, 15, 16]  # final look-ahead token has no hidden state
-    prefill = torch.arange(18, dtype=torch.bfloat16, device=device).reshape(3, 6)
-    decode = torch.arange(18, 54, dtype=torch.bfloat16, device=device).reshape(6, 6)
-
-    # Prefill + decode slices accumulate on device (the accumulator concatenates
-    # per-step chunks); the single materialization happens in ar2dit_full_payload
-    # at request end.
-    hidden = _accumulate_hidden_slices([prefill, decode])
-    assert hidden.device.type == device
-    assert hidden.shape == (len(prompt_token_ids) + len(output_token_ids) - 1, 6)
-
-    request = SimpleNamespace(
-        request_id="r1",
-        prompt_token_ids=prompt_token_ids,
-        output_token_ids=output_token_ids,
-        additional_information_cpu={"image_height": [512], "image_width": [768]},
-    )
-    payload = ar2dit_full_payload(
-        transfer_manager=_transfer_manager(),
-        pooling_output={"hidden": hidden},
-        request=request,
-    )
-
-    assert payload is not None
-    text_cond = payload["text_prompt_embeds"]
-    image_cond = payload["image_prompt_embeds"]
-    assert text_cond.device.type == "cpu"
-    assert image_cond.device.type == "cpu"
-    assert text_cond.dtype == torch.bfloat16
-    assert image_cond.dtype == torch.bfloat16
-    assert text_cond.shape == (len(prompt_token_ids), 6)
-    assert image_cond.shape == (len(output_token_ids) - 1, 6)
-    assert text_cond.is_contiguous()
-    assert image_cond.is_contiguous()
-    assert torch.equal(text_cond, prefill.cpu())
-    assert torch.equal(image_cond, decode.cpu())
-
-    assert payload["full_token_ids"] == prompt_token_ids + output_token_ids[:-1]
-    assert payload["answer_start_index"] == [len(prompt_token_ids)]
-    assert payload["image_height"] == [512]
-    assert payload["image_width"] == [768]
-    assert payload["text_guidance_scale"] == [9.0]
-    assert payload["cfg_range"] == [0.0, 1.0]
-    assert payload["num_inference_steps"] == [50]
-
-
-def test_ar2dit_full_payload_emits_direct_dit_condition_schema():
-    """The request-end payload uses the DiT's direct-condition input branch."""
-    prompt_token_ids = [1, 2, 3]
-    gen_token_ids = [10, 11, 12, 13]
-    full_hidden = torch.arange(36, dtype=torch.bfloat16).reshape(6, 6)
-    addi_info = {
-        "image_height": [512],
-        "image_width": [768],
-        "text_guidance_scale": [4.0],
-        "cfg_range": [0.0, 1.0],
-        "num_inference_steps": [25],
-    }
-
-    request_end = ar2dit_full_payload(
-        transfer_manager=_transfer_manager(),
-        pooling_output={"hidden": full_hidden},
-        request=SimpleNamespace(
-            request_id="r1",
-            prompt_token_ids=prompt_token_ids,
-            output_token_ids=gen_token_ids,
-            additional_information_cpu=addi_info,
-        ),
-    )
-
-    assert request_end is not None
-    assert "full_hidden_states" not in request_end
-    assert torch.equal(request_end["text_prompt_embeds"], full_hidden[:3])
-    assert torch.equal(request_end["image_prompt_embeds"], full_hidden[3:])
-    assert request_end["full_token_ids"] == prompt_token_ids + gen_token_ids[:-1]
-    assert request_end["answer_start_index"] == [len(prompt_token_ids)]
-    assert request_end["image_height"] == [512]
-    assert request_end["image_width"] == [768]
-    assert request_end["text_guidance_scale"] == [4.0]
-    assert request_end["cfg_range"] == [0.0, 1.0]
-    assert request_end["num_inference_steps"] == [25]
-
-    legacy = ar2dit(
-        [
+        request_id="mammoth-request",
+        prompt_token_ids=list(_PROMPT_TOKEN_IDS),
+        outputs=[
             SimpleNamespace(
-                prompt_token_ids=prompt_token_ids,
-                outputs=[
-                    SimpleNamespace(
-                        cumulative_token_ids=gen_token_ids,
-                        multimodal_output={"latent": full_hidden},
-                    )
-                ],
+                cumulative_token_ids=list(_GENERATED_TOKEN_IDS),
+                multimodal_output=multimodal_output,
             )
         ],
-        prompts=[{"additional_information": addi_info}],
-    )[0]["additional_information"]
-    assert torch.equal(request_end["text_prompt_embeds"].float(), legacy["full_hidden_states"][:3])
-    assert torch.equal(request_end["image_prompt_embeds"].float(), legacy["full_hidden_states"][3:])
-
-
-def test_ar2dit_full_payload_rejects_hidden_token_id_mismatch():
-    request = SimpleNamespace(
-        request_id="r1",
-        prompt_token_ids=[1, 2, 3],
-        output_token_ids=[10, 11, 12, 13],  # expects 6 hidden rows
-        additional_information_cpu=None,
     )
-    with pytest.raises(ValueError, match="length mismatch"):
-        ar2dit_full_payload(
-            transfer_manager=_transfer_manager(),
-            pooling_output={"hidden": torch.zeros((5, 6))},
-            request=request,
-        )
 
 
-def test_ar2dit_full_payload_synthesizes_t2i_ids_from_placeholder_outputs():
-    prompt_token_ids = [1, 2, 3]
-    ar_width = 2
-    ar_height = 2
-    generated_hidden_len = ar_height * (ar_width + 1)
-    visual_start = 152072
-    eol_token_id = 152064
-    request = SimpleNamespace(
-        request_id="r1",
-        prompt_token_ids=prompt_token_ids,
-        # The async AR path may still expose placeholders here at request end.
-        # The final look-ahead token has no hidden state and is dropped.
-        output_token_ids=[-1] * (generated_hidden_len + 1),
-        additional_information_cpu={
-            "omni_task": ["t2i"],
-            "ar_width": [ar_width],
-            "ar_height": [ar_height],
-            "eol_token_id": [eol_token_id],
-            "visual_token_start_id": [visual_start],
-            "visual_token_end_id": [168456],
+def _prompt(
+    *,
+    target_h: int | None = None,
+    target_w: int | None = None,
+) -> dict[str, object]:
+    mm_processor_kwargs: dict[str, int] = {}
+    if target_h is not None:
+        mm_processor_kwargs["target_h"] = target_h
+    if target_w is not None:
+        mm_processor_kwargs["target_w"] = target_w
+    return {
+        "additional_information": {
+            "image_height": [384],
+            "image_width": [640],
+            "text_guidance_scale": [4.5],
+            "cfg_range": [0.1, 0.9],
+            "num_inference_steps": [20],
         },
-    )
-
-    payload = ar2dit_full_payload(
-        transfer_manager=_transfer_manager(),
-        pooling_output={"hidden": torch.zeros((len(prompt_token_ids) + generated_hidden_len, 6))},
-        request=request,
-    )
-
-    assert payload is not None
-    assert payload["full_token_ids"] == prompt_token_ids + [
-        visual_start,
-        visual_start,
-        eol_token_id,
-        visual_start,
-        visual_start,
-        eol_token_id,
-    ]
+        "mm_processor_kwargs": mm_processor_kwargs,
+    }
 
 
-def test_ar2dit_full_payload_fills_partial_t2i_placeholders():
-    visual_start = 152072
-    eol_token_id = 152064
-    request = SimpleNamespace(
-        request_id="r1",
-        prompt_token_ids=[1, 2, 3],
-        output_token_ids=[152100, -1, eol_token_id, -1, 152101, -1, 168456],
-        additional_information_cpu={
-            "omni_task": ["t2i"],
-            "ar_width": [2],
-            "ar_height": [2],
-            "eol_token_id": [eol_token_id],
-            "visual_token_start_id": [visual_start],
-        },
-    )
+def _assert_complete_dit_input(dit_inputs: list[dict[str, object]], hidden_states: torch.Tensor) -> None:
+    assert len(dit_inputs) == 1
+    dit_input = dit_inputs[0]
+    assert dit_input["prompt_token_ids"] == [0]
 
-    payload = ar2dit_full_payload(
-        transfer_manager=_transfer_manager(),
-        pooling_output={"hidden": torch.zeros((9, 6))},
-        request=request,
-    )
-
-    assert payload is not None
-    assert payload["full_token_ids"] == [
-        1,
-        2,
-        3,
-        152100,
-        visual_start,
-        eol_token_id,
-        visual_start,
-        152101,
-        eol_token_id,
-    ]
+    additional_information = dit_input["additional_information"]
+    assert isinstance(additional_information, dict)
+    full_hidden_states = additional_information["full_hidden_states"]
+    assert isinstance(full_hidden_states, torch.Tensor)
+    assert full_hidden_states.dtype == torch.float32
+    assert full_hidden_states.is_contiguous()
+    assert torch.equal(full_hidden_states, hidden_states.float())
+    assert additional_information["full_token_ids"] == [7, 8, 9, 101, 102]
+    assert additional_information["answer_start_index"] == [3]
+    assert additional_information["image_height"] == [384]
+    assert additional_information["image_width"] == [640]
+    assert additional_information["text_guidance_scale"] == [4.5]
+    assert additional_information["cfg_range"] == [0.1, 0.9]
+    assert additional_information["num_inference_steps"] == [20]
 
 
-def test_ar2dit_full_payload_rejects_t2i_grid_hidden_mismatch():
-    request = SimpleNamespace(
-        request_id="r1",
-        prompt_token_ids=[1, 2, 3],
-        output_token_ids=[-1] * 7,
-        additional_information_cpu={
-            "omni_task": ["t2i"],
-            "ar_width": [2],
-            "ar_height": [3],
-            "eol_token_id": [152064],
-            "visual_token_start_id": [152072],
-        },
-    )
+def test_ar2dit_builds_one_complete_dit_input() -> None:
+    hidden_states = _hidden_states()
 
-    with pytest.raises(ValueError, match="expected 9 from AR grid 2x3, got 6"):
-        ar2dit_full_payload(
-            transfer_manager=_transfer_manager(),
-            pooling_output={"hidden": torch.zeros((9, 6))},
-            request=request,
-        )
+    dit_inputs = ar2dit([_ar_output(hidden_states)], _prompt())
+
+    _assert_complete_dit_input(dit_inputs, hidden_states)
 
 
-def test_ar2dit_full_payload_does_not_synthesize_non_t2i_placeholders():
-    request = SimpleNamespace(
-        request_id="r1",
-        prompt_token_ids=[1, 2, 3],
-        output_token_ids=[-1, -1, -1, -1],
-        additional_information_cpu={"omni_task": ["chat"]},
-    )
-    with pytest.raises(ValueError, match="unresolved output token placeholders"):
-        ar2dit_full_payload(
-            transfer_manager=_transfer_manager(),
-            pooling_output={"hidden": torch.zeros((6, 6))},
-            request=request,
-        )
+def test_ar2dit_prefers_processor_image_dimensions() -> None:
+    hidden_states = _hidden_states()
+
+    dit_inputs = ar2dit([_ar_output(hidden_states)], _prompt(target_h=512, target_w=768))
+
+    additional_information = dit_inputs[0]["additional_information"]
+    assert additional_information["image_height"] == [512]
+    assert additional_information["image_width"] == [768]
 
 
-def test_ar2dit_token_only_returns_placeholder_for_finished_outputs():
-    finished = SimpleNamespace(finished=True)
-    running = SimpleNamespace(finished=False)
-
-    placeholders = ar2dit_token_only([running, finished])
-
-    assert len(placeholders) == 1
-    assert placeholders[0]["prompt_token_ids"] == [0]
-    assert placeholders[0]["additional_information"] is None
+def test_ar2dit_rejects_missing_latent_output() -> None:
+    with pytest.raises(ValueError, match="missing latent multimodal output"):
+        ar2dit([_ar_output()], _prompt())
 
 
-def test_mammoth_moda2_pipeline_uses_request_end_full_payload():
+def test_ar2dit_rejects_hidden_token_row_mismatch() -> None:
+    with pytest.raises(AssertionError, match="Hidden states length mismatch"):
+        ar2dit([_ar_output(_hidden_states(rows=4))], _prompt())
+
+
+def test_mammoth_pipeline_uses_standard_completed_ar_forwarding() -> None:
     stage0, stage1 = MAMMOTH_MODA2_PIPELINE.stages
 
-    assert stage0.custom_process_next_stage_input_func.endswith("ar2dit_full_payload")
-    assert stage1.requires_full_payload_input is True
-    assert stage1.sync_process_input_func.endswith("ar2dit_token_only")
+    assert stage0.custom_process_next_stage_input_func is None
+    assert stage1.custom_process_input_func.endswith(".ar2dit")
+    assert stage1.sync_process_input_func is None
+    assert stage1.requires_full_payload_input is False
 
-    # The AR stage must qualify as a producer for the request-end accumulator.
-    model_config = SimpleNamespace(
-        async_chunk=False,
-        final_output=False,
-        model_stage="ar",
-        custom_process_next_stage_input_func=stage0.custom_process_next_stage_input_func,
+
+def test_stage_client_forwards_completed_ar_output_to_mammoth_adapter() -> None:
+    hidden_states = _hidden_states()
+    client = SimpleNamespace(
+        custom_process_input_func=ar2dit,
+        requires_multimodal_data=False,
+        _stage_hf_config=None,
     )
-    assert should_accumulate_full_payload_output(model_config, ar2dit_full_payload)
+
+    dit_inputs = StageEngineCoreClient.process_engine_inputs(
+        client,
+        [_ar_output(hidden_states)],
+        _prompt(),
+    )
+
+    _assert_complete_dit_input(dit_inputs, hidden_states)

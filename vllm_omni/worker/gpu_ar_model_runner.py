@@ -945,10 +945,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             for request in getattr(scheduler_output, "pending_input_registrations", []):
                 self.register_chunk_recv(request)
             self.recv_full_payload_inputs(scheduler_output)
-            self.finalize_full_payload_outputs(
-                set(getattr(scheduler_output, "finished_req_ids", set())),
-                self.requests,
-            )
+            if self._pending_full_payload_send:
+                flush_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
+                flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in self.requests})
+                if flush_ids:
+                    self.flush_full_payload_outputs(flush_ids)
 
         if self.omni_prefix_cache is not None and scheduler_output.finished_req_ids:
             self.omni_prefix_cache.commit_deferred_mm_outputs(
@@ -1846,36 +1847,22 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         )
 
         if self.omni_prefix_cache is None and needs_scheduled_hidden_payload and not audio_sparse_output:
-            if defer_full_payload_d2h:
-                # Request-end full-payload mode: retain per-request hidden
-                # slices on the producing device for accumulator lifetime
-                # safety. This only removes per-step host materialization;
-                # the existing connector still owns request-end D2H/transport.
+            num_valid_tokens = min(
+                int(scheduler_output.total_num_scheduled_tokens),
+                int(hidden_states.shape[0]),
+            )
+            if len(downstream_req_ids) == len(req_ids_output_copy):
+                with record_function_or_nullcontext("omni_output_builder:hidden_d2h/scheduled"):
+                    hidden_states_cpu = _to_cpu_contiguous(hidden_states[:num_valid_tokens])
+            else:
                 req_hidden_states_cpu = {}
-                with record_function_or_nullcontext("omni_output_builder:hidden_snapshot/per_request"):
+                with record_function_or_nullcontext("omni_output_builder:hidden_d2h/per_request"):
                     for rid in downstream_req_ids:
                         idx = req_id_to_index_output_copy[rid]
                         start = int(query_start_loc_cpu[idx])
                         sched = int(num_scheduled_tokens_np[idx])
                         end = start + sched
-                        req_hidden_states_cpu[rid] = snapshot_mm_payload({"hidden": hidden_states[start:end]})["hidden"]
-            else:
-                num_valid_tokens = min(
-                    int(scheduler_output.total_num_scheduled_tokens),
-                    int(hidden_states.shape[0]),
-                )
-                if len(downstream_req_ids) == len(req_ids_output_copy):
-                    with record_function_or_nullcontext("omni_output_builder:hidden_d2h/scheduled"):
-                        hidden_states_cpu = _to_cpu_contiguous(hidden_states[:num_valid_tokens])
-                else:
-                    req_hidden_states_cpu = {}
-                    with record_function_or_nullcontext("omni_output_builder:hidden_d2h/per_request"):
-                        for rid in downstream_req_ids:
-                            idx = req_id_to_index_output_copy[rid]
-                            start = int(query_start_loc_cpu[idx])
-                            sched = int(num_scheduled_tokens_np[idx])
-                            end = start + sched
-                            req_hidden_states_cpu[rid] = _to_cpu_contiguous(hidden_states[start:end])
+                        req_hidden_states_cpu[rid] = _to_cpu_contiguous(hidden_states[start:end])
 
         # NOTE: pooler_output here is used only for the full-payload accumulation
         # path (accumulate_full_payload_output) and is NOT passed on the wire via
@@ -1967,12 +1954,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 for i, rid in enumerate(req_ids_output_copy):
                     req_state = self.requests.get(rid)
                     if req_state is not None and pooler_inter[i]:
-                        self.accumulate_full_payload_output(
-                            rid,
-                            pooler_inter[i],
-                            req_state,
-                            token_start=int(getattr(req_state, "num_computed_tokens", 0)),
-                        )
+                        self.accumulate_full_payload_output(rid, pooler_inter[i], req_state)
 
         with record_function_or_nullcontext("omni_output_builder:build_multimodal_outputs"):
             inter_stage_outputs, multimodal_outputs = self._build_omni_step_outputs(
