@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "environment": {
+    "hardware": "2 x NVIDIA A100-PCIE-40GB",
+    "torch": "2.13.0+cu132",
+    "cuda": "13.2",
+    "model": "/data/vllm-workspace/models/MammothModa2-Preview",
+    "prompt": "A cat sitting on a laptop keyboard",
+    "height": 256,
+    "width": 256,
+    "diffusion_steps": 2,
+    "seed": 142,
+    "warmups": 2,
+    "timed_runs": 10
+  },
+  "baseline": {
+    "mean_seconds": 6.36750603560358,
+    "std_seconds": 0.0802460720905133,
+    "p50_seconds": 6.34018631,
+    "p95_seconds": 6.496411246,
+    "min_seconds": 6.318372514,
+    "max_seconds": 6.585917376,
+    "peak_gpu_memory_mib": {
+      "0": 38195,
+      "1": 7559
+    }
+  },
+  "candidate": {
+    "mean_seconds": 6.30669386014342,
+    "std_seconds": 0.194436589933872,
+    "p50_seconds": 6.254636793,
+    "p95_seconds": 6.654906349,
+    "min_seconds": 6.124589084,
+    "max_seconds": 6.726262476,
+    "peak_gpu_memory_mib": {
+      "0": 38195,
+      "1": 7559
+    }
+  },
+  "comparison": {
+    "mean_delta_seconds": -0.06081217546016,
+    "mean_delta_percent": -0.955,
+    "p50_delta_percent": -1.347,
+    "p95_delta_percent": 2.44,
+    "all_timed_output_hashes_equal": true
+  },
+  "interpretation": "The end-to-end result is directionally faster but noisy; payload and transfer measurements are the stronger evidence."
+}

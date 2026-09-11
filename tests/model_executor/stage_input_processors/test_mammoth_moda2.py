@@ -7,6 +7,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit import (
+    MammothModa2DiTPipeline,
+)
+from vllm_omni.engine.serialization import (
+    deserialize_additional_information,
+    serialize_additional_information,
+)
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
 from vllm_omni.model_executor.models.mammoth_moda2.pipeline import MAMMOTH_MODA2_PIPELINE
 from vllm_omni.model_executor.stage_input_processors.mammoth_moda2 import ar2dit
@@ -18,8 +25,8 @@ _PROMPT_TOKEN_IDS = [7, 8, 9]
 _GENERATED_TOKEN_IDS = [101, 102, 103]
 
 
-def _hidden_states(rows: int = 5) -> torch.Tensor:
-    return torch.arange(rows * 4, dtype=torch.bfloat16).reshape(rows, 4)
+def _hidden_states(rows: int = 5, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    return torch.arange(rows * 4, dtype=dtype).reshape(rows, 4)
 
 
 def _ar_output(hidden_states: torch.Tensor | None = None) -> SimpleNamespace:
@@ -67,9 +74,9 @@ def _assert_complete_dit_input(dit_inputs: list[dict[str, object]], hidden_state
     assert isinstance(additional_information, dict)
     full_hidden_states = additional_information["full_hidden_states"]
     assert isinstance(full_hidden_states, torch.Tensor)
-    assert full_hidden_states.dtype == torch.float32
+    assert full_hidden_states.dtype == torch.bfloat16
     assert full_hidden_states.is_contiguous()
-    assert torch.equal(full_hidden_states, hidden_states.float())
+    assert torch.equal(full_hidden_states, hidden_states)
     assert additional_information["full_token_ids"] == [7, 8, 9, 101, 102]
     assert additional_information["answer_start_index"] == [3]
     assert additional_information["image_height"] == [384]
@@ -85,6 +92,54 @@ def test_ar2dit_builds_one_complete_dit_input() -> None:
     dit_inputs = ar2dit([_ar_output(hidden_states)], _prompt())
 
     _assert_complete_dit_input(dit_inputs, hidden_states)
+
+
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+def test_ar2dit_preserves_low_precision_through_engine_core_payload(dtype: torch.dtype) -> None:
+    hidden_states = _hidden_states(dtype=dtype)
+    dit_input = ar2dit([_ar_output(hidden_states)], _prompt())[0]
+
+    wire_payload = serialize_additional_information(dit_input["additional_information"])
+    assert wire_payload is not None
+    restored = deserialize_additional_information(wire_payload)
+    restored_hidden_states = restored["full_hidden_states"]
+
+    assert isinstance(restored_hidden_states, torch.Tensor)
+    assert restored_hidden_states.dtype == dtype
+    assert restored_hidden_states.is_contiguous()
+    assert torch.equal(restored_hidden_states, hidden_states)
+
+
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+def test_dit_condition_split_preserves_compact_transfer_dtype(dtype: torch.dtype) -> None:
+    # Construct only the config read by _split_ar_conditions.  This keeps the
+    # test CPU-only and avoids loading the DiT/VAE weights.
+    pipeline = object.__new__(MammothModa2DiTPipeline)
+    object.__setattr__(
+        pipeline,
+        "config",
+        SimpleNamespace(
+            llm_config=SimpleNamespace(gen_vocab_start_index=100),
+            image_token_id=20,
+            video_token_id=21,
+            vision_start_token_id=22,
+            vision_end_token_id=23,
+        ),
+    )
+    hidden_states = _hidden_states(dtype=dtype)
+
+    text_cond, image_cond = pipeline._split_ar_conditions(
+        full_hidden_states=hidden_states,
+        full_token_ids=[7, 20, 8, 101, 102],
+        answer_start_index=3,
+    )
+
+    assert text_cond.dtype == dtype
+    assert image_cond.dtype == dtype
+    assert text_cond.is_contiguous()
+    assert image_cond.is_contiguous()
+    assert torch.equal(text_cond, hidden_states[[0, 2]])
+    assert torch.equal(image_cond, hidden_states[[3, 4]])
 
 
 def test_ar2dit_prefers_processor_image_dimensions() -> None:

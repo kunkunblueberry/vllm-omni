@@ -1,0 +1,97 @@
+{
+  "environment": {
+    "remote_host": "vllm",
+    "device": "Tesla V100S-PCIE-32GB",
+    "gpu": 3,
+    "shared_gpu": true,
+    "existing_gpu_memory_mib": 28448,
+    "max_memory_fraction": 0.08,
+    "scope": "isolated compatibility proxy; no Mammoth checkpoint and no local runtime source modification"
+  },
+  "precision_ab": {
+    "workload": {
+      "dtype": "float16",
+      "requests": 8,
+      "prompt_rows": 256,
+      "image_rows": 1568,
+      "hidden_size": 4096
+    },
+    "baseline": {
+      "payload_bytes": 238944256,
+      "peak_allocation_delta_bytes": 384221184,
+      "latency_ms": {
+        "mean": 113.48839066922665,
+        "p50": 100.23374110460281,
+        "p95": 220.7236222922802
+      }
+    },
+    "candidate": {
+      "payload_bytes": 119472128,
+      "peak_allocation_delta_bytes": 245425664,
+      "latency_ms": {
+        "mean": 56.96221962571144,
+        "p50": 56.650787591934204,
+        "p95": 57.93866403400899
+      }
+    }
+  },
+  "staging_event_chain": {
+    "dtype": "float16",
+    "requests": 8,
+    "per_request_payload_mib": 16,
+    "bytes_each_direction": 134217728,
+    "correctness": "all source, pinned host, and destination tensors matched",
+    "serial_per_request_sync_ms": {
+      "mean": 74.90381598472595,
+      "p50": 64.94554877281189,
+      "p95": 115.92056751251219
+    },
+    "event_chained_one_consumer_wait_ms": {
+      "mean": 17.404867708683014,
+      "p50": 15.90021699666977,
+      "p95": 25.794328749179833
+    },
+    "event_chained_enqueue_ms": {
+      "mean": 1.1111840605735779,
+      "p50": 1.0270923376083374,
+      "p95": 1.6027405858035779
+    }
+  },
+  "engine_payload_codec": {
+    "workload": {
+      "dtype": "float16",
+      "requests": 8,
+      "rows": 1824,
+      "hidden_size": 4096,
+      "bytes_per_request": 14942208,
+      "bytes_total": 119537664
+    },
+    "codec_contract": {
+      "producer": "GPU tensor -> CPU contiguous uint8 bytes",
+      "receiver": "bytearray -> pageable CPU tensor",
+      "payload_h2d_source_is_pinned_after_decode": false
+    },
+    "serial_pageable": {
+      "d2h_ms_mean": 36.52261346578598,
+      "serialize_ms_mean": 21.936076879501343,
+      "deserialize_ms_mean": 48.327864706516266,
+      "h2d_ms_mean": 24.952809512615204,
+      "total_ms_mean": 131.7417435348034
+    },
+    "event_chain_pageable_receive": {
+      "d2h_ms_mean": 9.230631589889526,
+      "serialize_ms_mean": 17.083408683538437,
+      "deserialize_ms_mean": 17.52287968993187,
+      "h2d_ms_mean": 46.4935839176178,
+      "total_ms_mean": 90.3312623500824
+    },
+    "event_chain_repinned_receive": {
+      "d2h_ms_mean": 10.481267422437668,
+      "serialize_ms_mean": 19.50022727251053,
+      "deserialize_ms_mean": 17.739374190568924,
+      "restage_ms_mean": 5.539727956056595,
+      "h2d_ms_mean": 15.654337406158447,
+      "total_ms_mean": 68.91493424773216
+    }
+  }
+}

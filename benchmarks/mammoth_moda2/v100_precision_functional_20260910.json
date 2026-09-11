@@ -1,0 +1,41 @@
+{
+  "environment": {
+    "remote_runtime": {
+      "torch": "2.10.0+cu126",
+      "vllm": "0.19.0",
+      "vllm_omni": "0.19.0rc1"
+    },
+    "scope": "isolated V100 compatibility proxy; no Mammoth checkpoint was available"
+  },
+  "functional_ab": {
+    "baseline": {
+      "mode": "baseline",
+      "output_dtype": "float32",
+      "text_shape": [2, 4],
+      "image_shape": [3, 4],
+      "payload_bytes": 80,
+      "value_equivalence_after_fp16_consume": true
+    },
+    "candidate": {
+      "mode": "candidate",
+      "output_dtype": "float16",
+      "text_shape": [2, 4],
+      "image_shape": [3, 4],
+      "payload_bytes": 40,
+      "value_equivalence_after_fp16_consume": true
+    },
+    "payload_reduction_percent": 50.0
+  },
+  "isolated_current_ar2dit_fp16_wire_contract": {
+    "status": "passed",
+    "scope": "current local ar2dit file against the remote isolated candidate's compatible EngineCore codec",
+    "dtype": "float16",
+    "shape": [5, 4],
+    "payload_bytes": 40,
+    "values_equal": true
+  },
+  "remote_dynamic_bfloat16_limit": {
+    "status": "not_supported_by_remote_codec",
+    "detail": "remote 0.19.0rc1 serializer raises unsupported ScalarType BFloat16 during NumPy conversion; local current serializer uses a uint8 raw-byte view"
+  }
+}
