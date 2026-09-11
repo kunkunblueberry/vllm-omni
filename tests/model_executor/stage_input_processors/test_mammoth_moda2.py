@@ -173,14 +173,11 @@ def test_mammoth_pipeline_uses_standard_completed_ar_forwarding() -> None:
 
 def test_stage_client_forwards_completed_ar_output_to_mammoth_adapter() -> None:
     hidden_states = _hidden_states()
-    client = SimpleNamespace(
-        custom_process_input_func=ar2dit,
-        requires_multimodal_data=False,
-        _stage_hf_config=None,
-    )
+    client = object.__new__(StageEngineCoreClient)
+    client.custom_process_input_func = ar2dit
+    client.requires_multimodal_data = False
 
-    dit_inputs = StageEngineCoreClient.process_engine_inputs(
-        client,
+    dit_inputs = client.process_engine_inputs(
         [_ar_output(hidden_states)],
         _prompt(),
     )
