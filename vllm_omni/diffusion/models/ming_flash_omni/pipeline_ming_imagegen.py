@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
+from copy import copy
 from pathlib import Path
 from typing import Any
 
@@ -49,7 +50,10 @@ from vllm_omni.diffusion.models.ming_flash_omni.ming_zimage_transformer import (
 )
 from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.request_batch import (
+    DiffusionRequestBatch,
+    split_diffusion_output_by_request,
+)
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
@@ -68,7 +72,7 @@ class MingImagePipeline(ZImagePipeline):
                                 ships ``byt5/``)
     """
 
-    supports_request_batch = False
+    supports_request_batch = True
 
     def __init__(
         self,
@@ -266,171 +270,221 @@ class MingImagePipeline(ZImagePipeline):
     # ------------------------------------------------------------------
 
     @torch.inference_mode()
-    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
-        """Run one text-to-image generation request.
+    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        """Run a compatible wave of independent image-generation requests.
 
         Args:
-            req: Single-request batch. The cross-stage thinker hidden states
-                must be present at
-                ``req.prompts[0]["extra"]["thinker_hidden_states"]`` as a
-                ``[N, H]`` (or ``[1, N, H]``) tensor, placed there by
-                ``thinker2imagegen``.
+            req: Independent requests in scheduler order. Each request's
+                thinker hidden states must be present in its own prompt
+                ``extra`` mapping.
 
         Returns:
-            One DiffusionOutput with ``.output`` set to a ``[B, 3, H, W]``
-            image tensor in ``[-1, 1]``. The vllm-omni diffusion engine's
-            output adapter converts this to PIL/base64 downstream.
+            One ``DiffusionOutput`` per input request, in the same order.
         """
-        first_prompt = req.prompts[0] if req.prompts else None
-        if isinstance(first_prompt, str):
-            prompt_dict: dict[str, Any] = {}
-        elif isinstance(first_prompt, dict):
-            prompt_dict = first_prompt
-        elif first_prompt is not None and hasattr(first_prompt, "_asdict"):
-            prompt_dict = first_prompt._asdict()
-        elif first_prompt is not None and hasattr(first_prompt, "__dict__"):
-            prompt_dict = vars(first_prompt)
-        else:
-            prompt_dict = {}
-
-        extra = prompt_dict.get("extra") or {}
-        hidden = extra.get("thinker_hidden_states")
-        if hidden is None:
-            # Same dual-path convention as glm_image: also check
-            # ``sampling_params.extra_args``.
-            hidden = (req.sampling_params.extra_args or {}).get("thinker_hidden_states")
-        if hidden is None:
-            scale = self.image_gen_config.img_gen_scales[-1]
-            num_query_tokens = scale * scale
-            hidden = torch.zeros(
-                (num_query_tokens, self.image_gen_config.thinker_hidden_size),
-                dtype=self._dtype,
-                device=self.device,
-            )
-            logger.warning(
-                "[MingImagePipeline.forward] 'thinker_hidden_states' missing "
-                "from request; falling back to zero-conditioning %s. This is "
-                "expected during warmup; for real requests verify that "
-                "`custom_process_input_func: thinker2imagegen` is set on the "
-                "diffusion stage in the YAML.",
-                tuple(hidden.shape),
-            )
-
-        if not isinstance(hidden, torch.Tensor):
-            raise TypeError(
-                f"[MingImagePipeline] 'thinker_hidden_states' must be a Tensor, got {type(hidden).__name__}"
-            )
-
-        # Move to the pipeline's device+dtype.
+        if req.num_reqs == 0:
+            return []
         target_device = next(self.parameters()).device
         target_dtype = next(self.parameters()).dtype
-        hidden = hidden.to(device=target_device, dtype=target_dtype)
-        if hidden.dim() == 2:
-            hidden = hidden.unsqueeze(0)  # [N, H] -> [1, N, H]
-        logger.debug(
-            "[MingImagePipeline.forward] thinker_hidden_states=%s on %s (%s)",
-            tuple(hidden.shape),
-            target_device,
-            target_dtype,
-        )
-
-        # ----- Condition encoder → cap_feats
-        cap_feats = self.condition_encoder(hidden)
-        logger.debug("[MingImagePipeline.forward] cap_feats=%s", tuple(cap_feats.shape))
-
-        # Real negative CFG conditioning (opt-in). See expand_cfg_prompts.
-        negative_hidden = extra.get("negative_thinker_hidden_states")
-        negative_cap_feats = None
-        if isinstance(negative_hidden, torch.Tensor):
-            negative_hidden = negative_hidden.to(device=target_device, dtype=target_dtype)
-            if negative_hidden.dim() == 2:
-                negative_hidden = negative_hidden.unsqueeze(0)
-            negative_cap_feats = self.condition_encoder(negative_hidden)
-            logger.debug("[MingImagePipeline.forward] negative_cap_feats=%s", tuple(negative_cap_feats.shape))
-
-        # ByT5 text enhancement (opt-in). Appends glyph-aware features along
-        # the sequence dim; negative side gets zeros for the byte5 portion so
-        # CFG doesn't push away from the rendered text.
-        byte5_texts = self._resolve_byte5_texts(extra, req.sampling_params)
-        if byte5_texts and self.byte5 is not None:
-            byte5_feats = self.byte5(byte5_texts).to(device=target_device, dtype=target_dtype)
-            cap_feats = torch.cat((cap_feats, byte5_feats), dim=1)
-            if negative_cap_feats is not None:
-                negative_cap_feats = torch.cat((negative_cap_feats, torch.zeros_like(byte5_feats)), dim=1)
-            logger.debug("[MingImagePipeline.forward] byte5 cat'd: cap_feats=%s", tuple(cap_feats.shape))
-
-        # Sampling knobs, in priority order:
-        #   top-level extra_args[key] > sampling_params.* attr >
-        #   MingImageGenConfig default. Knobs live flat on extra_args
-        sp = req.sampling_params
         cfg = self.image_gen_config
-        ea = sp.extra_args or {}
-        resolved: dict[str, Any] = {}
-        for ea_key, sp_attr, default in (
-            ("height", "height", cfg.default_height),
-            ("width", "width", cfg.default_width),
-            ("steps", "num_inference_steps", cfg.num_inference_steps),
-            ("cfg", "guidance_scale", cfg.guidance_scale),
-            ("seed", "seed", None),
-        ):
-            for v in (ea.get(ea_key), getattr(sp, sp_attr), default):
-                if v is not None:
-                    resolved[ea_key] = v
-                    break
 
-        height = int(resolved["height"])
-        width = int(resolved["width"])
-        num_inference_steps = int(resolved["steps"])
-        guidance_scale = float(resolved["cfg"])
-        seed = resolved.get("seed")
+        def _prompt_extra(prompt: Any) -> dict[str, Any]:
+            if isinstance(prompt, dict):
+                return prompt.get("extra") or {}
+            if prompt is not None and hasattr(prompt, "_asdict"):
+                return (_prompt_extra(prompt._asdict()))
+            if prompt is not None and hasattr(prompt, "__dict__"):
+                return (_prompt_extra(vars(prompt)))
+            return {}
 
-        # Always rebuild the generator from the resolved seed. Reusing
-        # ``sp.generator`` causes two problems:
-        #   (1) if the caller pre-seeded it with sp.seed (e.g. the top-level
-        #       ``seed`` key on OmniDiffusionSamplingParams), any override via
-        #       `extra_args["seed"]` would be silently ignored; and
-        #   (2) a persistent generator instance accumulates state across
-        #       requests → same-seed replays produce different outputs.
-        if seed is not None:
-            generator = torch.Generator(device=target_device).manual_seed(int(seed))
+        def _as_hidden(value: Any, request_id: str, field: str) -> torch.Tensor:
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"Ming request {request_id!r} {field} must be a Tensor, got {type(value).__name__}")
+            value = value.to(device=target_device, dtype=target_dtype)
+            if value.dim() == 2:
+                value = value.unsqueeze(0)
+            if value.dim() != 3:
+                raise ValueError(
+                    f"Ming request {request_id!r} {field} must have shape [B,N,H], got {tuple(value.shape)}"
+                )
+            if value.shape[0] != 1:
+                raise ValueError(
+                    f"Ming request {request_id!r} {field} must contain one request, got {tuple(value.shape)}"
+                )
+            return value
+
+        extras = [_prompt_extra(prompt) for prompt in req.prompts]
+        hidden_items: list[torch.Tensor] = []
+        negative_items: list[torch.Tensor | None] = []
+        hidden_metadata: list[tuple[tuple[int, ...], torch.dtype, torch.device] | None] = []
+        negative_metadata: list[tuple[tuple[int, ...], torch.dtype, torch.device] | None] = []
+        for request, extra in zip(req.requests, extras, strict=True):
+            hidden = extra.get("thinker_hidden_states")
+            if hidden is None:
+                hidden = (request.sampling_params.extra_args or {}).get("thinker_hidden_states")
+            if hidden is None:
+                scale = cfg.img_gen_scales[-1]
+                hidden = torch.zeros(
+                    (scale * scale, cfg.thinker_hidden_size), dtype=target_dtype, device=target_device
+                )
+                logger.warning(
+                    "[MingImagePipeline.forward] request %s has no thinker hidden states; using zeros",
+                    request.request_id,
+                )
+                hidden_metadata.append(None)
+            else:
+                if not isinstance(hidden, torch.Tensor):
+                    raise TypeError(
+                        f"Ming request {request.request_id!r} thinker_hidden_states must be a Tensor, "
+                        f"got {type(hidden).__name__}"
+                    )
+                normalized_shape = tuple(hidden.shape) if hidden.dim() == 3 else (1, *tuple(hidden.shape))
+                hidden_metadata.append((normalized_shape, hidden.dtype, hidden.device))
+            hidden_items.append(_as_hidden(hidden, request.request_id, "thinker_hidden_states"))
+            negative = extra.get("negative_thinker_hidden_states")
+            if negative is None:
+                negative_metadata.append(None)
+                negative_items.append(None)
+            else:
+                if not isinstance(negative, torch.Tensor):
+                    raise TypeError(
+                        f"Ming request {request.request_id!r} negative_thinker_hidden_states must be a Tensor, "
+                        f"got {type(negative).__name__}"
+                    )
+                normalized_shape = tuple(negative.shape) if negative.dim() == 3 else (1, *tuple(negative.shape))
+                negative_metadata.append((normalized_shape, negative.dtype, negative.device))
+                negative_items.append(_as_hidden(negative, request.request_id, "negative_thinker_hidden_states"))
+
+        provided_hidden_metadata = {item for item in hidden_metadata if item is not None}
+        if len(provided_hidden_metadata) > 1:
+            raise ValueError(
+                "Ming request batch thinker hidden states have incompatible shape/dtype/device: "
+                f"request_ids={req.request_ids}, metadata={hidden_metadata}"
+            )
+        provided_negative_metadata = {item for item in negative_metadata if item is not None}
+        if len(provided_negative_metadata) > 1:
+            raise ValueError(
+                "Ming request batch negative hidden states have incompatible shape/dtype/device: "
+                f"request_ids={req.request_ids}, metadata={negative_metadata}"
+            )
+        for request, positive, negative in zip(req.requests, hidden_items, negative_items, strict=True):
+            if negative is not None and negative.shape != positive.shape:
+                raise ValueError(
+                    f"Ming request {request.request_id!r} negative hidden shape {tuple(negative.shape)} "
+                    f"does not match positive shape {tuple(positive.shape)}"
+                )
+
+        first_shape = tuple(hidden_items[0].shape)
+        if any(tuple(item.shape) != first_shape for item in hidden_items[1:]):
+            details = [(rid, tuple(item.shape)) for rid, item in zip(req.request_ids, hidden_items, strict=True)]
+            raise ValueError(f"Ming request batch hidden-state shapes are incompatible: {details}")
+        hidden_batch = torch.cat(hidden_items, dim=0)
+        cap_batch = self.condition_encoder(hidden_batch)
+        cap_feats = [cap_batch[i] for i in range(req.num_reqs)]
+
+        negative_cap_feats: list[torch.Tensor] = []
+        if any(item is not None for item in negative_items):
+            negative_batch = torch.cat(
+                [
+                    item if item is not None else torch.zeros_like(hidden)
+                    for item, hidden in zip(negative_items, hidden_items, strict=True)
+                ],
+                dim=0,
+            )
+            negative_batch_feats = self.condition_encoder(negative_batch)
+            negative_cap_feats = [
+                negative_batch_feats[i] if item is not None else self.condition_encoder.zero_negative(cap_feats[i])
+                for i, item in enumerate(negative_items)
+            ]
         else:
-            generator = sp.generator
+            negative_cap_feats = [self.condition_encoder.zero_negative(item) for item in cap_feats]
 
-        # Format prompt_embeds / negative_prompt_embeds as list[Tensor]
-        # (one entry per request) — matches ZImagePipeline's contract when
-        # prompt_embeds are pre-computed.
-        prompt_embeds = [cap_feats[i] for i in range(cap_feats.shape[0])]
-        if negative_cap_feats is not None:
-            negative_prompt_embeds = [negative_cap_feats[i] for i in range(negative_cap_feats.shape[0])]
-        else:
-            negative_prompt_embeds = [self.condition_encoder.zero_negative(e) for e in prompt_embeds]
+        byte5_features: list[torch.Tensor | None] = [None] * req.num_reqs
+        if self.byte5 is not None:
+            for i, (request, extra) in enumerate(zip(req.requests, extras, strict=True)):
+                texts = self._resolve_byte5_texts(extra, request.sampling_params)
+                if texts:
+                    encoded = self.byte5(texts).to(device=target_device, dtype=target_dtype)
+                    byte5_features[i] = encoded.reshape(1, -1, encoded.shape[-1])[0]
+        for i, byte5 in enumerate(byte5_features):
+            if byte5 is not None:
+                cap_feats[i] = torch.cat((cap_feats[i], byte5), dim=0)
+                negative_cap_feats[i] = torch.cat((negative_cap_feats[i], torch.zeros_like(byte5)), dim=0)
+
+        # Sampling knobs are resolved per request. The scheduler's compatibility
+        # key keeps shape/control-flow fields homogeneous within this wave.
+        resolved_params: list[tuple[OmniDiffusionSamplingParams, int, int, int, float, int | None]] = []
+        for request in req.requests:
+            sp = request.sampling_params
+            ea = sp.extra_args or {}
+            values: dict[str, Any] = {}
+            for ea_key, sp_attr, default in (
+                ("height", "height", cfg.default_height),
+                ("width", "width", cfg.default_width),
+                ("steps", "num_inference_steps", cfg.num_inference_steps),
+                ("cfg", "guidance_scale", cfg.guidance_scale),
+                ("seed", "seed", None),
+            ):
+                for value in (ea.get(ea_key), getattr(sp, sp_attr), default):
+                    if value is not None:
+                        values[ea_key] = value
+                        break
+            explicit_seed = ea.get("seed")
+            seed = values.get("seed")
+            if sp.generator is not None and explicit_seed is None:
+                generator = sp.generator
+            elif seed is not None:
+                generator = torch.Generator(device=target_device).manual_seed(int(seed))
+            else:
+                generator = sp.generator
+            z_sp = copy(sp)
+            z_sp.height = int(values["height"])
+            z_sp.width = int(values["width"])
+            z_sp.num_inference_steps = int(values["steps"])
+            z_sp.guidance_scale = float(values["cfg"])
+            z_sp.generator = generator
+            z_sp.output_type = "pt"
+            resolved_params.append((z_sp, z_sp.height, z_sp.width, z_sp.num_inference_steps, z_sp.guidance_scale, seed))
+
+        heights = {item[1] for item in resolved_params}
+        widths = {item[2] for item in resolved_params}
+        steps = {item[3] for item in resolved_params}
+        guidance = {item[4] for item in resolved_params}
+        if len(heights) != 1 or len(widths) != 1 or len(steps) != 1 or len(guidance) != 1:
+            raise ValueError(f"Ming request batch has incompatible sampling fields for request_ids={req.request_ids}")
+        height, width, num_inference_steps, guidance_scale = (
+            next(iter(heights)), next(iter(widths)), next(iter(steps)), next(iter(guidance))
+        )
+        num_images_per_prompt = resolved_params[0][0].num_outputs_per_prompt or 1
+        if any(item[0].num_outputs_per_prompt != num_images_per_prompt for item in resolved_params):
+            raise ValueError(
+                "Ming request batch has incompatible num_outputs_per_prompt "
+                f"for request_ids={req.request_ids}"
+            )
+
+        prompt_embeds = cap_feats
+        negative_prompt_embeds = negative_cap_feats
         self._pending_prompt_embeds = prompt_embeds
         self._pending_negative_prompt_embeds = negative_prompt_embeds
 
-        # Build a real single-request DiffusionRequestBatch;
-        # the prompt text itself is a neutral placeholder here.
-        z_sp = OmniDiffusionSamplingParams(
-            height=height,
-            width=width,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            generator=generator,
-            output_type="pt",
-        )
         z_req = DiffusionRequestBatch(
             requests=[
-                OmniDiffusionRequest(
-                    prompt={"prompt": ""},
-                    sampling_params=z_sp,
-                    request_id=req.request_id or "ming-imagegen",
-                )
+                OmniDiffusionRequest(prompt={"prompt": ""}, sampling_params=z_sp, request_id=request.request_id)
+                for request, (z_sp, *_rest) in zip(req.requests, resolved_params, strict=True)
             ]
         )
 
-        # Reference image (img2img) → VAE-encoded latent published on the
-        # active ForwardContext so MingZImageTransformer2DModel can read it
-        # from request scope inside its forward().
-        ref_latent = self._encode_reference_image(extra.get("reference_image"), height, width)
+        ref_latents = []
+        has_reference = [extra.get("reference_image") is not None for extra in extras]
+        if any(has_reference):
+            if not all(has_reference):
+                raise ValueError(f"Ming request batch mixes reference and non-reference requests: {req.request_ids}")
+            ref_latents = [
+                self._encode_reference_image(extra.get("reference_image"), height, width) for extra in extras
+            ]
+            ref_latent = torch.cat(ref_latents, dim=0)
+            ref_latent = ref_latent.repeat_interleave(num_images_per_prompt, dim=0)
+        else:
+            ref_latent = None
         set_forward_context_ref_latent(ref_latent)
 
         logger.debug(
@@ -439,19 +493,19 @@ class MingImagePipeline(ZImagePipeline):
             width,
             num_inference_steps,
             guidance_scale,
-            seed,
-            ea,
+            [item[5] for item in resolved_params],
+            [item[0].extra_args for item in resolved_params],
             None if ref_latent is None else tuple(ref_latent.shape),
         )
         try:
-            outputs: DiffusionOutput = super().forward(z_req)
+            output: DiffusionOutput = super().forward(z_req)
         finally:
             set_forward_context_ref_latent(None)
             # Drop request-scoped conditioning so we don't retain GPU tensors.
             self._pending_prompt_embeds = None
             self._pending_negative_prompt_embeds = None
 
-        raw = outputs.output
+        raw = output.output
         if not isinstance(raw, torch.Tensor):
             raise RuntimeError(f"ZImagePipeline returned non-tensor output: {type(raw).__name__}")
         if logger.isEnabledFor(logging.DEBUG):
@@ -461,7 +515,7 @@ class MingImagePipeline(ZImagePipeline):
                 raw.float().min().item(),
                 raw.float().max().item(),
             )
-        return outputs
+        return split_diffusion_output_by_request(output, req, num_outputs_per_prompt=num_images_per_prompt)
 
 
 # ----------------------------------------------------------------------
@@ -505,7 +559,61 @@ def get_ming_image_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
+def get_ming_image_pre_process_func(od_config: OmniDiffusionConfig):
+    """Annotate Ming requests with the fields that must be homogeneous in a wave."""
+
+    del od_config
+    defaults = MingImageGenConfig()
+
+    def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+        extra = request.prompt.get("extra") if isinstance(request.prompt, dict) else {}
+        extra = extra or {}
+        sampling = request.sampling_params
+        sampling_extra = sampling.extra_args or {}
+
+        hidden = extra.get("thinker_hidden_states")
+        if hidden is None:
+            hidden = sampling_extra.get("thinker_hidden_states")
+        if isinstance(hidden, torch.Tensor):
+            hidden_shape = tuple(hidden.shape[-2:]) if hidden.dim() >= 2 else tuple(hidden.shape)
+            hidden_dtype = str(hidden.dtype)
+        else:
+            scale = defaults.img_gen_scales[-1]
+            hidden_shape = (scale * scale, defaults.thinker_hidden_size)
+            hidden_dtype = str(sampling_extra.get("thinker_hidden_states_dtype", "default"))
+
+        def resolve(name: str, attr: str, default: Any) -> Any:
+            return next(
+                (
+                    value
+                    for value in (sampling_extra.get(name), getattr(sampling, attr), default)
+                    if value is not None
+                ),
+                default,
+            )
+
+        byte5_count = len(MingImagePipeline._resolve_byte5_texts(extra, sampling))
+        request.batch_compatibility_key = (
+            "ming_image",
+            int(extra.get("reference_image") is not None),
+            byte5_count,
+            hidden_shape,
+            hidden_dtype,
+            int(resolve("height", "height", defaults.default_height)),
+            int(resolve("width", "width", defaults.default_width)),
+            int(resolve("steps", "num_inference_steps", defaults.num_inference_steps)),
+            float(resolve("cfg", "guidance_scale", defaults.guidance_scale)),
+            int(sampling.num_outputs_per_prompt or 1),
+            sampling.output_type or "pil",
+            sampling.strength,
+        )
+        return request
+
+    return pre_process_func
+
+
 __all__ = [
     "MingImagePipeline",
+    "get_ming_image_pre_process_func",
     "get_ming_image_post_process_func",
 ]
