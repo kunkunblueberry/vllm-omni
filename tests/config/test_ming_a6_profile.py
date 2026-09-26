@@ -31,3 +31,22 @@ def test_ming_a6_cfg_parallel_profile_assigns_two_diffusion_ranks():
     assert [stage.yaml_runtime["devices"] for stage in stages] == ["0,1,2,3", "4,5"]
     assert stages[0].yaml_engine_args["max_num_seqs"] == 2
     assert stages[1].yaml_engine_args["parallel_config"]["cfg_parallel_size"] == 2
+
+
+def test_ming_high_throughput_profile_enables_request_waves():
+    path = Path(get_deploy_config_path("ming_flash_omni_image_high_throughput.yaml"))
+    deploy = load_deploy_config(path)
+    stages = merge_pipeline_deploy(resolve_pipeline_config("ming_flash_omni_image"), deploy)
+
+    assert stages[0].yaml_engine_args["max_num_seqs"] == 8
+    assert stages[1].yaml_engine_args["max_num_seqs"] == 4
+    assert stages[1].yaml_engine_args["request_batch_max_wait_ms"] == 20
+
+
+def test_ming_default_image_profile_remains_low_latency():
+    path = Path(get_deploy_config_path("ming_flash_omni_image.yaml"))
+    deploy = load_deploy_config(path)
+    stages = merge_pipeline_deploy(resolve_pipeline_config("ming_flash_omni_image"), deploy)
+
+    assert stages[1].yaml_engine_args.get("max_num_seqs", 1) == 1
+    assert stages[1].yaml_engine_args.get("request_batch_max_wait_ms", 0.0) == 0.0

@@ -178,6 +178,19 @@ vllm serve Jonathan1909/Ming-flash-omni-2.0 --omni \
 With fewer GPUs, copy the YAML and drop the thinker to TP=2 with the DiT on a
 free card.
 
+### Request/wave batching (opt-in)
+
+For compatible image requests arriving in a burst, use
+`vllm_omni/deploy/ming_flash_omni_image_high_throughput.yaml`. It keeps stage 0
+capacity for parent plus CFG companion requests, admits up to four compatible
+stage-1 requests, and sets `request_batch_max_wait_ms: 20`. The default image
+profile remains `max_num_seqs: 1` with no admission wait for low latency.
+
+Compatibility is explicit: requests with different resolution, denoise steps,
+CFG, output count, ByT5 structure, or reference-image mode are scheduled in
+separate waves. Reference images are kept request-local. Throughput and
+latency benchmarks are **待测** until a real server measurement is available.
+
 ### Online (text-to-image)
 
 Request image output with `"modalities": ["image"]`:
