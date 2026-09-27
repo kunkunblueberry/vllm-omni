@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # Copyright 2025 Alibaba Z-Image Team and The HuggingFace Team. All rights reserved.
 #
@@ -708,7 +708,8 @@ class ZImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin
 
         # 5. Prepare timesteps
         if image is None:
-            image_seq_len = (latents.shape[2] // 2) * (latents.shape[3] // 2)
+            # for both [B, C, H, W] and multi-layer/frame [B, C, F, H, W]
+            image_seq_len = (latents.shape[-2] // 2) * (latents.shape[-1] // 2)
             mu = calculate_shift(
                 image_seq_len,
                 self.scheduler.config.get("base_image_seq_len", 256),
