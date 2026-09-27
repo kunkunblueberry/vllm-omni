@@ -117,6 +117,27 @@ def test_helios_step_single_request_regression_uses_same_path() -> None:
     assert torch.allclose(noise_pred, torch.full_like(noise_pred, 5.0))
 
 
+def test_helios_step_request_churn_keeps_state_and_output_identity() -> None:
+    pipeline = _step_pipeline()
+    request_a = _step_state("request-a", 2.0)
+    request_b = _step_state("request-b", 7.0)
+    request_c = _step_state("request-c", 11.0)
+
+    first_batch = InputBatch.make_batch([request_a, request_b])
+    first_pred = pipeline.denoise_step(first_batch, states=[request_a, request_b])
+
+    request_c.timesteps = torch.tensor([0.5])
+    second_batch = InputBatch.make_batch([request_b, request_c], cached_batch=first_batch)
+    second_pred = pipeline.denoise_step(second_batch, states=[request_b, request_c])
+
+    assert pipeline.transformer.calls == 2
+    assert second_batch.request_ids == ["request-b", "request-c"]
+    assert torch.allclose(first_pred[0], torch.full_like(first_pred[0], 3.0))
+    assert torch.allclose(first_pred[1], torch.full_like(first_pred[1], 8.0))
+    assert torch.allclose(second_pred[0], torch.full_like(second_pred[0], 8.0))
+    assert torch.allclose(second_pred[1], torch.full_like(second_pred[1], 12.0))
+
+
 def _request(request_id: str, *, extra_args: dict | None = None) -> OmniDiffusionRequest:
     return OmniDiffusionRequest(
         request_id=request_id,
