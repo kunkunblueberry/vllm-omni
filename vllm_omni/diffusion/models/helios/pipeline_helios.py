@@ -1175,7 +1175,9 @@ class HeliosPipeline(
 
         request_prompts = req.prompts
         if req.num_reqs == 1 and prompt is not None:
-            request_prompts = [prompt if negative_prompt is None else {"prompt": prompt, "negative_prompt": negative_prompt}]
+            request_prompts = [
+                prompt if negative_prompt is None else {"prompt": prompt, "negative_prompt": negative_prompt}
+            ]
         prompt = [item if isinstance(item, str) else item.get("prompt") for item in request_prompts]
         negative_values = [None if isinstance(item, str) else item.get("negative_prompt") for item in request_prompts]
         negative_prompt = (
