@@ -810,9 +810,9 @@ class HeliosPipeline(
             "indices_latents_history_long": self._concat_state_extra_tensor(
                 states, "indices_latents_history_long", expand_to_batch=True
             ),
-            "latents_history_short": self._concat_state_extra_tensor(
-                states, "latents_history_short"
-            ).to(extra["dtype"]),
+            "latents_history_short": self._concat_state_extra_tensor(states, "latents_history_short").to(
+                extra["dtype"]
+            ),
             "latents_history_mid": self._concat_state_extra_tensor(states, "latents_history_mid").to(extra["dtype"]),
             "latents_history_long": self._concat_state_extra_tensor(states, "latents_history_long").to(extra["dtype"]),
             "attention_kwargs": extra["attention_kwargs"],
@@ -886,9 +886,9 @@ class HeliosPipeline(
             "indices_latents_history_long": self._concat_state_extra_tensor(
                 states, "indices_latents_history_long", expand_to_batch=True
             ),
-            "latents_history_short": self._concat_state_extra_tensor(
-                states, "latents_history_short"
-            ).to(extra["dtype"]),
+            "latents_history_short": self._concat_state_extra_tensor(states, "latents_history_short").to(
+                extra["dtype"]
+            ),
             "latents_history_mid": self._concat_state_extra_tensor(states, "latents_history_mid").to(extra["dtype"]),
             "latents_history_long": self._concat_state_extra_tensor(states, "latents_history_long").to(extra["dtype"]),
             "attention_kwargs": extra["attention_kwargs"],
@@ -1116,8 +1116,6 @@ class HeliosPipeline(
         sampling_params_list = req.sampling_params_list
         common_sampling = sampling_params_list[0]
         request_extras = [getattr(sampling, "extra_args", {}) or {} for sampling in sampling_params_list]
-        extra = request_extras[0]
-
         def _common_extra(name: str, default: Any) -> Any:
             values = [item.get(name, default) for item in request_extras]
             if any(value != values[0] for value in values[1:]):
@@ -1140,9 +1138,7 @@ class HeliosPipeline(
 
         # Read Helios-specific params from the homogeneous request-batch key.
         history_sizes = list(_common_extra("history_sizes", history_sizes))
-        num_latent_frames_per_chunk = int(
-            _common_extra("num_latent_frames_per_chunk", num_latent_frames_per_chunk)
-        )
+        num_latent_frames_per_chunk = int(_common_extra("num_latent_frames_per_chunk", num_latent_frames_per_chunk))
         keep_first_frame = bool(_common_extra("keep_first_frame", keep_first_frame))
         attention_kwargs = _common_extra("attention_kwargs", attention_kwargs or {})
         frame_num = int(_common_extra("frame_num", frame_num))
@@ -1179,11 +1175,7 @@ class HeliosPipeline(
 
         request_prompts = req.prompts
         if req.num_reqs == 1 and prompt is not None:
-            request_prompts = [
-                prompt
-                if negative_prompt is None
-                else {"prompt": prompt, "negative_prompt": negative_prompt}
-            ]
+            request_prompts = [prompt if negative_prompt is None else {"prompt": prompt, "negative_prompt": negative_prompt}]
         prompt = [item if isinstance(item, str) else item.get("prompt") for item in request_prompts]
         negative_values = [None if isinstance(item, str) else item.get("negative_prompt") for item in request_prompts]
         negative_prompt = (
@@ -1799,10 +1791,7 @@ class HeliosPipeline(
                     f"Helios stage-2 generator count {len(generator)} does not match batch size {batch_size}."
                 )
             z = torch.cat(
-                [
-                    torch.randn(block_number_per_sample, block_size, generator=item, device=device)
-                    for item in generator
-                ],
+                [torch.randn(block_number_per_sample, block_size, generator=item, device=device) for item in generator],
                 dim=0,
             )
         else:
