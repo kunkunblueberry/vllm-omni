@@ -1116,6 +1116,7 @@ class HeliosPipeline(
         sampling_params_list = req.sampling_params_list
         common_sampling = sampling_params_list[0]
         request_extras = [getattr(sampling, "extra_args", {}) or {} for sampling in sampling_params_list]
+
         def _common_extra(name: str, default: Any) -> Any:
             values = [item.get(name, default) for item in request_extras]
             if any(value != values[0] for value in values[1:]):
