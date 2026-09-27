@@ -732,6 +732,17 @@ class HeliosPipeline(
         if len(stage2) != 1:
             raise ValueError("Helios step batch cannot mix stage-1 and stage-2 requests.")
         if stage2.pop():
+            stage_signatures = {
+                (
+                    int(state.extra["stage_index"]),
+                    tuple(state.latents.shape[1:]) if state.latents is not None else None,
+                )
+                for state in states
+            }
+            if len(stage_signatures) != 1:
+                raise ValueError(
+                    "Helios stage-2 step batch requires requests at the same pyramid stage and latent shape."
+                )
             return self._denoise_stage2_step(states, input_batch.latents, input_batch.timesteps)
         return self._denoise_stage1_step(states, input_batch.latents, input_batch.timesteps)
 
