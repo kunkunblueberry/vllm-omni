@@ -131,12 +131,56 @@ def test_helios_step_request_churn_keeps_state_and_output_identity() -> None:
     second_batch = InputBatch.make_batch([request_b, request_c], cached_batch=first_batch)
     second_pred = pipeline.denoise_step(second_batch, states=[request_b, request_c])
 
-    assert pipeline.transformer.calls == 2
+    # B and C have different current timesteps, so compatibility grouping
+    # correctly executes two groups on the second tick.
+    assert pipeline.transformer.calls == 3
     assert second_batch.request_ids == ["request-b", "request-c"]
     assert torch.allclose(first_pred[0], torch.full_like(first_pred[0], 3.0))
     assert torch.allclose(first_pred[1], torch.full_like(first_pred[1], 8.0))
     assert torch.allclose(second_pred[0], torch.full_like(second_pred[0], 8.0))
     assert torch.allclose(second_pred[1], torch.full_like(second_pred[1], 12.0))
+
+
+def test_helios_step_groups_mixed_stage_and_restores_request_order() -> None:
+    pipeline = _step_pipeline()
+    stage1 = _step_state("stage-1", 2.0)
+    stage2 = _step_state("stage-2", 7.0)
+    stage2.extra["is_enable_stage2"] = True
+    stage2.extra["stage_index"] = 1
+
+    prediction = pipeline.denoise_step(
+        InputBatch.make_batch([stage1, stage2]),
+        states=[stage1, stage2],
+    )
+
+    assert pipeline.transformer.calls == 2
+    assert torch.allclose(prediction[0], torch.full_like(prediction[0], 3.0))
+    assert torch.allclose(prediction[1], torch.full_like(prediction[1], 8.0))
+
+
+def test_helios_step_groups_mixed_cfg_without_input_batch_failure() -> None:
+    pipeline = _step_pipeline()
+    cfg = _step_state("cfg", 2.0)
+    no_cfg = _step_state("no-cfg", 7.0)
+    cfg.do_true_cfg = True
+    cfg.negative_prompt_embeds = torch.full((1, 2, 3), -1.0)
+
+    def fake_stage1(self, states, latents, timesteps):
+        del states, timesteps
+        return latents + 1.0
+
+    pipeline._denoise_stage1_step = MethodType(fake_stage1, pipeline)
+
+    prediction = pipeline.denoise_step(
+        # InputBatch intentionally rejects mixed CFG scalar settings.  The
+        # pipeline grouping contract is exercised directly here so that
+        # mixed CFG requests are still isolated when presented by a caller.
+        InputBatch.make_batch([cfg]),
+        states=[cfg, no_cfg],
+    )
+
+    assert prediction.shape[0] == 2
+    assert torch.allclose(prediction[:, 0, 0, 0, 0], torch.tensor([3.0, 8.0]))
 
 
 def _request(request_id: str, *, extra_args: dict | None = None) -> OmniDiffusionRequest:

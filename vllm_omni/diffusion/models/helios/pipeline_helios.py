@@ -728,23 +728,22 @@ class HeliosPipeline(
         del kwargs
         if not states:
             raise ValueError("Helios step execution received an empty batch.")
-        stage2 = {bool(state.extra["is_enable_stage2"]) for state in states}
-        if len(stage2) != 1:
-            raise ValueError("Helios step batch cannot mix stage-1 and stage-2 requests.")
-        if stage2.pop():
-            stage_signatures = {
-                (
-                    int(state.extra["stage_index"]),
-                    tuple(state.latents.shape[1:]) if state.latents is not None else None,
-                )
-                for state in states
-            }
-            if len(stage_signatures) != 1:
-                raise ValueError(
-                    "Helios stage-2 step batch requires requests at the same pyramid stage and latent shape."
-                )
-            return self._denoise_stage2_step(states, input_batch.latents, input_batch.timesteps)
-        return self._denoise_stage1_step(states, input_batch.latents, input_batch.timesteps)
+        outputs: dict[str, torch.Tensor] = {}
+        for group in self._split_step_groups(states):
+            group_latents = torch.cat([state.latents for state in group if state.latents is not None], dim=0)
+            group_timesteps = group[0].current_timestep
+            assert group_timesteps is not None
+            if bool(group[0].extra.get("is_enable_stage2", False)):
+                prediction = self._denoise_stage2_step(group, group_latents, group_timesteps)
+            else:
+                prediction = self._denoise_stage1_step(group, group_latents, group_timesteps)
+            offset = 0
+            for state in group:
+                assert state.latents is not None
+                rows = int(state.latents.shape[0])
+                outputs[state.request_id] = prediction[offset : offset + rows]
+                offset += rows
+        return torch.cat([outputs[state.request_id] for state in states], dim=0)
 
     @staticmethod
     def _concat_state_tensor(states: Sequence[StepRequestState], name: str) -> torch.Tensor:
@@ -782,6 +781,51 @@ class HeliosPipeline(
             return torch.cat(tensors, dim=0)
         except RuntimeError as exc:
             raise ValueError(f"Helios step batch extra[{name!r}] has incompatible shapes.") from exc
+
+    @staticmethod
+    def _step_tensor_shape(state: StepRequestState, name: str) -> tuple[int, ...] | None:
+        value = state.extra.get(name)
+        return tuple(value.shape[1:]) if isinstance(value, torch.Tensor) else None
+
+    def _step_group_key(self, state: StepRequestState) -> tuple[Any, ...]:
+        """Describe compatibility for the current denoise step."""
+        if state.latents is None or state.current_timestep is None:
+            raise ValueError(f"Helios request {state.request_id} is missing step inputs.")
+        return (
+            bool(state.extra.get("is_enable_stage2", False)),
+            int(state.extra.get("stage_index", -1)),
+            tuple(state.latents.shape[1:]),
+            tuple(state.current_timestep.detach().reshape(-1).tolist()),
+            bool(state.do_true_cfg),
+            str(state.extra.get("dtype")),
+            repr(state.extra.get("attention_kwargs", {})),
+            float(state.extra.get("guidance_scale", 0.0)),
+            bool(state.extra.get("use_cfg_zero_star", False)),
+            bool(state.extra.get("use_zero_init", True)),
+            int(state.extra.get("zero_steps", 1)),
+            tuple(state.prompt_embeds.shape[1:]) if state.prompt_embeds is not None else None,
+            tuple(state.negative_prompt_embeds.shape[1:])
+            if state.negative_prompt_embeds is not None
+            else None,
+            tuple(
+                self._step_tensor_shape(state, name)
+                for name in (
+                    "indices_hidden_states",
+                    "indices_latents_history_short",
+                    "indices_latents_history_mid",
+                    "indices_latents_history_long",
+                    "latents_history_short",
+                    "latents_history_mid",
+                    "latents_history_long",
+                )
+            ),
+        )
+
+    def _split_step_groups(self, states: Sequence[StepRequestState]) -> list[list[StepRequestState]]:
+        grouped: dict[tuple[Any, ...], list[StepRequestState]] = {}
+        for state in states:
+            grouped.setdefault(self._step_group_key(state), []).append(state)
+        return list(grouped.values())
 
     def _denoise_stage1_step(
         self,
