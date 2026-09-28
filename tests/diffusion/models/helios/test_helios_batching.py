@@ -179,7 +179,7 @@ def _batch_pipeline() -> HeliosPipeline:
 
     def prepare_latents(self, batch_size, *args, **kwargs):
         del args, kwargs
-        return torch.zeros(batch_size, 1, 1, 2, 2)
+        return torch.zeros(batch_size, 1, 1, 32, 32)
 
     def stage1_sample(self, latents, prompt_embeds, **kwargs):
         del kwargs
