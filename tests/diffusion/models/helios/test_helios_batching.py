@@ -16,6 +16,7 @@ from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.platforms import current_omni_platform
 
 
 class _CountingTransformer:
@@ -196,7 +197,8 @@ def _batch_pipeline() -> HeliosPipeline:
     return pipeline
 
 
-def test_helios_request_batch_forward_is_fused_and_keeps_output_order() -> None:
+def test_helios_request_batch_forward_is_fused_and_keeps_output_order(monkeypatch) -> None:
+    monkeypatch.setattr(current_omni_platform, "empty_cache", lambda: None)
     pipeline = _batch_pipeline()
     request_batch = DiffusionRequestBatch([_request("a"), _request("b")])
 
@@ -207,7 +209,8 @@ def test_helios_request_batch_forward_is_fused_and_keeps_output_order() -> None:
     assert torch.allclose(result[1].output, torch.ones_like(result[1].output))
 
 
-def test_helios_request_batch_matches_single_request_output() -> None:
+def test_helios_request_batch_matches_single_request_output(monkeypatch) -> None:
+    monkeypatch.setattr(current_omni_platform, "empty_cache", lambda: None)
     single = _batch_pipeline().forward(DiffusionRequestBatch([_request("a")]), output_type="latent")[0]
     batched = _batch_pipeline().forward(
         DiffusionRequestBatch([_request("a"), _request("b")]), output_type="latent"
