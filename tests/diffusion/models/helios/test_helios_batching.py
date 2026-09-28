@@ -201,9 +201,18 @@ def test_helios_request_batch_forward_is_fused_and_keeps_output_order() -> None:
 
     result = pipeline.forward(request_batch, output_type="latent")
 
-    assert result.output.shape[0] == 2
-    assert torch.allclose(result.output[0], torch.zeros_like(result.output[0]))
-    assert torch.allclose(result.output[1], torch.ones_like(result.output[1]))
+    assert [output.output.shape[0] for output in result] == [1, 1]
+    assert torch.allclose(result[0].output, torch.zeros_like(result[0].output))
+    assert torch.allclose(result[1].output, torch.ones_like(result[1].output))
+
+
+def test_helios_request_batch_matches_single_request_output() -> None:
+    single = _batch_pipeline().forward(DiffusionRequestBatch([_request("a")]), output_type="latent")[0]
+    batched = _batch_pipeline().forward(
+        DiffusionRequestBatch([_request("a"), _request("b")]), output_type="latent"
+    )[0]
+
+    assert torch.allclose(single.output, batched.output)
 
 
 def test_helios_declares_both_batch_capabilities() -> None:
