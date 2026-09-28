@@ -185,7 +185,7 @@ def _batch_pipeline() -> HeliosPipeline:
         del kwargs
         return latents + prompt_embeds.view(prompt_embeds.shape[0], 1, 1, 1, 1)
 
-    def decode(self, latents, **kwargs):
+    def decode(latents, **kwargs):
         del kwargs
         return (latents,)
 
