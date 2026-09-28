@@ -167,6 +167,7 @@ def _batch_pipeline() -> HeliosPipeline:
         config=SimpleNamespace(in_channels=1, patch_size=(1, 1, 1)),
     )
     pipeline.vae = SimpleNamespace(
+        device=torch.device("cpu"),
         dtype=torch.float32,
         config=SimpleNamespace(latents_mean=[0.0], latents_std=[1.0], z_dim=1),
     )
