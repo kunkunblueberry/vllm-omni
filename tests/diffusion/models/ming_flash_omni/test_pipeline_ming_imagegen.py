@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +9,7 @@ import torch
 import torch.nn as nn
 
 from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.models.ming_flash_omni import ming_zimage_transformer, pipeline_ming_imagegen
 from vllm_omni.diffusion.models.ming_flash_omni.ming_zimage_transformer import (
     MingZImageTransformer2DModel,
@@ -15,10 +17,13 @@ from vllm_omni.diffusion.models.ming_flash_omni.ming_zimage_transformer import (
 from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
 from vllm_omni.diffusion.models.z_image.z_image_transformer import ZImageTransformer2DModel
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched import StepScheduler
+from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_executor.stage_input_processors.ming_flash_omni import thinker2imagegen
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -217,10 +222,23 @@ def _step_pipeline(monkeypatch):
     )
     pipe.condition_encoder = _StepConditionEncoder()
     pipe.byte5 = None
-    monkeypatch.setattr(pipe, "_step_conditioning", lambda state: (torch.ones(2, 3), torch.zeros(2, 3)))
-    monkeypatch.setattr(pipe, "_encode_reference_image", lambda ref, height, width: torch.ones(1, 1, 2, 2))
+    monkeypatch.setattr(
+        pipe,
+        "_encode_reference_image",
+        lambda ref, height, width: torch.full((1, 1, 2, 2), float(torch.as_tensor(ref).flatten()[0])),
+    )
+
+    pipe.seen_step_conditions = []
 
     def fake_predict(**kwargs):
+        pipe.seen_step_conditions.append(
+            {
+                "request_ids": [item for item in kwargs["positive_kwargs"]["cap_feats"]],
+                "negative": None
+                if kwargs["negative_kwargs"] is None
+                else [item for item in kwargs["negative_kwargs"]["cap_feats"]],
+            }
+        )
         return torch.zeros((len(kwargs["positive_kwargs"]["x"]), 1, 1, 4, 4))
 
     monkeypatch.setattr(pipe, "predict_noise_maybe_with_cfg", fake_predict)
@@ -287,3 +305,173 @@ def test_ming_step_preprocessor_isolates_reference_requests():
     ref_a = _request("A", torch.ones((2, 3)), seed=111, reference=torch.zeros(1))
     ref_b = _request("B", torch.ones((2, 3)), seed=222, reference=torch.ones(1))
     assert pre(ref_a).batch_compatibility_key != pre(ref_b).batch_compatibility_key
+
+
+def test_ming_step_denoise_scopes_reference_latents_in_active_request_order(monkeypatch):
+    pipe = _step_pipeline(monkeypatch)
+    states = [
+        StepRequestState(
+            request_id=request_id,
+            sampling=OmniDiffusionSamplingParams(height=4, width=4, num_inference_steps=3),
+            prompt={"extra": {"thinker_hidden_states": torch.ones(2, 3), "reference_image": torch.full((1,), value)}},
+        )
+        for request_id, value in (("A", 1.0), ("B", 2.0))
+    ]
+    for state in states:
+        pipe.prepare_encode(state)
+
+    captured = []
+    monkeypatch.setattr(
+        pipeline_ming_imagegen,
+        "set_forward_context_ref_latent",
+        lambda value: captured.append(None if value is None else value.clone()),
+    )
+    pipe.denoise_step(InputBatch.make_batch(states), states=states)
+
+    torch.testing.assert_close(captured[0][:, 0, 0, 0], torch.tensor([1.0, 2.0]))
+    assert captured[-1] is None
+
+
+def test_ming_step_batch_runs_through_real_scheduler_and_runner(monkeypatch):
+    """Exercise the closest CPU-only production path without loading a checkpoint.
+
+    The scheduler, runner, request states, InputBatch construction, Ming hooks,
+    completion bookkeeping, and output routing are real.  Only the heavyweight
+    DIT/VAE kernels are replaced by the deterministic test pipeline above.
+    """
+    pipe = _step_pipeline(monkeypatch)
+    pipe.supports_step_execution = True
+
+    runner = object.__new__(DiffusionModelRunner)
+    runner.vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(
+            ir_op_priority=SimpleNamespace(set_priority=lambda *args, **kwargs: nullcontext())
+        ),
+        compilation_config=SimpleNamespace(ir_enable_torch_wrap=True),
+    )
+    runner.od_config = SimpleNamespace(
+        cache_backend=None,
+        diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
+        parallel_config=SimpleNamespace(use_hsdp=False),
+        streaming_output=False,
+    )
+    runner.device = torch.device("cpu")
+    runner.pipeline = pipe
+    runner.cache_backend = None
+    runner.offload_backend = None
+    runner.state_cache = {}
+    runner.kv_transfer_manager = SimpleNamespace(
+        receive_multi_kv_cache_distributed=lambda *args, **kwargs: None,
+    )
+
+    # The CI CPU platform advertises availability but has no CUDA memory API.
+    # Disable only that optional metric so the real runner path can execute.
+    platform_path = "vllm_omni.diffusion.worker.diffusion_model_runner.current_omni_platform"
+    monkeypatch.setattr(f"{platform_path}.is_available", lambda: False)
+    monkeypatch.setattr(f"{platform_path}.max_memory_reserved", lambda: 0)
+    monkeypatch.setattr(f"{platform_path}.max_memory_allocated", lambda: 0)
+
+    pre = pipeline_ming_imagegen.get_ming_image_pre_process_func(SimpleNamespace())
+    requests = []
+    for request_id, hidden, seed in (
+        ("A", torch.ones(257, 3), 111),
+        ("B", torch.ones(257, 3) * 2, 222),
+    ):
+        # Feed a production-shaped thinker output through the real stage input
+        # processor; this is the production producer of prompt.extra hidden state.
+        thinker_output = SimpleNamespace(
+            request_id=request_id,
+            prompt_token_ids=[157157] * 256 + [157159],
+            outputs=[SimpleNamespace(multimodal_output={"final_hidden_states": hidden})],
+        )
+        thinker_outputs = [thinker_output]
+        if request_id == "A":
+            thinker_outputs.append(
+                SimpleNamespace(
+                    request_id="A__cfg_text",
+                    prompt_token_ids=[157157] * 256 + [157159],
+                    outputs=[SimpleNamespace(multimodal_output={"final_hidden_states": torch.full((257, 3), 7.0)})],
+                )
+            )
+        imagegen_prompt = thinker2imagegen(thinker_outputs, prompt={"prompt": ""})[0]
+        request = OmniDiffusionRequest(
+            prompt=imagegen_prompt,
+            sampling_params=OmniDiffusionSamplingParams(
+                seed=seed,
+                height=4,
+                width=4,
+                num_inference_steps=2,
+            ),
+            request_id=request_id,
+        )
+        requests.append(pre(request))
+    scheduler = StepScheduler()
+    scheduler.initialize(
+        SimpleNamespace(
+            max_num_seqs=2,
+            omni_kv_config=None,
+            diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
+        )
+    )
+    scheduler.add_request(requests[0])
+
+    first = scheduler.schedule()
+    assert first.scheduled_request_ids == ["A"]
+    first_output = runner.execute_stepwise(first)
+    assert first_output.request_ids == ["A"]
+    assert all(not item.finished for item in first_output.runner_outputs)
+    torch.testing.assert_close(pipe.seen_step_conditions[0]["request_ids"][0], torch.full((256, 3), 11.0))
+    torch.testing.assert_close(pipe.seen_step_conditions[0]["negative"][0], torch.full((256, 3), 17.0))
+    scheduler.update_from_output(first, first_output)
+
+    # Admit B while A is already running; the next real wave must contain
+    # newly admitted B plus cached A.  BaseScheduler emits new rows first;
+    # request ids, rather than list position, are the routing contract.
+    scheduler.add_request(requests[1])
+    second = scheduler.schedule()
+    assert second.scheduled_request_ids == ["B", "A"]
+    assert second.scheduled_cached_reqs.request_ids == ["A"]
+    second_output = runner.execute_stepwise(second)
+    assert second_output.request_ids == ["B", "A"]
+    torch.testing.assert_close(pipe.seen_step_conditions[1]["request_ids"][0], torch.full((256, 3), 12.0))
+    torch.testing.assert_close(pipe.seen_step_conditions[1]["request_ids"][1], torch.full((256, 3), 11.0))
+    torch.testing.assert_close(pipe.seen_step_conditions[1]["negative"][0], torch.zeros((256, 3)))
+    torch.testing.assert_close(pipe.seen_step_conditions[1]["negative"][1], torch.full((256, 3), 17.0))
+    assert second_output["A"].finished is True
+    assert second_output["B"].finished is False
+    scheduler.update_from_output(second, second_output)
+
+    third = scheduler.schedule()
+    assert third.scheduled_request_ids == ["B"]
+    third_output = runner.execute_stepwise(third)
+    assert third_output.request_ids == ["B"]
+    assert third_output["B"].finished is True
+    scheduler.update_from_output(third, third_output)
+
+    assert not scheduler.has_requests()
+    assert runner.state_cache == {}
+    assert third_output["B"].result.output.shape == (1, 1, 4, 4)
+
+
+def test_ming_step_scheduler_matches_deterministic_reference_recurrence(monkeypatch):
+    """The scheduler hook applies the same deterministic latent recurrence each tick."""
+    pipe = _step_pipeline(monkeypatch)
+    state = StepRequestState(
+        request_id="A",
+        sampling=OmniDiffusionSamplingParams(seed=111, height=4, width=4, num_inference_steps=3),
+        prompt={"extra": {"thinker_hidden_states": torch.ones(2, 3)}},
+    )
+    pipe.prepare_encode(state)
+    initial = state.latents.clone()
+    for _ in range(3):
+        batch = InputBatch.make_batch([state])
+        prediction = pipe.denoise_step(batch, states=[state])
+        pipe.step_scheduler(state, prediction)
+
+    expected = initial.clone()
+    scheduler = _StepScheduler()
+    scheduler.set_timesteps(3, device=torch.device("cpu"))
+    for timestep in scheduler.timesteps:
+        expected = scheduler.step(torch.zeros_like(expected), timestep, expected, return_dict=False)[0]
+
+    torch.testing.assert_close(state.latents, expected)
