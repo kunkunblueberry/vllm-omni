@@ -804,9 +804,7 @@ class HeliosPipeline(
             bool(state.extra.get("use_zero_init", True)),
             int(state.extra.get("zero_steps", 1)),
             tuple(state.prompt_embeds.shape[1:]) if state.prompt_embeds is not None else None,
-            tuple(state.negative_prompt_embeds.shape[1:])
-            if state.negative_prompt_embeds is not None
-            else None,
+            tuple(state.negative_prompt_embeds.shape[1:]) if state.negative_prompt_embeds is not None else None,
             tuple(
                 self._step_tensor_shape(state, name)
                 for name in (

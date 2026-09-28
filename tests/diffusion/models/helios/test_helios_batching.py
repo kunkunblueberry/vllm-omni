@@ -7,11 +7,20 @@ from types import MethodType, SimpleNamespace
 
 import torch
 
+import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
+from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.models.helios.pipeline_helios import (
     HeliosPipeline,
     get_helios_pre_process_func,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched.interface import (
+    CachedRequestData,
+    DiffusionSchedulerOutput,
+    NewRequestData,
+)
+from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
@@ -183,6 +192,86 @@ def test_helios_step_groups_mixed_cfg_without_input_batch_failure() -> None:
     assert torch.allclose(prediction[:, 0, 0, 0, 0], torch.tensor([3.0, 8.0]))
 
 
+def test_helios_step_batch_uses_production_runner_path(monkeypatch) -> None:
+    """Exercise scheduler output -> runner state -> InputBatch -> Helios denoise."""
+    pipeline = _step_pipeline()
+
+    def prepare_encode(self, state):
+        value = 2.0 if state.request_id == "request-a" else 7.0
+        template = _step_state(state.request_id, value)
+        state.latents = template.latents
+        state.timesteps = template.timesteps
+        state.prompt_embeds = template.prompt_embeds
+        state.extra.update(template.extra)
+        state.total_chunks = 1
+        return state
+
+    def step_scheduler(self, state, noise_pred, **kwargs):
+        del kwargs
+        state.latents = noise_pred
+        state.step_index += 1
+
+    def post_decode(self, state, **kwargs):
+        del kwargs
+        return DiffusionOutput(output=state.latents.clone())
+
+    pipeline.prepare_encode = MethodType(prepare_encode, pipeline)
+    pipeline.step_scheduler = MethodType(step_scheduler, pipeline)
+    pipeline.post_decode = MethodType(post_decode, pipeline)
+    pipeline.supports_step_execution = True
+
+    runner = object.__new__(DiffusionModelRunner)
+    runner.vllm_config = SimpleNamespace()
+    runner.od_config = SimpleNamespace(
+        cache_backend=None,
+        diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
+        parallel_config=SimpleNamespace(use_hsdp=False),
+        streaming_output=False,
+    )
+    runner.device = torch.device("cpu")
+    runner.pipeline = pipeline
+    runner.input_batch = None
+    runner.cache_backend = None
+    runner.offload_backend = None
+    runner.state_cache = {}
+    runner.kv_transfer_manager = SimpleNamespace(
+        receive_multi_kv_cache_distributed=lambda *args, **kwargs: None,
+    )
+    runner._sample_peak_memory_mb = lambda: 0.0
+    runner._maybe_send_stage_payload = lambda *args, **kwargs: None
+    monkeypatch.setattr(model_runner_module, "set_forward_context", lambda **kwargs: _noop_context())
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "is_available", lambda: False)
+
+    requests = [_request("request-a"), _request("request-b")]
+    scheduler_output = DiffusionSchedulerOutput(
+        step_id=0,
+        scheduled_new_reqs=[NewRequestData(request_id=req.request_id, req=req) for req in requests],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        finished_req_ids=set(),
+        num_running_reqs=2,
+        num_waiting_reqs=0,
+    )
+
+    result = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+
+    assert pipeline.transformer.calls == 1
+    assert result.request_ids == ["request-a", "request-b"]
+    assert torch.allclose(result.get_request_output("request-a").result.output, torch.full((1, 1, 1, 2, 2), 3.0))
+    assert torch.allclose(result.get_request_output("request-b").result.output, torch.full((1, 1, 1, 2, 2), 8.0))
+
+
+class _NoopContext:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def _noop_context():
+    return _NoopContext()
+
+
 def _request(request_id: str, *, extra_args: dict | None = None) -> OmniDiffusionRequest:
     return OmniDiffusionRequest(
         request_id=request_id,
@@ -256,9 +345,7 @@ def test_helios_request_batch_forward_is_fused_and_keeps_output_order(monkeypatc
 def test_helios_request_batch_matches_single_request_output(monkeypatch) -> None:
     monkeypatch.setattr(current_omni_platform, "empty_cache", lambda: None)
     single = _batch_pipeline().forward(DiffusionRequestBatch([_request("a")]), output_type="latent")[0]
-    batched = _batch_pipeline().forward(
-        DiffusionRequestBatch([_request("a"), _request("b")]), output_type="latent"
-    )[0]
+    batched = _batch_pipeline().forward(DiffusionRequestBatch([_request("a"), _request("b")]), output_type="latent")[0]
 
     assert torch.allclose(single.output, batched.output)
 
