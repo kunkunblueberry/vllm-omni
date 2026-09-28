@@ -51,3 +51,13 @@ def test_ming_default_image_profile_remains_low_latency():
 
     assert stages[1].yaml_engine_args.get("max_num_seqs", 1) == 1
     assert stages[1].yaml_engine_args.get("request_batch_max_wait_ms", 0.0) == 0.0
+
+
+def test_ming_stepwise_profile_enables_continuous_batching():
+    path = Path(get_deploy_config_path("ming_flash_omni_image_stepwise.yaml"))
+    deploy = load_deploy_config(path)
+    stages = merge_pipeline_deploy(resolve_pipeline_config("ming_flash_omni_image"), deploy)
+
+    assert stages[1].yaml_engine_args["step_execution"] is True
+    assert stages[1].yaml_engine_args["max_num_seqs"] == 4
+    assert stages[1].yaml_engine_args.get("request_batch_max_wait_ms", 0.0) == 0.0

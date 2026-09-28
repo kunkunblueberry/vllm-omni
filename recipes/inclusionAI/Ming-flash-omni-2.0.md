@@ -239,6 +239,23 @@ curl http://127.0.0.1:8091/v1/chat/completions \
   | base64 -d > ming_imagegen_extra_body.png
 ```
 
+### Step-wise continuous batching (opt-in)
+
+For true continuous batching, use
+`vllm_omni/deploy/ming_flash_omni_image_stepwise.yaml`. Stage 1 sets
+`step_execution: true` and `max_num_seqs: 4`; each scheduler tick advances
+each active request by one Ming denoise step, so requests may join and leave a
+running batch at different step indices. The existing
+`ming_flash_omni_image_high_throughput.yaml` remains the request-level wave
+batching profile and is not step-wise execution.
+
+The step-wise profile supports T2I and negative-prompt conditioning. Ming
+img2img/reference-image requests are admitted in request-local groups because
+the current Ming transformer consumes the first reference latent in its forward
+context; cross-request reference-latent batching is therefore intentionally
+disabled until that transformer contract changes. GPU throughput and latency
+measurements are **待测**.
+
 **Full control — `sampling_params_list`** (one entry per stage: `[thinker, imagegen]`).
 Use this when you need to tune the thinker's own sampling (`temperature` / `top_p` / `top_k` / `max_tokens`), or to place knobs explicitly per stage.
 Note `negative_prompt` must sit on the **stage-0 thinker** `extra_args`; the imagegen-stage knobs (`steps` / `cfg` / `height` / `width` / `seed` / `byte5_text`) go on the **stage-1** entry:

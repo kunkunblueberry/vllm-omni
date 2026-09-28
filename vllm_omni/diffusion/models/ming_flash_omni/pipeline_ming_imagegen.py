@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import logging
 import os
-from copy import copy
+from copy import copy, deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,7 @@ import torch
 import torch.nn as nn
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+from diffusers.utils.torch_utils import randn_tensor
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import DistributedAutoencoderKL
@@ -49,12 +50,14 @@ from vllm_omni.diffusion.models.ming_flash_omni.condition_encoder import (
 from vllm_omni.diffusion.models.ming_flash_omni.ming_zimage_transformer import (
     MingZImageTransformer2DModel,
 )
-from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
+from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline, calculate_shift, retrieve_timesteps
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import (
     DiffusionRequestBatch,
     split_diffusion_output_by_request,
 )
+from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
@@ -74,6 +77,7 @@ class MingImagePipeline(ZImagePipeline):
     """
 
     supports_request_batch = True
+    supports_step_execution = True
 
     def __init__(
         self,
@@ -265,6 +269,229 @@ class MingImagePipeline(ZImagePipeline):
             )
 
         return self._pending_prompt_embeds, self._pending_negative_prompt_embeds
+
+    @staticmethod
+    def _step_prompt_extra_from_prompt(prompt: Any) -> dict[str, Any]:
+        if isinstance(prompt, dict):
+            return prompt.get("extra") or {}
+        if prompt is not None and hasattr(prompt, "_asdict"):
+            return MingImagePipeline._step_prompt_extra_from_prompt(prompt._asdict())
+        if prompt is not None and hasattr(prompt, "__dict__"):
+            return MingImagePipeline._step_prompt_extra_from_prompt(vars(prompt))
+        return {}
+
+    def _step_prompt_extra(self, state: StepRequestState) -> dict[str, Any]:
+        return self._step_prompt_extra_from_prompt(state.prompt)
+
+    def _step_conditioning(self, state: StepRequestState) -> tuple[torch.Tensor, torch.Tensor]:
+        extra = self._step_prompt_extra(state)
+        hidden = extra.get("thinker_hidden_states")
+        if hidden is None:
+            hidden = (state.sampling.extra_args or {}).get("thinker_hidden_states")
+        if hidden is None:
+            scale = self.image_gen_config.img_gen_scales[-1]
+            hidden = torch.zeros(
+                (scale * scale, self.image_gen_config.thinker_hidden_size), dtype=self._dtype, device=self.device
+            )
+        if not isinstance(hidden, torch.Tensor):
+            raise TypeError(f"Ming request {state.request_id!r} thinker_hidden_states must be a Tensor")
+        hidden = hidden.to(device=self.device, dtype=self._dtype)
+        if hidden.ndim == 2:
+            hidden = hidden.unsqueeze(0)
+        if hidden.ndim != 3 or hidden.shape[0] != 1:
+            raise ValueError(f"Ming request {state.request_id!r} hidden states must have shape [1,N,H]")
+        positive = self.condition_encoder(hidden)[0]
+
+        negative = extra.get("negative_thinker_hidden_states")
+        if negative is None:
+            negative_features = self.condition_encoder.zero_negative(positive)
+        else:
+            if not isinstance(negative, torch.Tensor):
+                raise TypeError(f"Ming request {state.request_id!r} negative hidden states must be a Tensor")
+            negative = negative.to(device=self.device, dtype=self._dtype)
+            if negative.ndim == 2:
+                negative = negative.unsqueeze(0)
+            if tuple(negative.shape) != tuple(hidden.shape):
+                raise ValueError(f"Ming request {state.request_id!r} negative hidden shape does not match positive")
+            negative_features = self.condition_encoder(negative)[0]
+
+        byte5_texts = self._resolve_byte5_texts(extra, state.sampling)
+        if byte5_texts and self.byte5 is not None:
+            byte5 = self.byte5(byte5_texts).to(device=self.device, dtype=self._dtype)
+            byte5 = byte5.reshape(1, -1, byte5.shape[-1])[0]
+            positive = torch.cat((positive, byte5), dim=0)
+            negative_features = torch.cat((negative_features, torch.zeros_like(byte5)), dim=0)
+        return positive, negative_features
+
+    def _step_sampling_values(self, sampling: OmniDiffusionSamplingParams) -> dict[str, Any]:
+        cfg = self.image_gen_config
+        extra = sampling.extra_args or {}
+        values: dict[str, Any] = {}
+        for extra_key, attr, default in (
+            ("height", "height", cfg.default_height),
+            ("width", "width", cfg.default_width),
+            ("steps", "num_inference_steps", cfg.num_inference_steps),
+            ("cfg", "guidance_scale", cfg.guidance_scale),
+            ("seed", "seed", None),
+        ):
+            for value in (extra.get(extra_key), getattr(sampling, attr, None), default):
+                if value is not None:
+                    values[extra_key] = value
+                    break
+        return values
+
+    def prepare_encode(self, state: StepRequestState, **kwargs: Any) -> StepRequestState:
+        """Encode one request and initialize its private scheduler/latent state."""
+        del kwargs
+        values = self._step_sampling_values(state.sampling)
+        height, width, steps = int(values["height"]), int(values["width"]), int(values["steps"])
+        output_count = max(1, int(state.sampling.num_outputs_per_prompt or 1))
+        if output_count != 1:
+            raise ValueError("Ming STEP_BATCH currently requires num_outputs_per_prompt=1")
+        if state.sampling.sigmas is not None or state.sampling.timesteps is not None:
+            raise ValueError("Ming STEP_BATCH does not support custom sigmas or timesteps yet")
+
+        generator = state.sampling.generator
+        seed = values.get("seed")
+        if seed is not None:
+            generator = torch.Generator(device=self.device).manual_seed(int(seed))
+
+        prompt_embeds, negative_prompt_embeds = self._step_conditioning(state)
+        scheduler = deepcopy(self.scheduler)
+        scheduler.config["use_dynamic_shifting"] = True
+        vae_scale = self.vae_scale_factor * 2
+        if height % vae_scale or width % vae_scale:
+            raise ValueError(f"Ming request {state.request_id!r} dimensions must be divisible by {vae_scale}")
+        latent_h = 2 * (height // vae_scale)
+        latent_w = 2 * (width // vae_scale)
+        mu = calculate_shift(
+            (latent_h // 2) * (latent_w // 2),
+            scheduler.config.get("base_image_seq_len", 256),
+            scheduler.config.get("max_image_seq_len", 4096),
+            scheduler.config.get("base_shift", 0.5),
+            scheduler.config.get("max_shift", 1.15),
+        )
+        scheduler.sigma_min = 0.0
+        timesteps, actual_steps = retrieve_timesteps(scheduler, steps, self.device, mu=mu)
+
+        extra = self._step_prompt_extra(state)
+        reference_image = extra.get("reference_image")
+        reference_latent = (
+            self._encode_reference_image(reference_image, height, width) if reference_image is not None else None
+        )
+        if reference_latent is None:
+            latent_shape = (1, self.transformer.in_channels, latent_h, latent_w)
+            latents = state.sampling.latents
+            if latents is None:
+                latents = randn_tensor(latent_shape, generator=generator, device=self.device, dtype=torch.float32)
+            elif tuple(latents.shape) != latent_shape:
+                raise ValueError(
+                    f"Ming request {state.request_id!r} latents shape {tuple(latents.shape)} != {latent_shape}"
+                )
+            else:
+                latents = latents.to(device=self.device, dtype=torch.float32)
+        else:
+            strength = state.sampling.strength if state.sampling.strength is not None else 0.6
+            if not 0.0 <= strength <= 1.0:
+                raise ValueError(f"Ming request {state.request_id!r} strength must be in [0, 1]")
+            init_timestep = min(int(actual_steps * strength), actual_steps)
+            t_start = max(actual_steps - init_timestep, 0)
+            timesteps = timesteps[t_start * scheduler.order :]
+            if timesteps.numel() == 0:
+                raise ValueError(f"Ming request {state.request_id!r} strength produced no denoise steps")
+            if hasattr(scheduler, "set_begin_index"):
+                scheduler.set_begin_index(t_start * scheduler.order)
+            noise = randn_tensor(
+                reference_latent.shape, generator=generator, device=self.device, dtype=reference_latent.dtype
+            )
+            latents = scheduler.scale_noise(reference_latent, timesteps[:1], noise)
+
+        if hasattr(scheduler, "set_begin_index") and reference_latent is None:
+            scheduler.set_begin_index(0)
+        state.prompt_embeds = prompt_embeds.unsqueeze(0)
+        state.negative_prompt_embeds = negative_prompt_embeds.unsqueeze(0)
+        state.latents = latents
+        state.timesteps = timesteps
+        state.step_index = 0
+        state.scheduler = scheduler
+        state.do_true_cfg = float(values["cfg"]) > 0.0
+        state.extra.update(
+            {
+                "ming_generator": generator,
+                "ming_guidance_scale": float(values["cfg"]),
+                "ming_cfg_normalize": state.sampling.cfg_normalize,
+                "ming_cfg_truncation": (state.sampling.extra_args or {}).get("cfg_truncation", 1.0),
+                "ming_output_type": state.sampling.output_type or "pil",
+                "ming_reference_latent": reference_latent,
+                "ming_height": height,
+                "ming_width": width,
+            }
+        )
+        return state
+
+    def denoise_step(
+        self,
+        input_batch: InputBatch,
+        *,
+        states: list[StepRequestState] | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor | None:
+        """Run exactly one DIT denoise step for the active request batch."""
+        del kwargs
+        active = list(states or input_batch.states)
+        if not active:
+            raise ValueError("Ming denoise_step received an empty batch")
+        x = [latent.unsqueeze(2) for latent in input_batch.latents.unbind(dim=0)]
+        t = (1000.0 - input_batch.timesteps.to(dtype=torch.float32)) / 1000.0
+        positive = [item for item in input_batch.prompt_embeds.unbind(dim=0)]
+        negative = [item for item in input_batch.negative_prompt_embeds.unbind(dim=0)]
+        cfg_scale = float(active[0].extra["ming_guidance_scale"])
+        apply_cfg = active[0].do_true_cfg and cfg_scale > 0
+        positive_kwargs = {"x": x, "t": t, "cap_feats": positive}
+        negative_kwargs = {"x": x, "t": t, "cap_feats": negative} if apply_cfg else None
+        references = [state.extra.get("ming_reference_latent") for state in active]
+        if any(reference is not None for reference in references):
+            if any(reference is None for reference in references):
+                raise ValueError("Ming STEP_BATCH cannot mix reference-image and text-to-image requests")
+            reference = torch.cat([reference for reference in references if reference is not None], dim=0)
+        else:
+            reference = None
+        set_forward_context_ref_latent(reference)
+        try:
+            prediction = self.predict_noise_maybe_with_cfg(
+                do_true_cfg=apply_cfg,
+                true_cfg_scale=cfg_scale,
+                positive_kwargs=positive_kwargs,
+                negative_kwargs=negative_kwargs,
+                cfg_normalize=active[0].extra["ming_cfg_normalize"],
+            )
+        finally:
+            set_forward_context_ref_latent(None)
+        if not isinstance(prediction, torch.Tensor):
+            raise TypeError("Ming denoise_step expected one tensor prediction")
+        return -prediction.squeeze(2)
+
+    def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
+        """Advance only this request's FlowMatch scheduler and latent state."""
+        del kwargs
+        state.latents = state.scheduler.step(
+            noise_pred.to(torch.float32),
+            state.current_timestep,
+            state.latents,
+            return_dict=False,
+        )[0].to(dtype=state.latents.dtype)
+        state.step_index += 1
+
+    @torch.inference_mode()
+    def post_decode(self, state: StepRequestState, **kwargs: Any) -> DiffusionOutput:
+        """Decode once, after this request's final denoise step."""
+        del kwargs
+        latents = state.latents
+        if state.extra["ming_output_type"] == "latent":
+            return DiffusionOutput(output=latents)
+        latents = latents.to(self.vae.dtype)
+        latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+        return DiffusionOutput(output=self.vae.decode(latents, return_dict=False)[0])
 
     # ------------------------------------------------------------------
     # Forward
@@ -592,7 +819,10 @@ def get_ming_image_pre_process_func(od_config: OmniDiffusionConfig):
         byte5_count = len(MingImagePipeline._resolve_byte5_texts(extra, sampling))
         request.batch_compatibility_key = (
             "ming_image",
-            int(extra.get("reference_image") is not None),
+            # Keep reference-image requests in request-local groups. This
+            # preserves the established compatibility contract while the
+            # direct step path still validates per-row reference latents.
+            ("reference", request.request_id) if extra.get("reference_image") is not None else ("t2i",),
             byte5_count,
             hidden_shape,
             hidden_dtype,

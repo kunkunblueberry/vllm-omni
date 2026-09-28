@@ -15,10 +15,10 @@ from vllm_omni.diffusion.models.ming_flash_omni.ming_zimage_transformer import (
 from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
 from vllm_omni.diffusion.models.z_image.z_image_transformer import ZImageTransformer2DModel
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -35,6 +35,10 @@ class _ConditionEncoder(nn.Module):
     @staticmethod
     def zero_negative(value):
         return torch.zeros_like(value)
+
+
+class _StepConditionEncoder(_ConditionEncoder):
+    pass
 
 
 def _pipeline(monkeypatch):
@@ -158,3 +162,128 @@ def test_ming_preprocessor_marks_wave_compatibility():
     req = _request("A", torch.ones((2, 3)), seed=111)
     processed = pre(req)
     assert processed.batch_compatibility_key[0] == "ming_image"
+
+
+class _StepScheduler:
+    order = 1
+
+    def __init__(self):
+        self.config = {
+            "base_image_seq_len": 256,
+            "max_image_seq_len": 4096,
+            "base_shift": 0.5,
+            "max_shift": 1.15,
+        }
+        self.timesteps = None
+
+    def set_timesteps(self, steps, device=None, **kwargs):
+        del kwargs
+        self.timesteps = torch.arange(steps, 0, -1, device=device, dtype=torch.float32)
+
+    def set_begin_index(self, index):
+        self.begin_index = index
+
+    def scale_noise(self, latents, timestep, noise):
+        del timestep
+        return latents + noise
+
+    def step(self, noise_pred, timestep, latents, **kwargs):
+        del timestep, kwargs
+        return (latents - noise_pred,)
+
+
+def _step_pipeline(monkeypatch):
+    pipe = object.__new__(pipeline_ming_imagegen.MingImagePipeline)
+    nn.Module.__init__(pipe)
+    pipe.register_parameter("_probe", nn.Parameter(torch.zeros(1)))
+    pipe.device = torch.device("cpu")
+    pipe._execution_device = pipe.device
+    pipe._dtype = torch.float32
+    pipe.vae_scale_factor = 1
+    pipe.image_gen_config = SimpleNamespace(
+        img_gen_scales=[2],
+        thinker_hidden_size=3,
+        default_height=4,
+        default_width=4,
+        num_inference_steps=3,
+        guidance_scale=2.0,
+    )
+    pipe.transformer = SimpleNamespace(in_channels=1)
+    pipe.scheduler = _StepScheduler()
+    pipe.vae = SimpleNamespace(
+        dtype=torch.float32,
+        config=SimpleNamespace(scaling_factor=1.0, shift_factor=0.0),
+        decode=lambda latents, return_dict=False: (latents,),
+    )
+    pipe.condition_encoder = _StepConditionEncoder()
+    pipe.byte5 = None
+    monkeypatch.setattr(pipe, "_step_conditioning", lambda state: (torch.ones(2, 3), torch.zeros(2, 3)))
+    monkeypatch.setattr(pipe, "_encode_reference_image", lambda ref, height, width: torch.ones(1, 1, 2, 2))
+
+    def fake_predict(**kwargs):
+        return torch.zeros((len(kwargs["positive_kwargs"]["x"]), 1, 1, 4, 4))
+
+    monkeypatch.setattr(pipe, "predict_noise_maybe_with_cfg", fake_predict)
+    return pipe
+
+
+def test_ming_step_lifecycle_runs_one_step_per_tick(monkeypatch):
+    pipe = _step_pipeline(monkeypatch)
+    states = [
+        StepRequestState(
+            request_id="A",
+            sampling=OmniDiffusionSamplingParams(seed=111, height=4, width=4, num_inference_steps=3),
+            prompt={"extra": {"thinker_hidden_states": torch.ones(2, 3)}},
+        ),
+        StepRequestState(
+            request_id="B",
+            sampling=OmniDiffusionSamplingParams(seed=222, height=4, width=4, num_inference_steps=3),
+            prompt={"extra": {"thinker_hidden_states": torch.ones(2, 3) * 2}},
+        ),
+    ]
+    for state in states:
+        pipe.prepare_encode(state)
+    assert [state.step_index for state in states] == [0, 0]
+    batch = InputBatch.make_batch(states)
+    for _ in range(3):
+        prediction = pipe.denoise_step(batch, states=states)
+        assert prediction.shape[0] == 2
+        for index, state in enumerate(states):
+            pipe.step_scheduler(state, prediction[index : index + 1])
+        if not all(state.denoise_completed for state in states):
+            batch = InputBatch.make_batch(states, cached_batch=batch)
+    assert [state.step_index for state in states] == [3, 3]
+    assert all(state.scheduler is not states[0].scheduler for state in states[1:])
+    states[0].extra["ming_output_type"] = "latent"
+    assert pipe.post_decode(states[0]).output is states[0].latents
+
+
+def test_ming_step_batch_uses_each_request_timestep(monkeypatch):
+    pipe = _step_pipeline(monkeypatch)
+    states = []
+    for request_id, step_index in (("A", 3), ("B", 0), ("C", 2)):
+        state = StepRequestState(
+            request_id=request_id,
+            sampling=OmniDiffusionSamplingParams(height=4, width=4, num_inference_steps=4),
+            prompt={"extra": {"thinker_hidden_states": torch.ones(2, 3)}},
+        )
+        pipe.prepare_encode(state)
+        state.step_index = step_index
+        states.append(state)
+    batch = InputBatch.make_batch(states)
+    seen = {}
+
+    def capture_predict(**kwargs):
+        seen["timesteps"] = kwargs["positive_kwargs"]["t"].clone()
+        return torch.zeros((3, 1, 1, 4, 4))
+
+    monkeypatch.setattr(pipe, "predict_noise_maybe_with_cfg", capture_predict)
+    pipe.denoise_step(batch, states=states)
+    torch.testing.assert_close(seen["timesteps"], torch.tensor([0.999, 0.996, 0.998]), atol=1e-6, rtol=0)
+
+
+def test_ming_step_preprocessor_isolates_reference_requests():
+    pre = pipeline_ming_imagegen.get_ming_image_pre_process_func(SimpleNamespace())
+    ref_a = _request("A", torch.ones((2, 3)), seed=111, reference=torch.zeros(1))
+    ref_b = _request("B", torch.ones((2, 3)), seed=222, reference=torch.ones(1))
+    assert pre(ref_a).batch_compatibility_key != pre(ref_b).batch_compatibility_key
