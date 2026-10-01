@@ -787,6 +787,29 @@ class HeliosPipeline(
         value = state.extra.get(name)
         return tuple(value.shape[1:]) if isinstance(value, torch.Tensor) else None
 
+    @staticmethod
+    def _rand_per_sample(
+        shape: tuple[int, ...],
+        *,
+        generator: torch.Generator | list[torch.Generator] | None,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Sample uniform values with request-local generators along dim 0."""
+        if isinstance(generator, list):
+            if len(generator) != shape[0]:
+                raise ValueError(
+                    "Helios request-batch generator count must match the sample dimension: "
+                    f"generators={len(generator)}, samples={shape[0]}"
+                )
+            return torch.cat(
+                [
+                    torch.rand((1, *shape[1:]), device=device, generator=request_generator)
+                    for request_generator in generator
+                ],
+                dim=0,
+            )
+        return torch.rand(shape, device=device, generator=generator)
+
     def _step_group_key(self, state: StepRequestState) -> tuple[Any, ...]:
         """Describe compatibility for the current denoise step."""
         if state.latents is None or state.current_timestep is None:
@@ -803,6 +826,8 @@ class HeliosPipeline(
             bool(state.extra.get("use_cfg_zero_star", False)),
             bool(state.extra.get("use_zero_init", True)),
             int(state.extra.get("zero_steps", 1)),
+            int(state.step_in_chunk) if state.extra.get("use_cfg_zero_star", False) else None,
+            int(state.extra.get("stage_step_index", -1)) if state.extra.get("use_cfg_zero_star", False) else None,
             tuple(state.prompt_embeds.shape[1:]) if state.prompt_embeds is not None else None,
             tuple(state.negative_prompt_embeds.shape[1:]) if state.negative_prompt_embeds is not None else None,
             tuple(
@@ -1256,8 +1281,6 @@ class HeliosPipeline(
             generator = common_sampling.generator
         if generator is None and common_sampling.seed is not None:
             generator = torch.Generator(device=device).manual_seed(common_sampling.seed)
-        random_generator = generator[0] if isinstance(generator, list) else generator
-
         # Encode prompts
         if prompt_embeds is None:
             prompt_embeds, negative_prompt_embeds = self.encode_prompt(
@@ -1303,19 +1326,21 @@ class HeliosPipeline(
 
         if image_latents is not None and add_noise_to_image_latents:
             image_noise_sigma = (
-                torch.rand(1, device=device, generator=random_generator)
+                self._rand_per_sample((image_latents.shape[0],), generator=generator, device=device)
                 * (image_noise_sigma_max - image_noise_sigma_min)
                 + image_noise_sigma_min
             )
+            image_noise_sigma = image_noise_sigma.view(-1, 1, 1, 1, 1)
             image_latents = (
                 image_noise_sigma * randn_tensor(image_latents.shape, generator=generator, device=device)
                 + (1 - image_noise_sigma) * image_latents
             )
             fake_image_noise_sigma = (
-                torch.rand(1, device=device, generator=random_generator)
+                self._rand_per_sample((fake_image_latents.shape[0],), generator=generator, device=device)
                 * (video_noise_sigma_max - video_noise_sigma_min)
                 + video_noise_sigma_min
             )
+            fake_image_noise_sigma = fake_image_noise_sigma.view(-1, 1, 1, 1, 1)
             fake_image_latents = (
                 fake_image_noise_sigma * randn_tensor(fake_image_latents.shape, generator=generator, device=device)
                 + (1 - fake_image_noise_sigma) * fake_image_latents
@@ -1336,10 +1361,11 @@ class HeliosPipeline(
 
         if video_latents is not None and add_noise_to_video_latents:
             image_noise_sigma = (
-                torch.rand(1, device=device, generator=random_generator)
+                self._rand_per_sample((image_latents.shape[0],), generator=generator, device=device)
                 * (image_noise_sigma_max - image_noise_sigma_min)
                 + image_noise_sigma_min
             )
+            image_noise_sigma = image_noise_sigma.view(-1, 1, 1, 1, 1)
             image_latents = (
                 image_noise_sigma * randn_tensor(image_latents.shape, generator=generator, device=device)
                 + (1 - image_noise_sigma) * image_latents
@@ -1353,11 +1379,15 @@ class HeliosPipeline(
                 latent_chunk = video_latents[:, :, chunk_start:chunk_end, :, :]
                 chunk_frames = latent_chunk.shape[2]
                 frame_sigmas = (
-                    torch.rand(chunk_frames, device=device, generator=random_generator)
+                    self._rand_per_sample(
+                        (latent_chunk.shape[0], chunk_frames),
+                        generator=generator,
+                        device=device,
+                    )
                     * (video_noise_sigma_max - video_noise_sigma_min)
                     + video_noise_sigma_min
                 )
-                frame_sigmas = frame_sigmas.view(1, 1, chunk_frames, 1, 1)
+                frame_sigmas = frame_sigmas.view(latent_chunk.shape[0], 1, chunk_frames, 1, 1)
                 noisy_chunk = (
                     frame_sigmas * randn_tensor(latent_chunk.shape, generator=generator, device=device)
                     + (1 - frame_sigmas) * latent_chunk

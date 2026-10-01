@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from types import MethodType, SimpleNamespace
 
+import pytest
 import torch
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
@@ -26,6 +27,8 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _CountingTransformer:
@@ -190,6 +193,57 @@ def test_helios_step_groups_mixed_cfg_without_input_batch_failure() -> None:
 
     assert prediction.shape[0] == 2
     assert torch.allclose(prediction[:, 0, 0, 0, 0], torch.tensor([3.0, 8.0]))
+
+
+def test_helios_request_noise_uses_one_generator_per_sample() -> None:
+    generators = [torch.Generator().manual_seed(11), torch.Generator().manual_seed(22)]
+    batched = HeliosPipeline._rand_per_sample((2,), generator=generators, device=torch.device("cpu"))
+    expected = torch.cat(
+        [
+            torch.rand(1, generator=torch.Generator().manual_seed(11)),
+            torch.rand(1, generator=torch.Generator().manual_seed(22)),
+        ]
+    )
+
+    torch.testing.assert_close(batched, expected)
+    assert not torch.equal(batched[0], batched[1])
+
+
+def test_helios_zero_star_groups_by_stage1_progress() -> None:
+    pipeline = _step_pipeline()
+    first = _step_state("first", 2.0)
+    second = _step_state("second", 2.0)
+    for state in (first, second):
+        state.do_true_cfg = True
+        state.negative_prompt_embeds = torch.full((1, 2, 3), -1.0)
+        state.extra.update({"use_cfg_zero_star": True, "use_zero_init": True, "zero_steps": 1})
+    second.step_in_chunk = 2
+
+    groups = pipeline._split_step_groups([first, second])
+
+    assert [[state.request_id for state in group] for group in groups] == [["first"], ["second"]]
+
+
+def test_helios_zero_star_groups_by_stage2_progress() -> None:
+    pipeline = _step_pipeline()
+    first = _step_state("first", 2.0)
+    second = _step_state("second", 2.0)
+    for state in (first, second):
+        state.extra.update(
+            {
+                "is_enable_stage2": True,
+                "stage_index": 0,
+                "stage_step_index": 0,
+                "use_cfg_zero_star": True,
+                "use_zero_init": True,
+                "zero_steps": 1,
+            }
+        )
+    second.extra["stage_step_index"] = 2
+
+    groups = pipeline._split_step_groups([first, second])
+
+    assert [[state.request_id for state in group] for group in groups] == [["first"], ["second"]]
 
 
 def test_helios_step_batch_uses_production_runner_path(monkeypatch) -> None:
