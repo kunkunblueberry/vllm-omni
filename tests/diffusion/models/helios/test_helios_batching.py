@@ -287,6 +287,7 @@ def test_helios_step_batch_uses_production_runner_path(monkeypatch) -> None:
     runner.input_batch = None
     runner.cache_backend = None
     runner.offload_backend = None
+    runner._interaction_coordinator = None
     runner.state_cache = {}
     runner.kv_transfer_manager = SimpleNamespace(
         receive_multi_kv_cache_distributed=lambda *args, **kwargs: None,
