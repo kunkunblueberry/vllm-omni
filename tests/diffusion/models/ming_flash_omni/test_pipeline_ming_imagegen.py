@@ -307,6 +307,64 @@ def test_ming_step_preprocessor_isolates_reference_requests():
     assert pre(ref_a).batch_compatibility_key != pre(ref_b).batch_compatibility_key
 
 
+def test_ming_step_preprocessor_isolates_cfg_truncation():
+    pre = pipeline_ming_imagegen.get_ming_image_pre_process_func(SimpleNamespace())
+    req_a = _request("A", torch.ones((2, 3)), seed=111)
+    req_b = _request("B", torch.ones((2, 3)), seed=222)
+    req_a.sampling_params.extra_args = {"cfg_truncation": 0.5}
+    req_b.sampling_params.extra_args = {"cfg_truncation": 1.0}
+    assert pre(req_a).batch_compatibility_key != pre(req_b).batch_compatibility_key
+
+
+def test_ming_step_consumes_cfg_truncation_per_timestep(monkeypatch):
+    pipe = _step_pipeline(monkeypatch)
+    states = []
+    for request_id in ("A", "B"):
+        state = StepRequestState(
+            request_id=request_id,
+            sampling=OmniDiffusionSamplingParams(height=4, width=4, num_inference_steps=3),
+            prompt={"extra": {"thinker_hidden_states": torch.ones(2, 3)}},
+        )
+        pipe.prepare_encode(state)
+        state.extra["ming_cfg_truncation"] = 0.9985
+        states.append(state)
+    states[1].step_index = 2
+
+    calls = []
+    original = pipe.predict_noise_maybe_with_cfg
+
+    def capture(**kwargs):
+        calls.append((kwargs["do_true_cfg"], len(kwargs["positive_kwargs"]["x"])))
+        return original(**kwargs)
+
+    monkeypatch.setattr(pipe, "predict_noise_maybe_with_cfg", capture)
+    pipe.denoise_step(InputBatch.make_batch(states), states=states)
+
+    assert calls == [(False, 1), (True, 1)]
+
+
+def test_zimage_diffuse_marks_cuda_graph_tree_steps(monkeypatch):
+    pipe = object.__new__(ZImagePipeline)
+    pipe._uses_cudagraph_trees = True
+    pipe._interrupt = False
+    pipe.od_config = SimpleNamespace(dtype=torch.float32)
+    pipe.predict_noise_maybe_with_cfg = lambda **kwargs: torch.zeros((1, 1, 1, 2, 2))
+    pipe.scheduler_step_maybe_with_cfg = lambda noise, timestep, latents, apply_cfg: latents
+    marker_calls = []
+    monkeypatch.setattr(torch.compiler, "cudagraph_mark_step_begin", lambda: marker_calls.append(True))
+
+    pipe.diffuse(
+        [torch.zeros(1, 1)],
+        [torch.zeros(1, 1)],
+        torch.zeros(1, 1, 2, 2),
+        torch.tensor([900.0, 500.0]),
+        do_true_cfg=False,
+        true_cfg_scale=0.0,
+    )
+
+    assert marker_calls == [True, True]
+
+
 def test_ming_step_denoise_scopes_reference_latents_in_active_request_order(monkeypatch):
     pipe = _step_pipeline(monkeypatch)
     states = [

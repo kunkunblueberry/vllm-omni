@@ -514,6 +514,11 @@ class ZImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin
                 else None
             )
 
+            if getattr(self, "_uses_cudagraph_trees", False):
+                # CUDA graph trees require an explicit boundary for every
+                # denoise iteration before the transformer is invoked.
+                torch.compiler.cudagraph_mark_step_begin()
+
             noise_pred = self.predict_noise_maybe_with_cfg(
                 do_true_cfg=apply_cfg,
                 true_cfg_scale=current_guidance_scale,

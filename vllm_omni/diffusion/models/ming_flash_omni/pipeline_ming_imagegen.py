@@ -445,30 +445,56 @@ class MingImagePipeline(ZImagePipeline):
         t = (1000.0 - input_batch.timesteps.to(dtype=torch.float32)) / 1000.0
         positive = [item for item in input_batch.prompt_embeds.unbind(dim=0)]
         negative = [item for item in input_batch.negative_prompt_embeds.unbind(dim=0)]
-        cfg_scale = float(active[0].extra["ming_guidance_scale"])
-        apply_cfg = active[0].do_true_cfg and cfg_scale > 0
-        positive_kwargs = {"x": x, "t": t, "cap_feats": positive}
-        negative_kwargs = {"x": x, "t": t, "cap_feats": negative} if apply_cfg else None
+        cfg_scales = {float(state.extra["ming_guidance_scale"]) for state in active}
+        if len(cfg_scales) != 1:
+            raise ValueError("Ming STEP_BATCH requires one guidance scale per compatible batch")
+        cfg_scale = cfg_scales.pop()
+        cfg_normalizations = {state.extra["ming_cfg_normalize"] for state in active}
+        if len(cfg_normalizations) != 1:
+            raise ValueError("Ming STEP_BATCH requires one cfg_normalize value per compatible batch")
         references = [state.extra.get("ming_reference_latent") for state in active]
         if any(reference is not None for reference in references):
             if any(reference is None for reference in references):
                 raise ValueError("Ming STEP_BATCH cannot mix reference-image and text-to-image requests")
-            reference = torch.cat([reference for reference in references if reference is not None], dim=0)
-        else:
+
+        truncations = [state.extra.get("ming_cfg_truncation", 1.0) for state in active]
+        if len({float(value) for value in truncations}) != 1:
+            raise ValueError("Ming STEP_BATCH requires one cfg_truncation per compatible batch")
+        cfg_truncation = float(truncations[0])
+        apply_cfg_rows = [
+            bool(state.do_true_cfg and cfg_scale > 0 and t_norm <= cfg_truncation)
+            for state, t_norm in zip(active, t.tolist(), strict=True)
+        ]
+
+        row_predictions: dict[int, torch.Tensor] = {}
+        for use_cfg in (False, True):
+            indices = [index for index, value in enumerate(apply_cfg_rows) if value is use_cfg]
+            if not indices:
+                continue
+            subset_refs = [references[index] for index in indices]
             reference = None
-        set_forward_context_ref_latent(reference)
-        try:
-            prediction = self.predict_noise_maybe_with_cfg(
-                do_true_cfg=apply_cfg,
-                true_cfg_scale=cfg_scale,
-                positive_kwargs=positive_kwargs,
-                negative_kwargs=negative_kwargs,
-                cfg_normalize=active[0].extra["ming_cfg_normalize"],
-            )
-        finally:
-            set_forward_context_ref_latent(None)
-        if not isinstance(prediction, torch.Tensor):
-            raise TypeError("Ming denoise_step expected one tensor prediction")
+            if subset_refs and subset_refs[0] is not None:
+                reference = torch.cat(subset_refs, dim=0)
+            subset_x = [x[index] for index in indices]
+            subset_t = t[indices]
+            subset_positive = [positive[index] for index in indices]
+            subset_negative = [negative[index] for index in indices]
+            set_forward_context_ref_latent(reference)
+            try:
+                subset_prediction = self.predict_noise_maybe_with_cfg(
+                    do_true_cfg=use_cfg,
+                    true_cfg_scale=cfg_scale,
+                    positive_kwargs={"x": subset_x, "t": subset_t, "cap_feats": subset_positive},
+                    negative_kwargs=({"x": subset_x, "t": subset_t, "cap_feats": subset_negative} if use_cfg else None),
+                    cfg_normalize=active[indices[0]].extra["ming_cfg_normalize"],
+                )
+            finally:
+                set_forward_context_ref_latent(None)
+            if not isinstance(subset_prediction, torch.Tensor):
+                raise TypeError("Ming denoise_step expected one tensor prediction")
+            for offset, index in enumerate(indices):
+                row_predictions[index] = subset_prediction[offset : offset + 1]
+        prediction = torch.cat([row_predictions[index] for index in range(len(active))], dim=0)
         return -prediction.squeeze(2)
 
     def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
@@ -817,6 +843,7 @@ def get_ming_image_pre_process_func(od_config: OmniDiffusionConfig):
             )
 
         byte5_count = len(MingImagePipeline._resolve_byte5_texts(extra, sampling))
+        cfg_truncation = float(sampling_extra.get("cfg_truncation", 1.0))
         request.batch_compatibility_key = (
             "ming_image",
             # Keep reference-image requests in request-local groups. This
@@ -830,6 +857,7 @@ def get_ming_image_pre_process_func(od_config: OmniDiffusionConfig):
             int(resolve("width", "width", defaults.default_width)),
             int(resolve("steps", "num_inference_steps", defaults.num_inference_steps)),
             float(resolve("cfg", "guidance_scale", defaults.guidance_scale)),
+            cfg_truncation,
             int(sampling.num_outputs_per_prompt or 1),
             sampling.output_type or "pil",
             sampling.strength,
