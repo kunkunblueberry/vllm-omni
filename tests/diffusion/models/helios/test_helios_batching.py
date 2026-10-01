@@ -295,6 +295,7 @@ def test_helios_step_batch_uses_production_runner_path(monkeypatch) -> None:
     runner._sample_peak_memory_mb = lambda: 0.0
     runner._maybe_send_stage_payload = lambda *args, **kwargs: None
     monkeypatch.setattr(model_runner_module, "set_forward_context", lambda **kwargs: _noop_context())
+    monkeypatch.setattr(model_runner_module, "supports_interaction_apply", lambda _pipeline: False)
     monkeypatch.setattr(model_runner_module.current_omni_platform, "is_available", lambda: False)
 
     requests = [_request("request-a"), _request("request-b")]
