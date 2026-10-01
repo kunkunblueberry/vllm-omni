@@ -175,6 +175,13 @@ def get_helios_pre_process_func(
         attention_key = tuple(sorted((str(key), repr(value)) for key, value in attention_kwargs.items()))
         image = extra.get("image")
         video = extra.get("video")
+        sampling = request.sampling_params
+        guidance_scale = float(extra.get("guidance_scale", 5.0))
+        if getattr(sampling, "guidance_scale_provided", False):
+            guidance_scale = float(sampling.guidance_scale)
+        prompt = request.prompt
+        negative_prompt = prompt.get("negative_prompt") if isinstance(prompt, dict) else None
+        effective_cfg = guidance_scale > 1.0 and negative_prompt is not None
         request.batch_compatibility_key = (
             "helios-v1",
             history_sizes,
@@ -191,7 +198,7 @@ def get_helios_pre_process_func(
             bool(extra.get("use_cfg_zero_star", False)),
             bool(extra.get("use_zero_init", True)),
             int(extra.get("zero_steps", 1)),
-            float(extra.get("guidance_scale", 5.0)),
+            ("effective_cfg", effective_cfg, guidance_scale, negative_prompt is not None),
             attention_key,
             bool(extra.get("add_noise_to_image_latents", True)),
             float(extra.get("image_noise_sigma_min", 0.111)),

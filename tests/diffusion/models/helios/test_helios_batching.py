@@ -326,11 +326,21 @@ def _noop_context():
     return _NoopContext()
 
 
-def _request(request_id: str, *, extra_args: dict | None = None) -> OmniDiffusionRequest:
+def _request(
+    request_id: str,
+    *,
+    prompt: str | dict[str, object] | None = None,
+    extra_args: dict | None = None,
+    guidance_scale: float | None = 1.0,
+) -> OmniDiffusionRequest:
     return OmniDiffusionRequest(
         request_id=request_id,
-        prompt=f"prompt-{request_id}",
-        sampling_params=_sampling(seed=len(request_id), extra_args=extra_args or {}),
+        prompt=prompt if prompt is not None else f"prompt-{request_id}",
+        sampling_params=_sampling(
+            seed=len(request_id),
+            guidance_scale=guidance_scale,
+            extra_args=extra_args or {},
+        ),
     )
 
 
@@ -340,6 +350,26 @@ def test_helios_preprocess_key_separates_structural_request_options() -> None:
     request_b = preprocess(_request("b", extra_args={"num_latent_frames_per_chunk": 5}))
 
     assert request_a.batch_compatibility_key != request_b.batch_compatibility_key
+
+
+def test_helios_preprocess_key_separates_effective_cfg_modes() -> None:
+    preprocess = get_helios_pre_process_func(SimpleNamespace())
+    cfg_request = preprocess(
+        _request(
+            "cfg",
+            prompt={"prompt": "prompt-cfg", "negative_prompt": "bad quality"},
+            guidance_scale=None,
+        )
+    )
+    no_cfg_request = preprocess(
+        _request(
+            "no-cfg",
+            prompt={"prompt": "prompt-no-cfg", "negative_prompt": None},
+            guidance_scale=None,
+        )
+    )
+
+    assert cfg_request.batch_compatibility_key != no_cfg_request.batch_compatibility_key
 
 
 def _batch_pipeline() -> HeliosPipeline:
