@@ -26,6 +26,7 @@ class MingImageTransformer2DModel(ZImageTransformer2DModel):
     ):
         generated_frames = [item.shape[1] for item in x]
         ref_x = None
+        cap_feats_2 = None
         if is_forward_context_available():
             context = get_forward_context()
             if context.cfg_branch is not None:
