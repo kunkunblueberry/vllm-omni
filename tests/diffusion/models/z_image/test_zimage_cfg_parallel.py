@@ -30,6 +30,16 @@ def test_zimage_cfg_formula_matches_legacy_semantics():
     torch.testing.assert_close(actual, positive + 3.0 * (positive - negative))
 
 
+def test_zimage_cfg_normalization_accepts_none():
+    pipeline = _pipeline_for_contract_tests()
+    positive = torch.tensor([[[[2.0, 1.0]]]])
+    negative = torch.tensor([[[[0.5, 0.25]]]])
+
+    actual = pipeline.combine_cfg_noise(positive, negative, 3.0, cfg_normalize=None)
+
+    torch.testing.assert_close(actual, positive + 3.0 * (positive - negative))
+
+
 def test_zimage_cfg_normalization_clamps_to_positive_norm():
     pipeline = _pipeline_for_contract_tests()
     positive = torch.tensor([[[[3.0, 4.0]]]])

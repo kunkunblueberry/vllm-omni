@@ -439,7 +439,7 @@ class ZImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin
         positive_noise_pred = positive_noise_pred.float()
         negative_noise_pred = negative_noise_pred.float()
         pred = positive_noise_pred + true_cfg_scale * (positive_noise_pred - negative_noise_pred)
-        normalize = float(cfg_normalize)
+        normalize = float(cfg_normalize or 0.0)
         if normalize > 0.0:
             positive_norm = torch.linalg.vector_norm(positive_noise_pred.flatten(1), dim=1, keepdim=True)
             combined_norm = torch.linalg.vector_norm(pred.flatten(1), dim=1, keepdim=True)
