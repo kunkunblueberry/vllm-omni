@@ -367,12 +367,12 @@ def test_ming_step_consumes_cfg_truncation_per_timestep(monkeypatch):
     assert calls == [(False, 1), (True, 1)]
 
 
-def test_zimage_diffuse_marks_cuda_graph_tree_steps(monkeypatch):
+def test_zimage_diffuse_marks_each_cfg_transformer_forward(monkeypatch):
     pipe = object.__new__(ZImagePipeline)
     pipe._uses_cudagraph_trees = True
     pipe._interrupt = False
     pipe.od_config = SimpleNamespace(dtype=torch.float32)
-    pipe.predict_noise_maybe_with_cfg = lambda **kwargs: torch.zeros((1, 1, 1, 2, 2))
+    pipe.transformer = lambda *args, **kwargs: ([torch.zeros(1, 1, 1, 2, 2)], {})
     pipe.scheduler_step_maybe_with_cfg = lambda noise, timestep, latents, apply_cfg: latents
     marker_calls = []
     monkeypatch.setattr(torch.compiler, "cudagraph_mark_step_begin", lambda: marker_calls.append(True))
@@ -382,11 +382,11 @@ def test_zimage_diffuse_marks_cuda_graph_tree_steps(monkeypatch):
         [torch.zeros(1, 1)],
         torch.zeros(1, 1, 2, 2),
         torch.tensor([900.0, 500.0]),
-        do_true_cfg=False,
-        true_cfg_scale=0.0,
+        do_true_cfg=True,
+        true_cfg_scale=2.0,
     )
 
-    assert marker_calls == [True, True]
+    assert marker_calls == [True, True, True, True]
 
 
 def test_zimage_diffuse_preserves_five_dimensional_latents(monkeypatch):
