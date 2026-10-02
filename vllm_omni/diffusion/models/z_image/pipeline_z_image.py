@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # Copyright 2025 Alibaba Z-Image Team and The HuggingFace Team. All rights reserved.
 #
@@ -439,7 +439,7 @@ class ZImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin
         positive_noise_pred = positive_noise_pred.float()
         negative_noise_pred = negative_noise_pred.float()
         pred = positive_noise_pred + true_cfg_scale * (positive_noise_pred - negative_noise_pred)
-        normalize = float(cfg_normalize)
+        normalize = float(cfg_normalize or 0.0)
         if normalize > 0.0:
             positive_norm = torch.linalg.vector_norm(positive_noise_pred.flatten(1), dim=1, keepdim=True)
             combined_norm = torch.linalg.vector_norm(pred.flatten(1), dim=1, keepdim=True)
@@ -497,7 +497,7 @@ class ZImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin
                     current_guidance_scale = 0.0
             apply_cfg = do_true_cfg and current_guidance_scale > 0
             latents_typed = latents.to(self.od_config.dtype)
-            latent_model_input = latents_typed.unsqueeze(2)
+            latent_model_input = latents_typed.unsqueeze(2) if latents_typed.ndim == 4 else latents_typed
             latent_model_input_list = list(latent_model_input.unbind(dim=0))
             positive_kwargs = {
                 "x": latent_model_input_list,
@@ -526,7 +526,8 @@ class ZImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin
                 negative_kwargs=negative_kwargs,
                 cfg_normalize=cfg_normalize,
             )
-            noise_pred = noise_pred.squeeze(2) if isinstance(noise_pred, torch.Tensor) else noise_pred
+            if isinstance(noise_pred, torch.Tensor) and latents.ndim == 4:
+                noise_pred = noise_pred.squeeze(2)
             noise_pred = -noise_pred
             latents = self.scheduler_step_maybe_with_cfg(noise_pred.to(torch.float32), t, latents, apply_cfg)
             assert latents.dtype == torch.float32
@@ -542,6 +543,41 @@ class ZImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin
         return latents
 
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
+        sampling_params_list = req.sampling_params_list
+        common_sampling_params = sampling_params_list[0]
+
+        def same_value(left: Any, right: Any) -> bool:
+            if isinstance(left, torch.Tensor) or isinstance(right, torch.Tensor):
+                if not isinstance(left, torch.Tensor) or not isinstance(right, torch.Tensor):
+                    return False
+                return torch.equal(left, right)
+            return left == right
+
+        def require_common(field: str) -> Any:
+            value = getattr(common_sampling_params, field)
+            if any(not same_value(getattr(params, field), value) for params in sampling_params_list[1:]):
+                raise ValueError(f"Z-Image request batch has incompatible {field}: {req.request_ids}")
+            return value
+
+        # These controls determine one shared scheduler/denoising trajectory.
+        # Generators and initial latents remain request-local and are collated.
+        for field in (
+            "height",
+            "width",
+            "num_inference_steps",
+            "sigmas",
+            "max_sequence_length",
+            "guidance_scale",
+            "num_outputs_per_prompt",
+            "cfg_normalize",
+            "output_type",
+            "strength",
+        ):
+            require_common(field)
+        cfg_truncations = [(params.extra_args or {}).get("cfg_truncation", 1.0) for params in sampling_params_list]
+        if any(value != cfg_truncations[0] for value in cfg_truncations[1:]):
+            raise ValueError(f"Z-Image request batch has incompatible cfg_truncation: {req.request_ids}")
+
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts]
@@ -570,8 +606,8 @@ class ZImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin
                     else:
                         image = PIL.Image.open(raw_image) if isinstance(raw_image, str) else raw_image
 
-        explicit_strength = req.sampling_params.strength is not None
-        strength = req.sampling_params.strength if explicit_strength else 0.6
+        explicit_strength = common_sampling_params.strength is not None
+        strength = common_sampling_params.strength if explicit_strength else 0.6
         if explicit_strength and image is None:
             logger.warning(
                 "strength parameter (%.2f) is only applicable for image-to-image (I2I) generation. "
@@ -582,24 +618,24 @@ class ZImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin
         if image is not None and strength is not None and (strength < 0 or strength > 1):
             raise ValueError(f"The value of strength should be in [0.0, 1.0] but is {strength}")
 
-        height = req.sampling_params.height or 1024
-        width = req.sampling_params.width or 1024
-        num_inference_steps = req.sampling_params.num_inference_steps or 50
-        generator = req.sampling_params.generator
-        sigmas = req.sampling_params.sigmas
-        max_sequence_length = req.sampling_params.max_sequence_length or 512
-        guidance_scale = req.sampling_params.guidance_scale
+        height = common_sampling_params.height or 1024
+        width = common_sampling_params.width or 1024
+        num_inference_steps = common_sampling_params.num_inference_steps or 50
         num_images_per_prompt = (
-            req.sampling_params.num_outputs_per_prompt if req.sampling_params.num_outputs_per_prompt > 0 else 1
+            common_sampling_params.num_outputs_per_prompt if common_sampling_params.num_outputs_per_prompt > 0 else 1
         )
-        latents = req.sampling_params.latents
+        generator = req.collate_request_generators(num_images_per_prompt, None)
+        sigmas = common_sampling_params.sigmas
+        max_sequence_length = common_sampling_params.max_sequence_length or 512
+        guidance_scale = common_sampling_params.guidance_scale
+        latents = req.collate_request_tensors("latents", None)
 
-        cfg_normalization = req.sampling_params.cfg_normalize
-        cfg_truncation = req.sampling_params.extra_args.get("cfg_truncation", 1.0)
+        cfg_normalization = common_sampling_params.cfg_normalize
+        cfg_truncation = cfg_truncations[0]
         joint_attention_kwargs: dict[str, Any] | None = None
         callback_on_step_end: Callable[[int, int, dict], None] | None = None
         callback_on_step_end_tensor_inputs = ["latents"]
-        output_type = req.sampling_params.output_type or "pil"
+        output_type = common_sampling_params.output_type or "pil"
 
         vae_scale = self.vae_scale_factor * 2
         if height % vae_scale != 0:
@@ -713,7 +749,7 @@ class ZImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin
 
         # 5. Prepare timesteps
         if image is None:
-            image_seq_len = (latents.shape[2] // 2) * (latents.shape[3] // 2)
+            image_seq_len = (latents.shape[-2] // 2) * (latents.shape[-1] // 2)
             mu = calculate_shift(
                 image_seq_len,
                 self.scheduler.config.get("base_image_seq_len", 256),

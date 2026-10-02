@@ -3,6 +3,7 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -14,6 +15,7 @@ from vllm_omni.diffusion.models.ming_flash_omni import ming_zimage_transformer, 
 from vllm_omni.diffusion.models.ming_flash_omni.ming_zimage_transformer import (
     MingZImageTransformer2DModel,
 )
+from vllm_omni.diffusion.models.z_image import pipeline_z_image
 from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
 from vllm_omni.diffusion.models.z_image.z_image_transformer import ZImageTransformer2DModel
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -141,6 +143,25 @@ def test_ming_preserves_explicit_request_generators(monkeypatch):
     pipe.forward(DiffusionRequestBatch([request]))
 
     assert capture["sampling"][0].generator is generator
+
+def test_ming_step_preserves_explicit_generator_over_sampling_seed(monkeypatch):
+    pipe = _step_pipeline(monkeypatch)
+    generator = torch.Generator().manual_seed(987)
+    state = StepRequestState(
+        request_id="generator-request",
+        sampling=OmniDiffusionSamplingParams(
+            generator=generator,
+            seed=123,
+            height=4,
+            width=4,
+            num_inference_steps=2,
+        ),
+        prompt={"extra": {"thinker_hidden_states": torch.ones(2, 3)}},
+    )
+
+    pipe.prepare_encode(state)
+
+    assert state.sampling.generator is generator
 
 
 def test_ming_reference_latents_are_indexed_per_request(monkeypatch):
@@ -365,6 +386,79 @@ def test_zimage_diffuse_marks_cuda_graph_tree_steps(monkeypatch):
     assert marker_calls == [True, True]
 
 
+def test_zimage_diffuse_preserves_five_dimensional_latents(monkeypatch):
+    pipe = object.__new__(ZImagePipeline)
+    pipe._uses_cudagraph_trees = False
+    pipe._interrupt = False
+    pipe.od_config = SimpleNamespace(dtype=torch.float32)
+    captured: dict[str, Any] = {}
+
+    def capture_predict(**kwargs):
+        captured["x"] = kwargs["positive_kwargs"]["x"]
+        return torch.zeros((1, 2, 3, 4, 5))
+
+    pipe.predict_noise_maybe_with_cfg = capture_predict
+    pipe.scheduler_step_maybe_with_cfg = lambda noise, timestep, latents, apply_cfg: latents
+
+    latents = torch.zeros(1, 2, 3, 4, 5)
+    result = pipe.diffuse(
+        [torch.zeros(1, 1)],
+        [torch.zeros(1, 1)],
+        latents,
+        torch.tensor([900.0]),
+        do_true_cfg=False,
+        true_cfg_scale=0.0,
+    )
+
+    assert captured["x"][0].shape == (2, 3, 4, 5)
+    assert result.shape == latents.shape
+
+
+def test_zimage_forward_accepts_multiple_requests_without_single_batch_assert(monkeypatch):
+    pipe = object.__new__(ZImagePipeline)
+    pipe._execution_device = torch.device("cpu")
+    pipe.vae_scale_factor = 1
+    pipe.transformer = SimpleNamespace(in_channels=1)
+    pipe.scheduler = SimpleNamespace(config={}, sigma_min=0.0)
+    captured: dict[str, Any] = {}
+
+    pipe.encode_prompt = lambda **kwargs: ([torch.zeros(1, 1)] * 2, [torch.zeros(1, 1)] * 2)
+
+    def fake_prepare_latents(batch_size, *args, **kwargs):
+        return torch.zeros((batch_size, 1, 3, 8, 10))
+
+    pipe.prepare_latents = fake_prepare_latents
+
+    def fake_retrieve_timesteps(scheduler, num_inference_steps, device, sigmas=None, **kwargs):
+        captured["mu"] = kwargs["mu"]
+        return torch.tensor([1.0], device=device), 1
+
+    monkeypatch.setattr(pipeline_z_image, "retrieve_timesteps", fake_retrieve_timesteps)
+
+    def fake_diffuse(**kwargs):
+        captured["latents"] = kwargs["latents"]
+        return kwargs["latents"]
+
+    pipe.diffuse = fake_diffuse
+    params = OmniDiffusionSamplingParams(
+        height=16,
+        width=16,
+        num_inference_steps=1,
+        guidance_scale=1.0,
+        output_type="latent",
+    )
+    requests = [
+        OmniDiffusionRequest(prompt={"prompt": ""}, sampling_params=params, request_id=request_id)
+        for request_id in ("A", "B")
+    ]
+
+    output = pipe.forward(DiffusionRequestBatch(requests))
+
+    assert output.output.shape == (2, 1, 3, 8, 10)
+    assert captured["latents"].shape == (2, 1, 3, 8, 10)
+    assert captured["mu"] == pipeline_z_image.calculate_shift(20, 256, 4096, 0.5, 1.15)
+
+
 def test_ming_step_denoise_scopes_reference_latents_in_active_request_order(monkeypatch):
     pipe = _step_pipeline(monkeypatch)
     states = [
@@ -378,7 +472,7 @@ def test_ming_step_denoise_scopes_reference_latents_in_active_request_order(monk
     for state in states:
         pipe.prepare_encode(state)
 
-    captured = []
+    captured: list[torch.Tensor | None] = []
     monkeypatch.setattr(
         pipeline_ming_imagegen,
         "set_forward_context_ref_latent",
@@ -386,6 +480,7 @@ def test_ming_step_denoise_scopes_reference_latents_in_active_request_order(monk
     )
     pipe.denoise_step(InputBatch.make_batch(states), states=states)
 
+    assert captured[0] is not None
     torch.testing.assert_close(captured[0][:, 0, 0, 0], torch.tensor([1.0, 2.0]))
     assert captured[-1] is None
 
@@ -529,6 +624,7 @@ def test_ming_step_scheduler_matches_deterministic_reference_recurrence(monkeypa
     expected = initial.clone()
     scheduler = _StepScheduler()
     scheduler.set_timesteps(3, device=torch.device("cpu"))
+    assert scheduler.timesteps is not None
     for timestep in scheduler.timesteps:
         expected = scheduler.step(torch.zeros_like(expected), timestep, expected, return_dict=False)[0]
 

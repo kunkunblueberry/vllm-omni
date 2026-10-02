@@ -353,8 +353,10 @@ class MingImagePipeline(ZImagePipeline):
 
         generator = state.sampling.generator
         seed = values.get("seed")
-        if seed is not None:
-            generator = torch.Generator(device=self.device).manual_seed(int(seed))
+        explicit_seed = (state.sampling.extra_args or {}).get("seed")
+        if generator is None or explicit_seed is not None:
+            if seed is not None:
+                generator = torch.Generator(device=self.device).manual_seed(int(seed))
 
         prompt_embeds, negative_prompt_embeds = self._step_conditioning(state)
         scheduler = deepcopy(self.scheduler)
@@ -857,6 +859,7 @@ def get_ming_image_pre_process_func(od_config: OmniDiffusionConfig):
             int(resolve("width", "width", defaults.default_width)),
             int(resolve("steps", "num_inference_steps", defaults.num_inference_steps)),
             float(resolve("cfg", "guidance_scale", defaults.guidance_scale)),
+            sampling.cfg_normalize,
             cfg_truncation,
             int(sampling.num_outputs_per_prompt or 1),
             sampling.output_type or "pil",

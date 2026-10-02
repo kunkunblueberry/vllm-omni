@@ -69,10 +69,14 @@ For A6.1 CFG parallel validation, use
 thinker on devices 0-3 and assigns devices 4-5 to the diffusion stage with
 `cfg_parallel_size: 2`.
 
-The profile's inline setting is a process-topology choice. It removes the
-`StageDiffusionProc` ZMQ hop for the diffusion stage. Naming the same device
-without `inline_diffusion` would still use `StageDiffusionClient`, ZMQ, and
-`OmniMsgpackEncoder` CPU serialization. The profile must be validated on a
+The single-GPU profile's `inline_diffusion` setting is a process-topology
+choice. It removes the `StageDiffusionProc` ZMQ hop for that diffusion stage.
+The CFG-parallel A6.1 profile remains a separate-process deployment and does
+not enable `inline_diffusion`. Naming the same device without
+`inline_diffusion` would still use `StageDiffusionClient`, ZMQ, and
+`OmniMsgpackEncoder` CPU serialization. The profiles must be validated on a
+machine with enough free VRAM; no memory or latency result is implied by the
+YAML alone.
 machine with enough free VRAM; no memory or latency result is implied by the
 YAML alone.
 

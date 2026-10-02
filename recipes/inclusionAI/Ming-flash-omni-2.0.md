@@ -250,10 +250,10 @@ running batch at different step indices. The existing
 batching profile and is not step-wise execution.
 
 The step-wise profile supports T2I and negative-prompt conditioning. Ming
-img2img/reference-image requests are admitted in request-local groups because
-the current Ming transformer consumes the first reference latent in its forward
-context; cross-request reference-latent batching is therefore intentionally
-disabled until that transformer contract changes. GPU throughput and latency
+img2img/reference-image requests are admitted in request-local groups as a
+conservative scheduling policy while cross-request reference-image batching
+continues to receive limited validation. GPU throughput and latency
+measurements are **待测**.
 measurements are **待测**.
 
 **Full control — `sampling_params_list`** (one entry per stage: `[thinker, imagegen]`).
