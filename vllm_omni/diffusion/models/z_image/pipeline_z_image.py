@@ -459,6 +459,8 @@ class ZImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin
         cfg_branch = kwargs.pop("_cfg_branch", None)
         set_forward_context_cfg_branch(cfg_branch)
         try:
+            if getattr(self, "_uses_cudagraph_trees", False):
+                torch.compiler.cudagraph_mark_step_begin()
             result = self.transformer(*args, **kwargs)
         finally:
             set_forward_context_cfg_branch(None)
@@ -522,10 +524,8 @@ class ZImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin
                 else None
             )
 
-            if getattr(self, "_uses_cudagraph_trees", False):
-                # CUDA graph trees require an explicit boundary for every
-                # denoise iteration before the transformer is invoked.
-                torch.compiler.cudagraph_mark_step_begin()
+            # CUDA graph markers are placed in predict_noise immediately before
+            # each transformer call, including both sequential CFG branches.
 
             noise_pred = self.predict_noise_maybe_with_cfg(
                 do_true_cfg=apply_cfg,

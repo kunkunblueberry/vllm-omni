@@ -293,6 +293,10 @@ class MingImagePipeline(ZImagePipeline):
             hidden = torch.zeros(
                 (scale * scale, self.image_gen_config.thinker_hidden_size), dtype=self._dtype, device=self.device
             )
+            logger.warning(
+                "[MingImagePipeline] request %s has no thinker hidden states; using zeros",
+                state.request_id,
+            )
         if not isinstance(hidden, torch.Tensor):
             raise TypeError(f"Ming request {state.request_id!r} thinker_hidden_states must be a Tensor")
         hidden = hidden.to(device=self.device, dtype=self._dtype)
@@ -381,35 +385,23 @@ class MingImagePipeline(ZImagePipeline):
         reference_latent = (
             self._encode_reference_image(reference_image, height, width) if reference_image is not None else None
         )
-        if reference_latent is None:
-            latent_shape = (1, self.transformer.in_channels, latent_h, latent_w)
-            latents = state.sampling.latents
-            if latents is None:
-                latents = randn_tensor(latent_shape, generator=generator, device=self.device, dtype=torch.float32)
-            elif tuple(latents.shape) != latent_shape:
-                raise ValueError(
-                    f"Ming request {state.request_id!r} latents shape {tuple(latents.shape)} != {latent_shape}"
-                )
-            else:
-                latents = latents.to(device=self.device, dtype=torch.float32)
-        else:
-            strength = state.sampling.strength if state.sampling.strength is not None else 0.6
-            if not 0.0 <= strength <= 1.0:
-                raise ValueError(f"Ming request {state.request_id!r} strength must be in [0, 1]")
-            init_timestep = min(int(actual_steps * strength), actual_steps)
-            t_start = max(actual_steps - init_timestep, 0)
-            timesteps = timesteps[t_start * scheduler.order :]
-            if timesteps.numel() == 0:
-                raise ValueError(f"Ming request {state.request_id!r} strength produced no denoise steps")
-            if hasattr(scheduler, "set_begin_index"):
-                scheduler.set_begin_index(t_start * scheduler.order)
-            noise = randn_tensor(
-                reference_latent.shape, generator=generator, device=self.device, dtype=reference_latent.dtype
+        latent_shape = (1, self.transformer.in_channels, latent_h, latent_w)
+        latents = state.sampling.latents
+        if latents is None:
+            latents = randn_tensor(latent_shape, generator=generator, device=self.device, dtype=torch.float32)
+        elif tuple(latents.shape) != latent_shape:
+            raise ValueError(
+                f"Ming request {state.request_id!r} latents shape {tuple(latents.shape)} != {latent_shape}"
             )
-            latents = scheduler.scale_noise(reference_latent, timesteps[:1], noise)
+        else:
+            latents = latents.to(device=self.device, dtype=torch.float32)
 
-        if hasattr(scheduler, "set_begin_index") and reference_latent is None:
+        # Match B1: reference images condition the DiT through context; they do
+        # not turn the stepwise path into a separate strength/scale-noise mode.
+        # This keeps B1 and B2 on the same latent and timestep trajectory.
+        if hasattr(scheduler, "set_begin_index"):
             scheduler.set_begin_index(0)
+
         state.prompt_embeds = prompt_embeds.unsqueeze(0)
         state.negative_prompt_embeds = negative_prompt_embeds.unsqueeze(0)
         state.latents = latents
@@ -443,7 +435,8 @@ class MingImagePipeline(ZImagePipeline):
         active = list(states or input_batch.states)
         if not active:
             raise ValueError("Ming denoise_step received an empty batch")
-        x = [latent.unsqueeze(2) for latent in input_batch.latents.unbind(dim=0)]
+        latent_model_input = input_batch.latents.unsqueeze(2) if input_batch.latents.ndim == 4 else input_batch.latents
+        x = list(latent_model_input.unbind(dim=0))
         t = (1000.0 - input_batch.timesteps.to(dtype=torch.float32)) / 1000.0
         positive = [item for item in input_batch.prompt_embeds.unbind(dim=0)]
         negative = [item for item in input_batch.negative_prompt_embeds.unbind(dim=0)]
@@ -544,13 +537,7 @@ class MingImagePipeline(ZImagePipeline):
         cfg = self.image_gen_config
 
         def _prompt_extra(prompt: Any) -> dict[str, Any]:
-            if isinstance(prompt, dict):
-                return prompt.get("extra") or {}
-            if prompt is not None and hasattr(prompt, "_asdict"):
-                return _prompt_extra(prompt._asdict())
-            if prompt is not None and hasattr(prompt, "__dict__"):
-                return _prompt_extra(vars(prompt))
-            return {}
+            return MingImagePipeline._step_prompt_extra_from_prompt(prompt)
 
         def _as_hidden(value: Any, request_id: str, field: str) -> torch.Tensor:
             if not isinstance(value, torch.Tensor):

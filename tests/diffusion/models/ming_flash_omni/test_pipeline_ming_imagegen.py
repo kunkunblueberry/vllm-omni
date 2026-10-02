@@ -259,6 +259,7 @@ def _step_pipeline(monkeypatch):
                 "negative": None
                 if kwargs["negative_kwargs"] is None
                 else [item for item in kwargs["negative_kwargs"]["cap_feats"]],
+                "x_shapes": [tuple(item.shape) for item in kwargs["positive_kwargs"]["x"]],
             }
         )
         return torch.zeros((len(kwargs["positive_kwargs"]["x"]), 1, 1, 4, 4))
@@ -287,6 +288,7 @@ def test_ming_step_lifecycle_runs_one_step_per_tick(monkeypatch):
     batch = InputBatch.make_batch(states)
     for _ in range(3):
         prediction = pipe.denoise_step(batch, states=states)
+        assert pipe.seen_step_conditions[-1]["x_shapes"] == [(1, 1, 4, 4), (1, 1, 4, 4)]
         assert prediction.shape[0] == 2
         for index, state in enumerate(states):
             pipe.step_scheduler(state, prediction[index : index + 1])
