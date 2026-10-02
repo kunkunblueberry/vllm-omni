@@ -36,6 +36,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import DistributedAutoencoderKL
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.forward_context import set_forward_context_cfg_branch
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
@@ -455,7 +456,12 @@ class ZImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin
 
     def predict_noise(self, *args: Any, **kwargs: Any) -> torch.Tensor | IntermediateTensors:
         """Adapt Z-Image's per-sample list output to the CFG framework."""
-        result = self.transformer(*args, **kwargs)
+        cfg_branch = kwargs.pop("_cfg_branch", None)
+        set_forward_context_cfg_branch(cfg_branch)
+        try:
+            result = self.transformer(*args, **kwargs)
+        finally:
+            set_forward_context_cfg_branch(None)
         if isinstance(result, IntermediateTensors):
             return result
         if isinstance(result, tuple) and result and isinstance(result[0], list):
@@ -503,12 +509,14 @@ class ZImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin
                 "x": latent_model_input_list,
                 "t": timestep,
                 "cap_feats": prompt_embeds,
+                "_cfg_branch": "positive",
             }
             negative_kwargs = (
                 {
                     "x": latent_model_input_list,
                     "t": timestep,
                     "cap_feats": negative_prompt_embeds,
+                    "_cfg_branch": "negative",
                 }
                 if apply_cfg
                 else None

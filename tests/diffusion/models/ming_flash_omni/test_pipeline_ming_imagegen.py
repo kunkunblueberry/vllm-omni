@@ -144,6 +144,7 @@ def test_ming_preserves_explicit_request_generators(monkeypatch):
 
     assert capture["sampling"][0].generator is generator
 
+
 def test_ming_step_preserves_explicit_generator_over_sampling_seed(monkeypatch):
     pipe = _step_pipeline(monkeypatch)
     generator = torch.Generator().manual_seed(987)
