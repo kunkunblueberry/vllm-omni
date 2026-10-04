@@ -298,6 +298,81 @@ def test_live_req_reentering_new_reqs_is_not_a_hit():
     assert torch.equal(outs.hidden_states["a"][:8], expected_rows(view.slots_for("a", 0, 8)))
 
 
+def test_manager_trusts_started_event_without_a_second_lifecycle_table():
+    mgr, view = make_manager()
+    try:
+        sid = run_step(mgr, view, {"a": ([0], 0, 4)})
+        mgr.materialize(sid, ["a"])
+        assert not hasattr(mgr._request_tasks, "live_reqs")
+        # A new STARTED is authoritative even if the old ID wrote before.
+        # Internal write bookkeeping is not a second lifecycle classifier.
+        mgr.new_step_starts((PrefixCacheRequestEvent("a", PrefixCacheEventKind.STARTED, hit_end=4, block_ids=((0,),)),))
+        assert mgr._hit_spans == {"a": (4, [0])}
+    finally:
+        mgr.shutdown()
+
+
+@pytest.mark.parametrize("terminal", ["finished", "aborted"])
+def test_same_step_terminal_id_reuse_merges_only_the_new_start(terminal):
+    mgr, view = make_manager()
+    try:
+        first = run_step(mgr, view, {"a": ([0], 0, 4)})
+        mgr.materialize(first, ["a"])
+        if terminal == "finished":
+            second = run_step(mgr, view, {"a": ([0, 1], 4, 1)}, new_hits={"a": 4}, finished=["a"])
+        else:
+            # The fake scheduler helper has no abort field, so construct the
+            # explicit side channel as a real producer would supply it.
+            adapter = mgr._test_adapter
+            sched = FakeSchedOut(new_reqs=[FakeNewReq("a", 4, [[0, 1]])], num_scheduled={"a": 1})
+            sched.aborted_req_ids = {"a"}
+            mgr.new_step_starts(adapter.translate_step(sched))
+            view.order = ["a"]
+            view.req_blocks["a"] = [0, 1]
+            view.computed["a"] = 4
+            second = mgr.save_outputs(
+                expected_rows(view.slots_for("a", 4, 5)),
+                {},
+                num_tokens_unpadded=1,
+                num_tokens_padded=1,
+                write_layout=adapter.build_write_layout(view, num_scheduled_tokens={"a": 1}),
+            )
+        assert mgr._step_ctxs[second].hits == {"a": (4, [0])}
+        merged = mgr.materialize(second, ["a"]).hidden_states["a"]
+        assert torch.equal(merged, expected_rows(view.slots_for("a", 0, 5)))
+        third = run_step(mgr, view, {"a": ([0, 1], 5, 1)}, new_hits={"a": 4})
+        assert not mgr._step_ctxs[third].hits
+        assert mgr.materialize(third, ["a"]).hidden_states["a"].shape == (1, HIDDEN)
+    finally:
+        mgr.shutdown()
+
+
+def test_save_requires_write_layout_with_cache_contract_error():
+    mgr, _ = make_manager()
+    try:
+        with pytest.raises(OmniPrefixCacheUnmatchError, match="adapter-produced write_layout"):
+            mgr.save_outputs(torch.zeros(1, HIDDEN), {}, num_tokens_unpadded=1, num_tokens_padded=1)
+    finally:
+        mgr.shutdown()
+
+
+def test_save_requires_slot_snapshot_with_cache_contract_error():
+    from vllm_omni.core.prefix_cache.adapter import PrefixCacheWrite, PrefixCacheWriteLayout
+
+    mgr, _ = make_manager()
+    try:
+        with pytest.raises(OmniPrefixCacheUnmatchError, match="CPU slot snapshot"):
+            mgr.save_outputs(
+                torch.zeros(1, HIDDEN),
+                {},
+                num_tokens_unpadded=1,
+                num_tokens_padded=1,
+                write_layout=PrefixCacheWriteLayout((PrefixCacheWrite("a", 0, 1),), 1),
+            )
+    finally:
+        mgr.shutdown()
+
+
 def test_join_next_step_hit_waits_done_then_reads_pool():
     """CPU stand-in for the non-eager path: dispatch holds the task instead of
     writing the pool. A same-step hit must join(done), drain, then read the pool."""
@@ -1399,14 +1474,16 @@ def test_same_step_hit_refreshes_prefetch_after_write(reuse_blocks, deferred_mm)
         blocks = [0, 1] if reuse_blocks else [8, 9]
         sid = run_step(mgr, view, {"old": (blocks, 0, 8)}, mm={"mm": torch.full((8, 2), 100.0)})
         mgr.materialize(sid, ["old"])
-        mgr.new_step_starts(FakeSchedOut(finished=["old"]))
+        adapter = mgr._test_adapter
+        mgr.new_step_starts(adapter.translate_step(FakeSchedOut(finished=["old"])))
 
-        mgr.new_step_starts(
+        step = adapter.translate_step(
             FakeSchedOut(
                 new_reqs=[FakeNewReq("a", 0, [[0, 1]]), FakeNewReq("b", 8, [[0, 1, 2]])],
                 num_scheduled={"a": 8, "b": 4},
             )
         )
+        mgr.new_step_starts(step)
         old_prefetch = dict(mgr._hit_prefetch["b"])
         # Complete the early reads before A publishes the prefix B actually hits.
         for future in old_prefetch.values():
@@ -1417,7 +1494,8 @@ def test_same_step_hit_refreshes_prefetch_after_write(reuse_blocks, deferred_mm)
         view.computed.update(a=0, b=8)
         hidden = torch.cat([torch.full((8, HIDDEN), 20.0), torch.full((4, HIDDEN), 30.0)])
         mm = torch.cat([torch.full((8, 2), 200.0), torch.full((4, 2), 300.0)])
-        sid = mgr.save_outputs(hidden, {"mm": mm}, num_tokens_unpadded=12, num_tokens_padded=12)
+        layout = adapter.build_write_layout(view, num_scheduled_tokens=dict(step.scheduled_tokens))
+        sid = mgr.save_outputs(hidden, {"mm": mm}, num_tokens_unpadded=12, num_tokens_padded=12, write_layout=layout)
         outs = mgr.materialize(sid, ["a", "b"])
 
         assert torch.equal(outs.hidden_states["b"][:8], hidden[:8])

@@ -391,7 +391,6 @@ class _RequestTaskTable:
         self.write_n: dict[ReqId, int] = {}  # last write_n issued
         self.tasks: dict[ReqId, set[Tid]] = {}
         self.deferred: dict[ReqId, WriteTask] = {}
-        self.live_reqs: set[ReqId] = set()
 
     def alloc_tid(self) -> Tid:
         tid = self._next_tid
@@ -408,7 +407,6 @@ class _RequestTaskTable:
 
     def finish(self, req_id: ReqId) -> tuple[set[Tid], WriteTask | None]:
         """Drop this request's rows. Returns owned tids + deferred task."""
-        self.live_reqs.discard(req_id)
         self.write_n.pop(req_id, None)
         tids = self.tasks.pop(req_id, set())
         dtask = self.deferred.pop(req_id, None)
@@ -529,13 +527,8 @@ class OmniPrefixCacheManager:
                 if event.kind not in (PrefixCacheEventKind.STARTED,):
                     continue
                 req_id = event.req_id
-                if req_id in self._request_tasks.live_reqs:
-                    # Already live: async_chunk continuation, or a V2-runner
-                    # resume after preemption (V1 resumes via
-                    # scheduled_cached_reqs). Either way num_computed_tokens is
-                    # not mirrored as a hit span; see the design doc.
-                    continue
-                self._request_tasks.live_reqs.add(req_id)
+                # The adapter alone classifies starts versus continuation or
+                # resume. Do not re-infer that lifecycle from write-task state.
                 num_computed = int(event.hit_end)
                 if num_computed > 0:
                     # block_ids is per-kv-group; group 0 only.
@@ -601,7 +594,7 @@ class OmniPrefixCacheManager:
 
         # 2. Packed batch layout for this step (req -> [start, end)).
         if write_layout is None:
-            raise ValueError("save_outputs requires an adapter-produced write_layout")
+            raise OmniPrefixCacheUnmatchError("save_outputs requires an adapter-produced write_layout")
         req_order = [write.req_id for write in write_layout.writes]
         num_sched = {write.req_id: write.row_end - write.row_start for write in write_layout.writes}
         query_start = {write.req_id: write.row_start for write in write_layout.writes}
@@ -615,7 +608,7 @@ class OmniPrefixCacheManager:
             # Derive the slot mapping on CPU: reading the device one back
             # would need a stream sync that waits on the whole forward.
             if slots_cpu is None:
-                raise ValueError("write_layout is missing its CPU slot snapshot")
+                raise OmniPrefixCacheUnmatchError("write_layout is missing its CPU slot snapshot")
             if int(slots_cpu.numel()) != num_tokens_unpadded:
                 # Fail at the cause: skipping the save would leave rows absent
                 # behind hashes vLLM already published — a delayed crash at
@@ -1429,12 +1422,10 @@ class OmniPrefixCacheManager:
                         violated[i] = False
             if not bool(violated.any()):
                 return
-            live = req_id in self._request_tasks.live_reqs
         _raise_unreadable_hit(
             req_id,
             key,
-            f"{int(violated.sum())} hit slots reassigned before this delayed read "
-            f"({'live' if live else 'finished'} req, block reuse)",
+            f"{int(violated.sum())} hit slots reassigned before this delayed read (block reuse)",
         )
 
     # ---------------------------------------------------------- merge

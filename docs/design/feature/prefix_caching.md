@@ -264,7 +264,7 @@ Which stages may set `enable_prefix_caching: true`:
 | Codec decoder / Code2Wav stages (Qwen3-Omni stage 2, Qwen3-TTS stage 1) | keep `false` | Nothing downstream consumes their hidden states; the cache would only add device→host copies. Not validated. |
 | Diffusion stages | n/a | No vLLM KV cache to mirror. |
 
-Hit spans come from `scheduled_new_reqs` only, as in the pre-refactor cache:
+Hit spans come from adapter-classified `STARTED` events for new requests:
 
 - A new request with a (partial) prefix hit is the normal path: the hit
   blocks are read from the pool, the rest is this step's rows, and the
@@ -285,22 +285,34 @@ Hit spans come from `scheduled_new_reqs` only, as in the pre-refactor cache:
   stay opt-in until preempt/resume hit spans are reconstructed.
 - `async_chunk` continuation: when the next upstream chunk arrives, the same
   request id re-enters `scheduled_new_reqs` with `num_computed_tokens` equal
-  to what it already computed itself. Ids already in `live_reqs` are skipped
-  for hit marking: those rows were delivered in earlier steps and re-emitting
-  them would duplicate output. A `delivered_upto` span for this case is
-  Phase 2.
+  to what it already computed itself. The adapter classifies an observed ID as
+  `EXTENDED`, so the manager does not mark a hit: those rows were delivered in
+  earlier steps and re-emitting them would duplicate output. A
+  `delivered_upto` span for this case is Phase 2.
 - Preemption + reschedule: vLLM resets `num_computed_tokens` to 0 on
   preemption and re-runs prefix matching on resume, so the resumed request
   can come back with a fresh hit. With the V1 model runner it arrives
   through `scheduled_cached_reqs` (id in `resumed_req_ids`, `new_block_ids`
   replaces the table); with the V2 runner it re-enters `scheduled_new_reqs`
-  while still in `live_reqs`. Neither path marks an omni hit span: the
+  as an already-observed ID. Neither path marks an omni hit span: the
   resumed request gets only the rows it recomputes, and its still-open
   deferred write keeps appending (a slot written twice keeps the later
   chunk). Cache integrity holds either way — the hit blocks already have
   rows, from this request or the one it hit. Stages that need full prompt
   hidden states should be sized so preemption does not occur while prefix
   caching is on. Same as before this refactor; tracked for Phase 2.
+
+The adapter is the sole owner of started-request observations. It emits
+`EXTENDED` for each observed request scheduled again, including ordinary
+decode and chunked prefill, not just IDs re-entering `scheduled_new_reqs`.
+`RESUMED` payloads follow the scheduler's cached-request order. Terminal
+events precede arrivals, so same-step ID reuse finishes the old request
+before `STARTED` classifies the new one. The manager keeps write/resource
+bookkeeping only, with no second `live_reqs` lifecycle classifier.
+`ABORTED` requires an explicit `aborted_req_ids` producer; without that
+side channel aborts remain `FINISHED`. `REPLACED` belongs to item 5.
+Hit payloads describe prefixes `[0, hit_end)`; arbitrary read ranges and
+resume delivery watermarks are follow-up contracts, not inferred here.
 
 Two write paths, split by `ModelCachePolicy.deferred_keys`:
 
