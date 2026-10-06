@@ -36,7 +36,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import DistributedAutoencoderKL
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.forward_context import set_forward_context_cfg_branch
+from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
@@ -457,13 +457,17 @@ class ZImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin
     def predict_noise(self, *args: Any, **kwargs: Any) -> torch.Tensor | IntermediateTensors:
         """Adapt Z-Image's per-sample list output to the CFG framework."""
         cfg_branch = kwargs.pop("_cfg_branch", None)
-        set_forward_context_cfg_branch(cfg_branch)
+        context = get_forward_context() if is_forward_context_available() else None
+        previous_branch = context.cfg_branch if context is not None else None
+        if context is not None:
+            context.cfg_branch = cfg_branch
         try:
             if getattr(self, "_uses_cudagraph_trees", False):
                 torch.compiler.cudagraph_mark_step_begin()
             result = self.transformer(*args, **kwargs)
         finally:
-            set_forward_context_cfg_branch(None)
+            if context is not None:
+                context.cfg_branch = previous_branch
         if isinstance(result, IntermediateTensors):
             return result
         if isinstance(result, tuple) and result and isinstance(result[0], list):
@@ -523,9 +527,6 @@ class ZImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin
                 if apply_cfg
                 else None
             )
-
-            # CUDA graph markers are placed in predict_noise immediately before
-            # each transformer call, including both sequential CFG branches.
 
             noise_pred = self.predict_noise_maybe_with_cfg(
                 do_true_cfg=apply_cfg,

@@ -53,10 +53,10 @@ class ForwardContext:
     total_denoise_steps: int | None = None
     # Per-request reference latent for img2img DiT models (e.g. Ming)
     ref_latent: torch.Tensor | None = None
+    # Z-Image's sequential CFG selects the matching half of fused Ming-Image conditions.
+    cfg_branch: str | None = None
     # Per-request projected direct-VLM condition (e.g., Ming-Image). For now for bsz 1.
     direct_condition: torch.Tensor | None = None
-    # Active CFG branch for models with fused positive/negative context.
-    cfg_branch: str | None = None
     # whether to split the text embed in sequence parallel, if True, the text embed will be split in sequence parallel
 
     # Sequence Parallel padding support

@@ -29,24 +29,19 @@ class MingImageTransformer2DModel(ZImageTransformer2DModel):
         cap_feats_2 = None
         if is_forward_context_available():
             context = get_forward_context()
+            batch_size = len(x)
+            start = batch_size if context.cfg_branch == "negative" else 0
+            reference = context.ref_latent
+            direct = context.direct_condition
             if context.cfg_branch is not None:
-                branch = 0 if context.cfg_branch == "positive" else 1
-                batch_size = len(x)
-                if context.ref_latent is not None and context.ref_latent.shape[0] == batch_size * 2:
-                    context_ref = context.ref_latent.chunk(2, dim=0)[branch]
-                else:
-                    context_ref = context.ref_latent
-                if context.direct_condition is not None and context.direct_condition.shape[0] == batch_size * 2:
-                    context_direct = context.direct_condition.chunk(2, dim=0)[branch]
-                else:
-                    context_direct = context.direct_condition
-            else:
-                context_ref = context.ref_latent
-                context_direct = context.direct_condition
-            if context_ref is not None:
-                ref_x = [item.to(device=x[0].device, dtype=x[0].dtype) for item in context_ref.unbind(dim=0)]
-            if context_direct is not None:
-                cap_feats_2 = [item.to(device=x[0].device, dtype=x[0].dtype) for item in context_direct.unbind(dim=0)]
+                if reference is not None and reference.shape[0] == 2 * batch_size:
+                    reference = reference[start : start + batch_size]
+                if direct is not None and direct.shape[0] == 2 * batch_size:
+                    direct = direct[start : start + batch_size]
+            if reference is not None:
+                ref_x = [item.to(device=x[0].device, dtype=x[0].dtype) for item in reference.unbind(dim=0)]
+            if direct is not None:
+                cap_feats_2 = [item.to(device=x[0].device, dtype=x[0].dtype) for item in direct.unbind(dim=0)]
 
         output, metadata = super().forward(
             x,

@@ -251,9 +251,10 @@ batching profile and is not step-wise execution.
 
 The step-wise profile supports T2I and negative-prompt conditioning. Ming
 img2img/reference-image requests are admitted in request-local groups as a
-conservative scheduling policy while cross-request reference-image batching
-continues to receive limited validation. GPU throughput and latency
-measurements are **待测**.
+conservative scheduler policy. The transformer concatenates `ref_latent[i]`
+onto request `i`; widening admission requires real model validation. Reference
+images condition an extra frame; `strength` is ignored with a warning and the
+full denoise schedule is used. GPU throughput and latency
 measurements are **待测**.
 
 **Full control — `sampling_params_list`** (one entry per stage: `[thinker, imagegen]`).
@@ -308,7 +309,7 @@ curl http://127.0.0.1:8091/v1/chat/completions \
 | `steps` | 30 | Number of FlowMatchEuler denoise steps. |
 | `cfg` | 2.0 | Classifier-free guidance scale. |
 | `seed` | 42 | Per-request RNG seed. |
-| `byte5_text` | (auto) | Glyph text for ByT5 enhancement; raw strings are auto-wrapped to Ming's `Text "…".` format. Auto-extracted from quoted spans in the prompt when omitted. |
+| `byte5_text` | (auto) | Glyph text for ByT5 enhancement; raw strings are auto-wrapped to Ming's `Text "…".` format (including the trailing space). Auto-extracted from quoted spans in the prompt when omitted. |
 | `negative_prompt` | (empty) | Real CFG negative conditioning. Spawns a CFG-text companion via `expand_cfg_prompts`; **online / text-to-image only** (offline uses Ming's default zero-negative). |
 
 For img2img, add an `image_url` content part to the user message (online) or pass `--image` (offline); the reference image is routed into the DiT stage as `extra[reference_image]`.

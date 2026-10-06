@@ -1,23 +1,40 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Independent Ming contracts: bridge -> scheduler -> runner -> public output.
 
-from contextlib import nullcontext
+Inputs come from actual stage/request types and production batch builders.
+Expected results come from the Euler ODE, Z-Image CFG and runner/API contracts.
+Small real HF Qwen2, VAE and FlowMatch components need no model downloads.
+The analytic DiT isolates numerical wiring; real DiT coverage is in
+test_ming_imagegen_model_contract.py and must also pass before acceptance.
+"""
+
+import json
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
 
+import numpy as np
 import pytest
 import torch
-import torch.nn as nn
+from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler
+from diffusers.image_processor import VaeImageProcessor
+from PIL import Image
+from torch import nn
+from transformers import ByT5Tokenizer, Qwen2Config, Qwen2Model, T5Config, T5EncoderModel
+from vllm.config import get_current_vllm_config
+from vllm.outputs import CompletionOutput
 
-from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
-from vllm_omni.diffusion.models.ming_flash_omni import ming_zimage_transformer, pipeline_ming_imagegen
-from vllm_omni.diffusion.models.ming_flash_omni.ming_zimage_transformer import (
-    MingZImageTransformer2DModel,
+from vllm_omni.diffusion.forward_context import get_forward_context, set_forward_context
+from vllm_omni.diffusion.models.ming_flash_omni import pipeline_ming_imagegen
+from vllm_omni.diffusion.models.ming_flash_omni.byte5_encoder import MingByT5Encoder
+from vllm_omni.diffusion.models.ming_flash_omni.condition_encoder import MingConditionEncoder
+from vllm_omni.diffusion.models.ming_flash_omni.pipeline_ming_imagegen import (
+    MingImagePipeline,
+    get_ming_image_post_process_func,
+    get_ming_image_pre_process_func,
 )
-from vllm_omni.diffusion.models.z_image import pipeline_z_image
-from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
-from vllm_omni.diffusion.models.z_image.z_image_transformer import ZImageTransformer2DModel
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import StepScheduler
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
@@ -26,609 +43,689 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.stage_input_processors.ming_flash_omni import thinker2imagegen
+from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.transformers_utils.configs.ming_flash_omni import MingImageGenConfig
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
-class _ConditionEncoder(nn.Module):
+class AnalyticDiT(nn.Module):
+    """Controlled model boundary, not a substitute for real DiT shape tests.
+
+    Reference equation: f(x,c,t,r) = x/8 + mean(c)/1000 + t/4 + r/2.
+    Nonzero input-dependent predictions constrain sign, routing and stale state.
+    Production CFG, predict_noise and scheduler adapters are untouched.
+    """
+
+    in_channels = 4
+
     def __init__(self):
         super().__init__()
-        self.calls: list[torch.Tensor] = []
+        self.calls = []
+        self.grad_modes = []
 
-    def forward(self, hidden):
-        self.calls.append(hidden.detach().clone())
-        return hidden + 10
+    def forward(self, x, t, cap_feats):
+        self.grad_modes.append((torch.is_grad_enabled(), torch.is_inference_mode_enabled()))
+        ref = get_forward_context().ref_latent
+        self.calls.append((t.clone(), [a.clone() for a in x], ref))
+        output = []
+        for i, (sample, condition) in enumerate(zip(x, cap_feats, strict=True)):
+            assert sample.shape == (4, 1, 8, 8), "DiT frame axis must precede spatial axes"
+            value = sample / 8 + condition.mean() / 1000 + t[i] / 4
+            if ref is not None:
+                value = value + ref[i].unsqueeze(1) / 2
+            output.append(value)
+        return output, {}
 
-    @staticmethod
-    def zero_negative(value):
-        return torch.zeros_like(value)
+
+def stage_output(request_id, hidden):
+    """Producer: actual stage result type and the image query-token layout."""
+    completion = CompletionOutput(index=0, text="", token_ids=[], cumulative_logprob=None, logprobs=None)
+    completion.multimodal_output = {"final_hidden_states": hidden}
+    return OmniRequestOutput(
+        request_id=request_id,
+        prompt="",
+        prompt_token_ids=[157157] * 256 + [157159],
+        outputs=[completion],
+        finished=True,
+    )
 
 
-class _StepConditionEncoder(_ConditionEncoder):
-    pass
+def request(request_id="A", *, seed=11, reference=None, negative=False, **overrides):
+    """Real bridge: one thinker hidden row per prompt token, then query slicing."""
+    hidden = torch.arange(257 * 4, dtype=torch.float32).reshape(257, 4) / 1000
+    hidden = hidden + (0.2 if request_id == "B" else 0)
+    outputs = [stage_output(request_id, hidden)]
+    if negative:
+        outputs.append(stage_output(request_id + "__cfg_text", -hidden))
+    original: dict[str, object] = {"prompt": "paint a landscape", "modalities": ["image"]}
+    if reference is not None:
+        original["multi_modal_data"] = {"image": reference}
+    prompt = thinker2imagegen(outputs, prompt=original)[0]
+    values = dict(seed=seed, height=16, width=16, num_inference_steps=3, output_type="latent")
+    values.update(overrides)
+    return OmniDiffusionRequest(
+        prompt=prompt, request_id=request_id, sampling_params=OmniDiffusionSamplingParams(**values)
+    )
 
 
-def _pipeline(monkeypatch):
-    pipe = object.__new__(pipeline_ming_imagegen.MingImagePipeline)
-    nn.Module.__init__(pipe)
-    pipe.register_parameter("_probe", nn.Parameter(torch.zeros(1)))
-    pipe.image_gen_config = SimpleNamespace(
-        img_gen_scales=[2],
-        thinker_hidden_size=3,
+@pytest.fixture
+def pipeline(tmp_path):
+    """Real stage components; bypass only checkpoint IO and the DiT kernel."""
+    cfg = MingImageGenConfig(
+        thinker_hidden_size=4,
+        diffusion_c_input_dim=4,
+        img_gen_scales=[16],
         default_height=16,
         default_width=16,
-        num_inference_steps=2,
-        guidance_scale=2.0,
-    )
-    pipe.condition_encoder = _ConditionEncoder()
-    pipe.byte5 = None
-    pipe._dtype = torch.float32
-    pipe.device = torch.device("cpu")
-
-    captured = {}
-
-    def fake_forward(_self, z_req):
-        captured["request_ids"] = z_req.request_ids
-        captured["sampling"] = z_req.sampling_params_list
-        captured["positive"] = [x.detach().clone() for x in pipe._pending_prompt_embeds]
-        captured["negative"] = [x.detach().clone() for x in pipe._pending_negative_prompt_embeds]
-        captured["generator_values"] = [
-            torch.rand(1, generator=item.generator).item() for item in z_req.sampling_params_list
-        ]
-        return DiffusionOutput(
-            output=torch.arange(z_req.num_reqs * 4, dtype=torch.float32).reshape(z_req.num_reqs, 1, 2, 2)
-        )
-
-    monkeypatch.setattr(ZImagePipeline, "forward", fake_forward)
-    return pipe, captured
-
-
-def _request(request_id, hidden, *, seed, negative=None, reference=None):
-    extra = {"thinker_hidden_states": hidden}
-    if negative is not None:
-        extra["negative_thinker_hidden_states"] = negative
-    if reference is not None:
-        extra["reference_image"] = reference
-    return OmniDiffusionRequest(
-        prompt={"prompt": "", "extra": extra},
-        sampling_params=OmniDiffusionSamplingParams(seed=seed, height=16, width=16, num_inference_steps=2),
-        request_id=request_id,
-    )
-
-
-def test_ming_pipeline_batches_request_local_conditions_and_preserves_order(monkeypatch):
-    pipe, captured = _pipeline(monkeypatch)
-    assert pipe.supports_request_batch is True
-    req_a = _request("A", torch.full((2, 3), 1.0), seed=111, negative=torch.full((2, 3), 7.0))
-    req_b = _request("B", torch.full((2, 3), 2.0), seed=222)
-
-    outputs = pipe.forward(DiffusionRequestBatch([req_a, req_b]))
-
-    assert [item.output.flatten()[0].item() for item in outputs] == [0.0, 4.0]
-    assert captured["request_ids"] == ["A", "B"]
-    assert captured["positive"][0][0, 0].item() == 11.0
-    assert captured["positive"][1][0, 0].item() == 12.0
-    assert captured["negative"][0][0, 0].item() == 17.0
-    assert torch.count_nonzero(captured["negative"][1]) == 0
-    assert [g.initial_seed() for g in (s.generator for s in captured["sampling"])] == [111, 222]
-
-
-def test_ming_seed_isolation_matches_single_request_execution(monkeypatch):
-    pipe, batch_capture = _pipeline(monkeypatch)
-    req_a = _request("A", torch.ones((2, 3)), seed=111)
-    req_b = _request("B", torch.ones((2, 3)), seed=222)
-    batch = DiffusionRequestBatch([req_a, req_b])
-    pipe.forward(batch)
-    _pipeline_single, single_capture = _pipeline(monkeypatch)
-    _pipeline_single.forward(DiffusionRequestBatch([_request("A", torch.ones((2, 3)), seed=111)]))
-    assert batch_capture["generator_values"][0] == single_capture["generator_values"][0]
-    assert batch_capture["generator_values"][0] != batch_capture["generator_values"][1]
-
-
-def test_ming_preserves_explicit_request_generators(monkeypatch):
-    pipe, capture = _pipeline(monkeypatch)
-    generator = torch.Generator().manual_seed(987)
-    request = OmniDiffusionRequest(
-        prompt={"prompt": "", "extra": {"thinker_hidden_states": torch.ones((2, 3))}},
-        sampling_params=OmniDiffusionSamplingParams(
-            generator=generator,
-            seed=123,
-            height=16,
-            width=16,
-            num_inference_steps=2,
-        ),
-        request_id="generator-request",
-    )
-
-    pipe.forward(DiffusionRequestBatch([request]))
-
-    assert capture["sampling"][0].generator is generator
-
-
-def test_ming_step_preserves_explicit_generator_over_sampling_seed(monkeypatch):
-    pipe = _step_pipeline(monkeypatch)
-    generator = torch.Generator().manual_seed(987)
-    state = StepRequestState(
-        request_id="generator-request",
-        sampling=OmniDiffusionSamplingParams(
-            generator=generator,
-            seed=123,
-            height=4,
-            width=4,
-            num_inference_steps=2,
-        ),
-        prompt={"extra": {"thinker_hidden_states": torch.ones(2, 3)}},
-    )
-
-    pipe.prepare_encode(state)
-
-    assert state.sampling.generator is generator
-
-
-def test_ming_reference_latents_are_indexed_per_request(monkeypatch):
-    captured = {}
-    context = SimpleNamespace(ref_latent=torch.tensor([[[[1.0]]], [[[2.0]]]]))
-    monkeypatch.setattr(ming_zimage_transformer, "is_forward_context_available", lambda: True)
-    monkeypatch.setattr(ming_zimage_transformer, "get_forward_context", lambda: context)
-
-    def fake_parent(_self, x, t, cap_feats, patch_size=2, f_patch_size=1):
-        captured["x"] = x
-        return x, {}
-
-    monkeypatch.setattr(ZImageTransformer2DModel, "forward", fake_parent)
-    transformer = object.__new__(MingZImageTransformer2DModel)
-    x = [torch.zeros(1, 1, 1, 1), torch.zeros(1, 1, 1, 1)]
-    transformer.forward(x, torch.ones(2), [torch.zeros(1, 1), torch.zeros(1, 1)])
-
-    assert captured["x"][0][0, 1, 0, 0].item() == 1.0
-    assert captured["x"][1][0, 1, 0, 0].item() == 2.0
-
-
-def test_ming_preprocessor_marks_wave_compatibility():
-    pre = pipeline_ming_imagegen.get_ming_image_pre_process_func(SimpleNamespace())
-    req = _request("A", torch.ones((2, 3)), seed=111)
-    processed = pre(req)
-    assert processed.batch_compatibility_key[0] == "ming_image"
-
-
-class _StepScheduler:
-    order = 1
-
-    def __init__(self):
-        self.config = {
-            "base_image_seq_len": 256,
-            "max_image_seq_len": 4096,
-            "base_shift": 0.5,
-            "max_shift": 1.15,
-        }
-        self.timesteps = None
-
-    def set_timesteps(self, steps, device=None, **kwargs):
-        del kwargs
-        self.timesteps = torch.arange(steps, 0, -1, device=device, dtype=torch.float32)
-
-    def set_begin_index(self, index):
-        self.begin_index = index
-
-    def scale_noise(self, latents, timestep, noise):
-        del timestep
-        return latents + noise
-
-    def step(self, noise_pred, timestep, latents, **kwargs):
-        del timestep, kwargs
-        return (latents - noise_pred,)
-
-
-def _step_pipeline(monkeypatch):
-    pipe = object.__new__(pipeline_ming_imagegen.MingImagePipeline)
-    nn.Module.__init__(pipe)
-    pipe.register_parameter("_probe", nn.Parameter(torch.zeros(1)))
-    pipe.device = torch.device("cpu")
-    pipe._execution_device = pipe.device
-    pipe._dtype = torch.float32
-    pipe.vae_scale_factor = 1
-    pipe.image_gen_config = SimpleNamespace(
-        img_gen_scales=[2],
-        thinker_hidden_size=3,
-        default_height=4,
-        default_width=4,
         num_inference_steps=3,
         guidance_scale=2.0,
+        vae_subfolder="custom_vae",
     )
-    pipe.transformer = SimpleNamespace(in_channels=1)
-    pipe.scheduler = _StepScheduler()
-    pipe.vae = SimpleNamespace(
+    root = tmp_path / "model"
+    (root / "custom_vae").mkdir(parents=True)
+    (root / "config.json").write_text(json.dumps({"image_gen_config": cfg.to_dict()}), encoding="utf-8")
+    (root / "custom_vae" / "config.json").write_text(json.dumps({"block_out_channels": [8, 16]}), encoding="utf-8")
+    od_config = SimpleNamespace(
+        model=str(root),
+        revision=None,
         dtype=torch.float32,
-        config=SimpleNamespace(scaling_factor=1.0, shift_factor=0.0),
-        decode=lambda latents, return_dict=False: (latents,),
+        tf_model_config=cfg,
+        step_execution=True,
+        model_class_name="MingImagePipeline",
+        streaming_output=False,
+        max_num_seqs=2,
+        omni_kv_config=None,
+        cache_backend=None,
+        diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
+        parallel_config=SimpleNamespace(use_hsdp=False, sequence_parallel_size=1),
     )
-    pipe.condition_encoder = _StepConditionEncoder()
-    pipe.byte5 = None
-    monkeypatch.setattr(
-        pipe,
-        "_encode_reference_image",
-        lambda ref, height, width: torch.full((1, 1, 2, 2), float(torch.as_tensor(ref).flatten()[0])),
-    )
-
-    pipe.seen_step_conditions = []
-
-    def fake_predict(**kwargs):
-        pipe.seen_step_conditions.append(
-            {
-                "request_ids": [item for item in kwargs["positive_kwargs"]["cap_feats"]],
-                "negative": None
-                if kwargs["negative_kwargs"] is None
-                else [item for item in kwargs["negative_kwargs"]["cap_feats"]],
-                "x_shapes": [tuple(item.shape) for item in kwargs["positive_kwargs"]["x"]],
-            }
-        )
-        return torch.zeros((len(kwargs["positive_kwargs"]["x"]), 1, 1, 4, 4))
-
-    monkeypatch.setattr(pipe, "predict_noise_maybe_with_cfg", fake_predict)
+    pipe = object.__new__(MingImagePipeline)
+    nn.Module.__init__(pipe)
+    pipe.od_config, pipe.image_gen_config = od_config, cfg
+    pipe.device = pipe._execution_device = torch.device("cpu")
+    pipe._dtype, pipe._interrupt, pipe.byte5 = torch.float32, False, None
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(31)
+        connector = Qwen2Model(
+            Qwen2Config(
+                vocab_size=16,
+                hidden_size=4,
+                intermediate_size=8,
+                num_hidden_layers=1,
+                num_attention_heads=1,
+                num_key_value_heads=1,
+                attn_implementation="eager",
+            )
+        ).eval()
+        pipe.condition_encoder = MingConditionEncoder(cfg, thinker_hidden_size=4)
+        pipe.condition_encoder.connector = connector
+        pipe.condition_encoder.eval()
+        pipe.vae = AutoencoderKL(
+            in_channels=3,
+            out_channels=3,
+            latent_channels=4,
+            block_out_channels=(8, 16),
+            down_block_types=("DownEncoderBlock2D", "DownEncoderBlock2D"),
+            up_block_types=("UpDecoderBlock2D", "UpDecoderBlock2D"),
+            layers_per_block=1,
+            norm_num_groups=4,
+            sample_size=16,
+            scaling_factor=0.5,
+            shift_factor=0.25,
+        ).eval()
+    pipe.vae_scale_factor = 2
+    pipe.image_processor = VaeImageProcessor(vae_scale_factor=4, do_convert_rgb=True)
+    pipe.scheduler = FlowMatchEulerDiscreteScheduler(use_dynamic_shifting=True)
+    pipe.transformer = AnalyticDiT()
     return pipe
 
 
-def test_ming_step_lifecycle_runs_one_step_per_tick(monkeypatch):
-    pipe = _step_pipeline(monkeypatch)
-    states = [
-        StepRequestState(
-            request_id="A",
-            sampling=OmniDiffusionSamplingParams(seed=111, height=4, width=4, num_inference_steps=3),
-            prompt={"extra": {"thinker_hidden_states": torch.ones(2, 3)}},
-        ),
-        StepRequestState(
-            request_id="B",
-            sampling=OmniDiffusionSamplingParams(seed=222, height=4, width=4, num_inference_steps=3),
-            prompt={"extra": {"thinker_hidden_states": torch.ones(2, 3) * 2}},
-        ),
-    ]
-    for state in states:
+def prepared(pipe, req):
+    req = get_ming_image_pre_process_func(pipe.od_config)(req)
+    state = StepRequestState(request_id=req.request_id, sampling=req.sampling_params, prompt=req.prompt)
+    with torch.inference_mode():
         pipe.prepare_encode(state)
-    assert [state.step_index for state in states] == [0, 0]
+    return state
+
+
+def oracle_prediction(state, *, scale=2.0, threshold=1.0, normalization=0.0):
+    """Independent analytic-model equation and vendor Z-Image CFG convention."""
+    t = float((1000 - state.current_timestep.float()) / 1000)
+    reference = state.extra["ming_reference_latent"]
+    base = state.latents / 8 + t / 4
+    if reference is not None:
+        base = base + reference / 2
+    pos = base + state.prompt_embeds.mean() / 1000
+    if scale <= 0 or (threshold is not None and t > threshold):
+        return -pos
+    neg = base + state.negative_prompt_embeds.mean() / 1000
+    guided = pos + scale * (pos - neg)
+    limit = normalization
+    if limit > 0:
+        max_norm, norm = torch.linalg.vector_norm(pos) * limit, torch.linalg.vector_norm(guided)
+        if norm > max_norm:
+            guided = guided * max_norm / norm
+    return -guided
+
+
+def assert_euler_tick(pipe, states, *, scale=2.0, threshold=1.0, normalization=0.0):
+    # Expected source: Euler ODE, never scheduler.step() or implementation_under_test().
+    predictions = [oracle_prediction(s, scale=scale, threshold=threshold, normalization=normalization) for s in states]
+    expected = [
+        s.latents + (s.scheduler.sigmas[s.step_index + 1] - s.scheduler.sigmas[s.step_index]) * p
+        for s, p in zip(states, predictions, strict=True)
+    ]
     batch = InputBatch.make_batch(states)
-    for _ in range(3):
-        prediction = pipe.denoise_step(batch, states=states)
-        assert pipe.seen_step_conditions[-1]["x_shapes"] == [(1, 1, 4, 4), (1, 1, 4, 4)]
-        assert prediction.shape[0] == 2
-        for index, state in enumerate(states):
-            pipe.step_scheduler(state, prediction[index : index + 1])
-        if not all(state.denoise_completed for state in states):
-            batch = InputBatch.make_batch(states, cached_batch=batch)
-    assert [state.step_index for state in states] == [3, 3]
-    assert all(state.scheduler is not states[0].scheduler for state in states[1:])
-    states[0].extra["ming_output_type"] = "latent"
-    assert pipe.post_decode(states[0]).output is states[0].latents
+    with torch.inference_mode():
+        prediction = pipe.denoise_step(batch)
+        torch.testing.assert_close(prediction, torch.cat(predictions))
+        for i, s in enumerate(states):
+            old_index = s.step_index
+            pipe.step_scheduler(s, prediction[i : i + 1])
+            assert s.step_index == old_index + 1
+            assert s.scheduler.step_index == s.step_index
+            assert s.latents.dtype == torch.float32
+            torch.testing.assert_close(s.latents, expected[i], rtol=1e-5, atol=1e-5)
 
 
-def test_ming_step_batch_uses_each_request_timestep(monkeypatch):
-    pipe = _step_pipeline(monkeypatch)
-    states = []
-    for request_id, step_index in (("A", 3), ("B", 0), ("C", 2)):
-        state = StepRequestState(
-            request_id=request_id,
-            sampling=OmniDiffusionSamplingParams(height=4, width=4, num_inference_steps=4),
-            prompt={"extra": {"thinker_hidden_states": torch.ones(2, 3)}},
-        )
-        pipe.prepare_encode(state)
-        state.step_index = step_index
-        states.append(state)
-    batch = InputBatch.make_batch(states)
-    seen = {}
+@pytest.mark.parametrize("normalize", [False, True, 2.0])
+def test_nonzero_euler_cfg_and_interleaved_cursors(pipeline, normalize):
+    """Scenario: B joins after A advances, CFG and non-CFG rows share a wave.
 
-    def capture_predict(**kwargs):
-        seen["timesteps"] = kwargs["positive_kwargs"]["t"].clone()
-        return torch.zeros((3, 1, 1, 4, 4))
-
-    monkeypatch.setattr(pipe, "predict_noise_maybe_with_cfg", capture_predict)
-    pipe.denoise_step(batch, states=states)
-    torch.testing.assert_close(seen["timesteps"], torch.tensor([0.999, 0.996, 0.998]), atol=1e-6, rtol=0)
-
-
-def test_ming_step_preprocessor_isolates_reference_requests():
-    pre = pipeline_ming_imagegen.get_ming_image_pre_process_func(SimpleNamespace())
-    ref_a = _request("A", torch.ones((2, 3)), seed=111, reference=torch.zeros(1))
-    ref_b = _request("B", torch.ones((2, 3)), seed=222, reference=torch.ones(1))
-    assert pre(ref_a).batch_compatibility_key != pre(ref_b).batch_compatibility_key
-
-
-def test_ming_step_preprocessor_isolates_cfg_truncation():
-    pre = pipeline_ming_imagegen.get_ming_image_pre_process_func(SimpleNamespace())
-    req_a = _request("A", torch.ones((2, 3)), seed=111)
-    req_b = _request("B", torch.ones((2, 3)), seed=222)
-    req_a.sampling_params.extra_args = {"cfg_truncation": 0.5}
-    req_b.sampling_params.extra_args = {"cfg_truncation": 1.0}
-    assert pre(req_a).batch_compatibility_key != pre(req_b).batch_compatibility_key
-
-
-def test_ming_step_consumes_cfg_truncation_per_timestep(monkeypatch):
-    pipe = _step_pipeline(monkeypatch)
-    states = []
-    for request_id in ("A", "B"):
-        state = StepRequestState(
-            request_id=request_id,
-            sampling=OmniDiffusionSamplingParams(height=4, width=4, num_inference_steps=3),
-            prompt={"extra": {"thinker_hidden_states": torch.ones(2, 3)}},
-        )
-        pipe.prepare_encode(state)
-        state.extra["ming_cfg_truncation"] = 0.9985
-        states.append(state)
-    states[1].step_index = 2
-
-    calls = []
-    original = pipe.predict_noise_maybe_with_cfg
-
-    def capture(**kwargs):
-        calls.append((kwargs["do_true_cfg"], len(kwargs["positive_kwargs"]["x"])))
-        return original(**kwargs)
-
-    monkeypatch.setattr(pipe, "predict_noise_maybe_with_cfg", capture)
-    pipe.denoise_step(InputBatch.make_batch(states), states=states)
-
-    assert calls == [(False, 1), (True, 1)]
-
-
-def test_zimage_diffuse_marks_each_cfg_transformer_forward(monkeypatch):
-    pipe = object.__new__(ZImagePipeline)
-    pipe._uses_cudagraph_trees = True
-    pipe._interrupt = False
-    pipe.od_config = SimpleNamespace(dtype=torch.float32)
-    pipe.transformer = lambda *args, **kwargs: ([torch.zeros(1, 1, 1, 2, 2)], {})
-    pipe.scheduler_step_maybe_with_cfg = lambda noise, timestep, latents, apply_cfg: latents
-    marker_calls = []
-    monkeypatch.setattr(torch.compiler, "cudagraph_mark_step_begin", lambda: marker_calls.append(True))
-
-    pipe.diffuse(
-        [torch.zeros(1, 1)],
-        [torch.zeros(1, 1)],
-        torch.zeros(1, 1, 2, 2),
-        torch.tensor([900.0, 500.0]),
-        do_true_cfg=True,
-        true_cfg_scale=2.0,
-    )
-
-    assert marker_calls == [True, True, True, True]
-
-
-def test_zimage_diffuse_preserves_five_dimensional_latents(monkeypatch):
-    pipe = object.__new__(ZImagePipeline)
-    pipe._uses_cudagraph_trees = False
-    pipe._interrupt = False
-    pipe.od_config = SimpleNamespace(dtype=torch.float32)
-    captured: dict[str, Any] = {}
-
-    def capture_predict(**kwargs):
-        captured["x"] = kwargs["positive_kwargs"]["x"]
-        return torch.zeros((1, 2, 3, 4, 5))
-
-    pipe.predict_noise_maybe_with_cfg = capture_predict
-    pipe.scheduler_step_maybe_with_cfg = lambda noise, timestep, latents, apply_cfg: latents
-
-    latents = torch.zeros(1, 2, 3, 4, 5)
-    result = pipe.diffuse(
-        [torch.zeros(1, 1)],
-        [torch.zeros(1, 1)],
-        latents,
-        torch.tensor([900.0]),
-        do_true_cfg=False,
-        true_cfg_scale=0.0,
-    )
-
-    assert captured["x"][0].shape == (2, 3, 4, 5)
-    assert result.shape == latents.shape
-
-
-def test_zimage_forward_accepts_multiple_requests_without_single_batch_assert(monkeypatch):
-    pipe = object.__new__(ZImagePipeline)
-    pipe._execution_device = torch.device("cpu")
-    pipe.vae_scale_factor = 1
-    pipe.transformer = SimpleNamespace(in_channels=1)
-    pipe.scheduler = SimpleNamespace(config={}, sigma_min=0.0)
-    captured: dict[str, Any] = {}
-
-    pipe.encode_prompt = lambda **kwargs: ([torch.zeros(1, 1)] * 2, [torch.zeros(1, 1)] * 2)
-
-    def fake_prepare_latents(batch_size, *args, **kwargs):
-        return torch.zeros((batch_size, 1, 3, 8, 10))
-
-    pipe.prepare_latents = fake_prepare_latents
-
-    def fake_retrieve_timesteps(scheduler, num_inference_steps, device, sigmas=None, **kwargs):
-        captured["mu"] = kwargs["mu"]
-        return torch.tensor([1.0], device=device), 1
-
-    monkeypatch.setattr(pipeline_z_image, "retrieve_timesteps", fake_retrieve_timesteps)
-
-    def fake_diffuse(**kwargs):
-        captured["latents"] = kwargs["latents"]
-        return kwargs["latents"]
-
-    pipe.diffuse = fake_diffuse
-    params = OmniDiffusionSamplingParams(
-        height=16,
-        width=16,
-        num_inference_steps=1,
-        guidance_scale=1.0,
-        output_type="latent",
-    )
-    requests = [
-        OmniDiffusionRequest(prompt={"prompt": ""}, sampling_params=params, request_id=request_id)
-        for request_id in ("A", "B")
-    ]
-
-    output = pipe.forward(DiffusionRequestBatch(requests))
-
-    assert output.output.shape == (2, 1, 3, 8, 10)
-    assert captured["latents"].shape == (2, 1, 3, 8, 10)
-    assert captured["mu"] == pipeline_z_image.calculate_shift(20, 256, 4096, 0.5, 1.15)
-
-
-def test_ming_step_denoise_scopes_reference_latents_in_active_request_order(monkeypatch):
-    pipe = _step_pipeline(monkeypatch)
-    states = [
-        StepRequestState(
-            request_id=request_id,
-            sampling=OmniDiffusionSamplingParams(height=4, width=4, num_inference_steps=3),
-            prompt={"extra": {"thinker_hidden_states": torch.ones(2, 3), "reference_image": torch.full((1,), value)}},
-        )
-        for request_id, value in (("A", 1.0), ("B", 2.0))
-    ]
-    for state in states:
-        pipe.prepare_encode(state)
-
-    captured: list[torch.Tensor | None] = []
-    monkeypatch.setattr(
-        pipeline_ming_imagegen,
-        "set_forward_context_ref_latent",
-        lambda value: captured.append(None if value is None else value.clone()),
-    )
-    pipe.denoise_step(InputBatch.make_batch(states), states=states)
-
-    assert captured[0] is not None
-    torch.testing.assert_close(captured[0][:, 0, 0, 0], torch.tensor([1.0, 2.0]))
-    assert captured[-1] is None
-
-
-def test_ming_step_batch_runs_through_real_scheduler_and_runner(monkeypatch):
-    """Exercise the closest CPU-only production path without loading a checkpoint.
-
-    The scheduler, runner, request states, InputBatch construction, Ming hooks,
-    completion bookkeeping, and output routing are real.  Only the heavyweight
-    DIT/VAE kernels are replaced by the deterministic test pipeline above.
+    Input source: bridge -> prepare_encode -> actual InputBatch.
+    Why valid: compatible continuous-batch requests may be at different ticks.
+    Expected source: Euler equation and inclusive CFG progress threshold.
+    Regression: wrong sign/axis, reversed truncation, shared cursor, reordered rows.
     """
-    pipe = _step_pipeline(monkeypatch)
-    pipe.supports_step_execution = True
+    a = prepared(pipeline, request(negative=True, cfg_normalize=normalize, extra_args={"cfg_truncation": 0.3}))
+    b = prepared(pipeline, request("B", cfg_normalize=normalize, extra_args={"cfg_truncation": 0.3}))
+    assert a.scheduler is not b.scheduler
+    contract = {"threshold": 0.3, "normalization": float(normalize)}
+    with set_forward_context(omni_diffusion_config=pipeline.od_config):
+        assert_euler_tick(pipeline, [a], **contract)
+        assert_euler_tick(pipeline, [b, a], **contract)
+        assert_euler_tick(pipeline, [a, b], **contract)
+        assert a.denoise_completed and not b.denoise_completed
+        assert_euler_tick(pipeline, [b], **contract)
+    assert b.denoise_completed
 
+
+@pytest.mark.parametrize("reference", [False, True])
+def test_b1_batch_matches_b2_and_single_request(pipeline, reference):
+    """Regression: B1 multi-request sampling accessor must not assert.
+
+    Input: same bridge requests/seeds in B1 wave, singleton and B2.
+    Expected source: deterministic per-request ODE independent of admission.
+    The separate Euler test pins correctness without depending on B1/B2 agreement.
+    """
+    image = Image.new("RGB", (16, 16), color=(100, 20, 50)) if reference else None
+
+    def make():
+        return [request("A", reference=image, negative=True), request("B", seed=22, reference=image)]
+
+    with set_forward_context(omni_diffusion_config=pipeline.od_config), torch.inference_mode():
+        batch = pipeline.forward(DiffusionRequestBatch(make()))
+        singles = [pipeline.forward(DiffusionRequestBatch([r]))[0] for r in make()]
+        states = [prepared(pipeline, r) for r in make()]
+        for _ in range(3):
+            assert_euler_tick(pipeline, states)
+        for i, s in enumerate(states):
+            torch.testing.assert_close(batch[i].output, singles[i].output, rtol=1e-5, atol=1e-5)
+            torch.testing.assert_close(batch[i].output, pipeline.post_decode(s).output, rtol=1e-5, atol=1e-5)
+            assert torch.isfinite(batch[i].output).all()
+
+
+@pytest.mark.parametrize("strength", [0, 1e-8, 0.6, 1])
+def test_reference_is_conditioning_not_strength_initialization(pipeline, strength, caplog):
+    """Input: bridge PIL reference. Expected: vendor random-latent + extra frame.
+
+    Regression: reference must not shorten schedule or replace seeded initial noise.
+    """
+    reference = Image.new("RGB", (16, 16), color="red")
+    ref = prepared(pipeline, request(reference=reference, strength=strength))
+    plain = prepared(pipeline, request())
+    assert ref.extra["ming_reference_latent"].shape == (1, 4, 8, 8)
+    assert torch.count_nonzero(ref.extra["ming_reference_latent"]) > 0
+    torch.testing.assert_close(ref.latents, plain.latents)
+    torch.testing.assert_close(ref.timesteps, plain.timesteps)
+    assert ref.total_steps == 3 and ref.scheduler.begin_index == 0
+    assert "ignores strength" in caplog.text
+
+
+def test_generator_precedence_and_seed_isolation(pipeline):
+    """API generator wins unless extra seed overrides; expected: independent torch RNG.
+
+    Regression: runner-created generators must not be replaced or shared across seeds.
+    """
+    gen = torch.Generator().manual_seed(987)
+    a = prepared(pipeline, request(generator=gen, seed=11))
+    expected = torch.randn((1, 4, 8, 8), generator=torch.Generator().manual_seed(987))
+    torch.testing.assert_close(a.latents, expected)
+    b = prepared(pipeline, request("B", generator=gen, extra_args={"seed": 123}))
+    expected_b = torch.randn((1, 4, 8, 8), generator=torch.Generator().manual_seed(123))
+    torch.testing.assert_close(b.latents, expected_b)
+    torch.testing.assert_close(prepared(pipeline, request()).latents, prepared(pipeline, request()).latents)
+    assert not torch.equal(a.latents, prepared(pipeline, request(seed=22)).latents)
+
+
+@pytest.mark.parametrize("index", [0, 1, 2])
+@pytest.mark.parametrize("offset", [-1e-5, 0.0, 1e-5])
+def test_cfg_threshold_is_inclusive_at_each_schedule_position(pipeline, index, offset):
+    """Schedule-produced noise levels -> CFG at and before the declared threshold.
+
+    Expected source: vendor progress=(1000-timestep)/1000, inclusive comparison.
+    Regression: reversed time direction and accidentally exclusive threshold.
+    """
+    state = prepared(pipeline, request(negative=True))
+    # Advancing through real scheduler steps is a legal lifecycle, not forged indices.
+    with set_forward_context(omni_diffusion_config=pipeline.od_config):
+        for _ in range(index):
+            assert_euler_tick(pipeline, [state])
+        progress = float((1000 - state.current_timestep.float()) / 1000)
+        threshold = progress + offset
+        state.extra["ming_cfg_truncation"] = threshold
+        actual = pipeline.denoise_step(InputBatch.make_batch([state]))
+        expected = oracle_prediction(state, threshold=threshold)
+        torch.testing.assert_close(actual, expected)
+
+
+def test_real_admission_runner_and_api_consumer(pipeline, monkeypatch):
+    """Scenario: A starts, B joins, each finishes and retires separately.
+
+    Input source: real stage output -> bridge -> preprocessor -> StepScheduler.
+    Why valid: actual NewRequestData/CachedRequestData reach the actual runner.
+    Expected source: runner tick/retirement and OmniRequestOutput API contracts.
+    Regression: stale batch, misrouting, false completion, latent-as-PIL conversion.
+    Only CPU memory metrics are disabled. The analytic DiT isolates GPU kernels.
+    """
     runner = object.__new__(DiffusionModelRunner)
-    runner.vllm_config = SimpleNamespace(
-        kernel_config=SimpleNamespace(
-            ir_op_priority=SimpleNamespace(set_priority=lambda *args, **kwargs: nullcontext())
-        ),
-        compilation_config=SimpleNamespace(ir_enable_torch_wrap=True),
-    )
-    runner.od_config = SimpleNamespace(
-        cache_backend=None,
-        diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
-        parallel_config=SimpleNamespace(use_hsdp=False),
-        streaming_output=False,
-    )
-    runner.device = torch.device("cpu")
-    runner.pipeline = pipe
-    runner.cache_backend = None
-    runner.offload_backend = None
+    runner.vllm_config, runner.od_config = get_current_vllm_config(), pipeline.od_config
+    runner.device, runner.pipeline = pipeline.device, pipeline
+    runner.cache_backend = runner.offload_backend = None
     runner.state_cache = {}
-    runner.kv_transfer_manager = SimpleNamespace(
-        receive_multi_kv_cache_distributed=lambda *args, **kwargs: None,
-    )
-
-    # The CI CPU platform advertises availability but has no CUDA memory API.
-    # Disable only that optional metric so the real runner path can execute.
-    platform_path = "vllm_omni.diffusion.worker.diffusion_model_runner.current_omni_platform"
-    monkeypatch.setattr(f"{platform_path}.is_available", lambda: False)
-    monkeypatch.setattr(f"{platform_path}.max_memory_reserved", lambda: 0)
-    monkeypatch.setattr(f"{platform_path}.max_memory_allocated", lambda: 0)
-
-    pre = pipeline_ming_imagegen.get_ming_image_pre_process_func(SimpleNamespace())
-    requests = []
-    for request_id, hidden, seed in (
-        ("A", torch.ones(257, 3), 111),
-        ("B", torch.ones(257, 3) * 2, 222),
-    ):
-        # Feed a production-shaped thinker output through the real stage input
-        # processor; this is the production producer of prompt.extra hidden state.
-        thinker_output = SimpleNamespace(
-            request_id=request_id,
-            prompt_token_ids=[157157] * 256 + [157159],
-            outputs=[SimpleNamespace(multimodal_output={"final_hidden_states": hidden})],
-        )
-        thinker_outputs = [thinker_output]
-        if request_id == "A":
-            thinker_outputs.append(
-                SimpleNamespace(
-                    request_id="A__cfg_text",
-                    prompt_token_ids=[157157] * 256 + [157159],
-                    outputs=[SimpleNamespace(multimodal_output={"final_hidden_states": torch.full((257, 3), 7.0)})],
-                )
-            )
-        imagegen_prompt = thinker2imagegen(thinker_outputs, prompt={"prompt": ""})[0]
-        request = OmniDiffusionRequest(
-            prompt=imagegen_prompt,
-            sampling_params=OmniDiffusionSamplingParams(
-                seed=seed,
-                height=4,
-                width=4,
-                num_inference_steps=2,
-            ),
-            request_id=request_id,
-        )
-        requests.append(pre(request))
+    runner.kv_transfer_manager = SimpleNamespace(receive_multi_kv_cache_distributed=lambda *a, **kw: None)
+    platform = "vllm_omni.diffusion.worker.diffusion_model_runner.current_omni_platform"
+    monkeypatch.setattr(platform + ".is_available", lambda: False)
+    monkeypatch.setattr(platform + ".max_memory_reserved", lambda: 0)
+    monkeypatch.setattr(platform + ".max_memory_allocated", lambda: 0)
+    pre = get_ming_image_pre_process_func(pipeline.od_config)
+    requests = {r.request_id: pre(r) for r in [request("A", negative=True), request("B", seed=22)]}
+    with set_forward_context(omni_diffusion_config=pipeline.od_config), torch.inference_mode():
+        baselines = {rid: pipeline.forward(DiffusionRequestBatch([req]))[0].output for rid, req in requests.items()}
     scheduler = StepScheduler()
-    scheduler.initialize(
-        SimpleNamespace(
-            max_num_seqs=2,
-            omni_kv_config=None,
-            diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
-        )
-    )
-    scheduler.add_request(requests[0])
-
-    first = scheduler.schedule()
-    assert first.scheduled_request_ids == ["A"]
-    first_output = runner.execute_stepwise(first)
-    assert first_output.request_ids == ["A"]
-    assert all(not item.finished for item in first_output.runner_outputs)
-    torch.testing.assert_close(pipe.seen_step_conditions[0]["request_ids"][0], torch.full((256, 3), 11.0))
-    torch.testing.assert_close(pipe.seen_step_conditions[0]["negative"][0], torch.full((256, 3), 17.0))
-    scheduler.update_from_output(first, first_output)
-
-    # Admit B while A is already running; the next real wave must contain
-    # newly admitted B plus cached A.  BaseScheduler emits new rows first;
-    # request ids, rather than list position, are the routing contract.
-    scheduler.add_request(requests[1])
-    second = scheduler.schedule()
-    assert second.scheduled_request_ids == ["B", "A"]
-    assert second.scheduled_cached_reqs.request_ids == ["A"]
-    second_output = runner.execute_stepwise(second)
-    assert second_output.request_ids == ["B", "A"]
-    torch.testing.assert_close(pipe.seen_step_conditions[1]["request_ids"][0], torch.full((256, 3), 12.0))
-    torch.testing.assert_close(pipe.seen_step_conditions[1]["request_ids"][1], torch.full((256, 3), 11.0))
-    torch.testing.assert_close(pipe.seen_step_conditions[1]["negative"][0], torch.zeros((256, 3)))
-    torch.testing.assert_close(pipe.seen_step_conditions[1]["negative"][1], torch.full((256, 3), 17.0))
-    assert second_output["A"].finished is True
-    assert second_output["B"].finished is False
-    scheduler.update_from_output(second, second_output)
-
-    third = scheduler.schedule()
-    assert third.scheduled_request_ids == ["B"]
-    third_output = runner.execute_stepwise(third)
-    assert third_output.request_ids == ["B"]
-    assert third_output["B"].finished is True
-    scheduler.update_from_output(third, third_output)
-
-    assert not scheduler.has_requests()
-    assert runner.state_cache == {}
-    assert third_output["B"].result.output.shape == (1, 1, 4, 4)
+    scheduler.initialize(pipeline.od_config)
+    scheduler.add_request(requests["A"])
+    outputs, waves = [], []
+    for tick in range(4):
+        if tick == 1:
+            scheduler.add_request(requests["B"])
+        scheduled = scheduler.schedule()
+        waves.append(scheduled.scheduled_request_ids)
+        result = runner.execute_stepwise(scheduled)
+        assert result.request_ids == scheduled.scheduled_request_ids
+        for row in result.runner_outputs:
+            if row.result is not None:
+                assert row.result.error is None
+            if row.finished:
+                torch.testing.assert_close(row.result.output, baselines[row.request_id], rtol=1e-5, atol=1e-5)
+                outputs.append(row)
+        scheduler.update_from_output(scheduled, result)
+    assert waves[0] == ["A"] and waves[1] == ["B", "A"] and waves[-1] == ["B"]
+    assert set(waves[2]) == {"A", "B"}
+    assert [r.request_id for r in outputs] == ["A", "B"]
+    assert not scheduler.has_requests() and not runner.state_cache
+    assert all(not grad and inference for grad, inference in pipeline.transformer.grad_modes)
+    engine = make_engine(pipeline)
+    for row in outputs:
+        (api,) = engine.postprocess_output(requests[row.request_id], row.result)
+        assert api.request_id == row.request_id and api.finished
+        assert api.images == [] and api.final_output_type == "latents"
+        torch.testing.assert_close(api.latents, baselines[row.request_id])
 
 
-def test_ming_step_scheduler_matches_deterministic_reference_recurrence(monkeypatch):
-    """The scheduler hook applies the same deterministic latent recurrence each tick."""
-    pipe = _step_pipeline(monkeypatch)
-    state = StepRequestState(
-        request_id="A",
-        sampling=OmniDiffusionSamplingParams(seed=111, height=4, width=4, num_inference_steps=3),
-        prompt={"extra": {"thinker_hidden_states": torch.ones(2, 3)}},
-    )
-    pipe.prepare_encode(state)
+def make_engine(pipeline):
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = pipeline.od_config
+    engine.post_process_func = get_ming_image_post_process_func(pipeline.od_config)
+    engine._post_process_accepts_sampling_params = True
+    return engine
+
+
+@pytest.mark.parametrize("output_type", ["pil", "pt", "np", "latent"])
+def test_decode_through_engine_honors_api_output_type(pipeline, output_type):
+    """Input: runner state. Expected: VAE inverse scale and API type/range.
+
+    Regression: latent-as-PIL, unconditional PIL, wrong axes or double decode.
+    """
+    req = request(output_type=output_type)
+    state = prepared(pipeline, req)
+    with torch.inference_mode():
+        raw = pipeline.post_decode(state)
+        (api,) = make_engine(pipeline).postprocess_output(req, raw)
+        if output_type == "latent":
+            assert api.images == [] and api.latents is state.latents
+        else:
+            independent_decode = pipeline.vae.decode(state.latents / 0.5 + 0.25, return_dict=False)[0]
+            torch.testing.assert_close(raw.output, independent_decode)
+            pixels = (independent_decode / 2 + 0.5).clamp(0, 1)
+            if output_type == "pil":
+                assert isinstance(api.images[0], Image.Image) and api.images[0].size == (16, 16)
+            elif output_type == "pt":
+                assert isinstance(api.images[0], torch.Tensor) and api.images[0].shape == (1, 3, 16, 16)
+                torch.testing.assert_close(api.images[0], pixels)
+            else:
+                assert isinstance(api.images[0], np.ndarray) and api.images[0].shape == (1, 16, 16, 3)
+                np.testing.assert_allclose(api.images[0], pixels.permute(0, 2, 3, 1).numpy(), rtol=1e-5, atol=1e-5)
+
+
+def test_effective_defaults_are_materialized_before_scheduler(pipeline):
+    """API omission -> checkpoint defaults, available before scheduler admission.
+
+    Regression: request constructor's substituted CFG=1 must not override default CFG=2.
+    """
+    pre = get_ming_image_pre_process_func(pipeline.od_config)
+    req = pre(request(height=None, width=None, num_inference_steps=None, guidance_scale=None))
+    assert req.sampling_params.height == req.sampling_params.width == 16
+    assert req.sampling_params.num_inference_steps == 3
+    assert req.sampling_params.guidance_scale == 2
+    assert pre(request(guidance_scale=0)).sampling_params.guidance_scale == 0
+    override = pre(request(guidance_scale=0, extra_args={"cfg": 4, "steps": 2, "height": 32}))
+    assert override.sampling_params.guidance_scale == 4
+    assert override.sampling_params.num_inference_steps == 2 and override.sampling_params.height == 32
+    assert prepared(pipeline, override).total_steps == 2
+
+
+def test_equivalent_hidden_dtypes_and_decoded_types_share_key(pipeline):
+    """Producer payloads normalize before gather; expected: equal execution keys.
+
+    Regression: raw hidden dtype/final formatting unnecessarily splits compatible requests.
+    """
+    pre = get_ming_image_pre_process_func(pipeline.od_config)
+    a, b = request(output_type="pt"), request("B", output_type="pil")
+    b.prompt["extra"]["thinker_hidden_states"] = b.prompt["extra"]["thinker_hidden_states"].double()
+    assert pre(a).batch_compatibility_key == pre(b).batch_compatibility_key
+    assert prepared(pipeline, b).prompt_embeds.dtype == torch.float32
+    b.sampling_params.output_type = "latent"
+    assert pre(a).batch_compatibility_key != pre(b).batch_compatibility_key
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("height", 0),
+        ("width", 3.5),
+        ("steps", -1),
+        ("steps", float("inf")),
+        ("cfg", float("nan")),
+        ("cfg", -1),
+        ("cfg_truncation", float("inf")),
+    ],
+)
+def test_invalid_sampling_rejected_before_admission(pipeline, field, value):
+    """API extra_args -> invalid values must fail before scheduler state exists."""
+    with pytest.raises(ValueError):
+        get_ming_image_pre_process_func(pipeline.od_config)(request(extra_args={field: value}))
+
+
+@pytest.mark.parametrize("count", [0, -1, 2, True, 1.5, "bad", float("inf")])
+def test_step_output_count_is_not_silently_clamped(pipeline, count):
+    """Regression: STEP_BATCH supports exactly one output, never clamps invalid counts."""
+    req = request(num_outputs_per_prompt=count)
+    with pytest.raises(ValueError, match="num_outputs_per_prompt"):
+        get_ming_image_pre_process_func(pipeline.od_config)(req)
+
+
+def test_b1_multiple_outputs_and_mixed_explicit_latents(pipeline):
+    """API n=2 and per-request optional latents -> independent preparation before collation.
+
+    Regression: tensor+None collation crash, incorrect output count and routing.
+    """
+    a = request(num_outputs_per_prompt=2, latents=torch.full((2, 4, 8, 8), 0.5), max_sequence_length=64)
+    b = request("B", num_outputs_per_prompt=2, max_sequence_length=128)
+    pipeline.od_config.step_execution = False
+    pre = get_ming_image_pre_process_func(pipeline.od_config)
+    assert pre(a).batch_compatibility_key == pre(b).batch_compatibility_key
+    with set_forward_context(omni_diffusion_config=pipeline.od_config), torch.inference_mode():
+        batch = pipeline.forward(DiffusionRequestBatch([a, b]))
+        single = pipeline.forward(DiffusionRequestBatch([a]))
+    assert len(batch) == 2 and all(o.output.shape == (2, 4, 8, 8) for o in batch)
+    torch.testing.assert_close(batch[0].output, single[0].output)
+
+
+def test_b1_custom_sigmas_are_in_compatibility_key(pipeline):
+    """Reviewer regression: distinct custom schedules must never share a B1 wave."""
+    pipeline.od_config.step_execution = False
+    pre = get_ming_image_pre_process_func(pipeline.od_config)
+    a, b = pre(request(sigmas=[1.0, 0.5, 0.1])), pre(request(sigmas=[1.0, 0.7, 0.1]))
+    assert a.batch_compatibility_key != b.batch_compatibility_key
+    with set_forward_context(omni_diffusion_config=pipeline.od_config), torch.inference_mode():
+        assert pipeline.forward(DiffusionRequestBatch([a]))[0].output.shape == (1, 4, 8, 8)
+    pipeline.od_config.step_execution = True
+    with pytest.raises(ValueError, match="custom sigmas"):
+        get_ming_image_pre_process_func(pipeline.od_config)(a)
+
+
+def test_missing_hidden_warns_and_malformed_hidden_fails(pipeline, caplog):
+    """Bridge missing/faulty payload -> explicit fallback warning or shape error."""
+    req = request()
+    req.prompt["extra"].pop("thinker_hidden_states")
+    assert prepared(pipeline, req).prompt_embeds.shape == (1, 256, 4)
+    assert "A" in caplog.text and "using zeros" in caplog.text
+    req.prompt["extra"]["thinker_hidden_states"] = torch.ones(256, 3)
+    with pytest.raises(ValueError, match="invalid shape"):
+        prepared(pipeline, req)
+
+
+def test_no_cfg_does_not_require_negative_and_batch_order_is_checked(pipeline):
+    """Regression: unused absent negatives are legal; conflicting state order is illegal."""
+    a, b = prepared(pipeline, request(guidance_scale=0)), prepared(pipeline, request("B", guidance_scale=0))
+    batch = InputBatch.make_batch([a, b])
+    batch.negative_prompt_embeds = None
+    with set_forward_context(omni_diffusion_config=pipeline.od_config), torch.inference_mode():
+        expected = torch.cat([oracle_prediction(a, scale=0), oracle_prediction(b, scale=0)])
+        torch.testing.assert_close(pipeline.denoise_step(batch), expected)
+        with pytest.raises(ValueError, match="request order"):
+            pipeline.denoise_step(batch, states=[b, a])
+        with pytest.raises(ValueError, match="empty batch"):
+            pipeline.denoise_step(batch, states=[])
+        a.extra.pop("ming_guidance_scale")
+        with pytest.raises(ValueError, match="A.*ming_guidance_scale"):
+            pipeline.denoise_step(batch)
+
+
+def test_reference_context_restored_on_predictor_failure(pipeline, monkeypatch):
+    """Nested active context -> caller's reference and scheduler survive failed prediction."""
+    state = prepared(pipeline, request())
+    sentinel = torch.ones(1, 4, 8, 8)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("injected DiT failure")
+
+    monkeypatch.setattr(pipeline.transformer, "forward", fail)
+    with set_forward_context(omni_diffusion_config=pipeline.od_config), torch.inference_mode():
+        get_forward_context().ref_latent = sentinel
+        with pytest.raises(RuntimeError, match="injected"):
+            pipeline.denoise_step(InputBatch.make_batch([state]))
+        assert get_forward_context().ref_latent is sentinel
+        original = pipeline.scheduler
+        with pytest.raises(RuntimeError, match="injected"):
+            pipeline.forward(DiffusionRequestBatch([request()]))
+        assert pipeline.scheduler is original and get_forward_context().ref_latent is sentinel
+
+
+def test_mixed_reference_batch_and_missing_cfg_negative_are_rejected(pipeline):
+    """Real prepared states + invalid batch combination -> explicit invariant failure.
+
+    Regression: first-row-only reference inference and silent missing negative conditions.
+    """
+    ref = prepared(pipeline, request(reference=Image.new("RGB", (16, 16), "red")))
+    plain = prepared(pipeline, request("B"))
+    with set_forward_context(omni_diffusion_config=pipeline.od_config):
+        with pytest.raises(ValueError, match="cannot mix"):
+            pipeline.denoise_step(InputBatch.make_batch([ref, plain]))
+        batch = InputBatch.make_batch([plain])
+        batch.negative_prompt_embeds = None
+        with pytest.raises(ValueError, match="negative prompt embeddings are missing"):
+            pipeline.denoise_step(batch)
+
+
+def test_scheduler_begin_index_capability_has_clear_error():
+    """Invalid scheduler capability -> request-specific error rather than silent skip."""
+    with pytest.raises(RuntimeError, match="bad-scheduler.*set_begin_index"):
+        MingImagePipeline._set_scheduler_begin_index(object(), 0, "bad-scheduler")
+
+
+def test_invalid_prediction_geometry_fails_at_model_boundary(pipeline, monkeypatch):
+    """Regression: batch-only checks must not accept extra-frame predictions."""
+    state = prepared(pipeline, request(guidance_scale=0))
+    monkeypatch.setattr(pipeline.transformer, "forward", lambda **kw: ([torch.ones(4, 2, 8, 8)], {}))
+    with set_forward_context(omni_diffusion_config=pipeline.od_config), torch.inference_mode():
+        with pytest.raises(ValueError, match="prediction must have shape"):
+            pipeline.denoise_step(InputBatch.make_batch([state]))
+
+
+def test_scheduler_failure_does_not_advance_request_index(pipeline, monkeypatch):
+    """Prepared state + scheduler failure -> no successful-tick bookkeeping."""
+    state = prepared(pipeline, request())
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("injected scheduler failure")
+
+    monkeypatch.setattr(state.scheduler, "step", fail)
     initial = state.latents.clone()
-    for _ in range(3):
-        batch = InputBatch.make_batch([state])
-        prediction = pipe.denoise_step(batch, states=[state])
-        pipe.step_scheduler(state, prediction)
+    with pytest.raises(RuntimeError, match="injected"):
+        pipeline.step_scheduler(state, torch.ones_like(initial))
+    assert state.step_index == 0
+    torch.testing.assert_close(state.latents, initial)
 
-    expected = initial.clone()
-    scheduler = _StepScheduler()
-    scheduler.set_timesteps(3, device=torch.device("cpu"))
-    assert scheduler.timesteps is not None
-    for timestep in scheduler.timesteps:
-        expected = scheduler.step(torch.zeros_like(expected), timestep, expected, return_dict=False)[0]
 
-    torch.testing.assert_close(state.latents, expected)
+class _ByT5Projection(nn.Module):
+    """Identity boundary for tokenizer/padding only; no mapper correctness claim."""
+
+    def forward(self, hidden, mask):
+        return hidden
+
+
+def test_actual_byt5_tokenizer_lengths_gather_safely(pipeline):
+    """Equal glyph count/different UTF-8 bytes -> fixed-length encoding and zero padding.
+
+    Input source: genuine ByT5 tokenizer and HF T5 encoder with real InputBatch.
+    Expected source: max_length padding/mask contract, independent of text byte length.
+    Regression: conflating raw byte length with output condition length.
+    Mapper is an identity here; its real GPU implementation is tested separately.
+    """
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(41)
+        t5 = T5EncoderModel(
+            T5Config(
+                vocab_size=384,
+                d_model=4,
+                d_ff=8,
+                d_kv=4,
+                num_layers=1,
+                num_heads=1,
+                dropout_rate=0,
+            )
+        ).eval()
+    tokenizer = ByT5Tokenizer()
+    pipeline.byte5 = MingByT5Encoder(tokenizer, t5, _ByT5Projection(), max_length=32)
+    (Path(pipeline.od_config.model) / "byt5").mkdir()
+    a, b = request(extra_args={"byte5_text": ["A"]}), request("B", extra_args={"byte5_text": ["中文中文"]})
+    pre = get_ming_image_pre_process_func(pipeline.od_config)
+    assert pre(a).batch_compatibility_key == pre(b).batch_compatibility_key
+    states = [prepared(pipeline, r) for r in [a, b]]
+    assert InputBatch.make_batch(states).prompt_embeds.shape == (2, 288, 4)
+    texts = ['Text "A". ', 'Text "中文中文". ']
+    tokens = tokenizer(texts, padding="max_length", max_length=32, truncation=True, return_tensors="pt")
+    features = pipeline.byte5(texts)
+    assert tokens.attention_mask[0].sum() != tokens.attention_mask[1].sum()
+    assert torch.count_nonzero(features[tokens.attention_mask == 0]) == 0
+    with set_forward_context(omni_diffusion_config=pipeline.od_config):
+        assert_euler_tick(pipeline, states)
+
+
+def test_missing_byt5_warns_without_splitting_equal_shapes(pipeline, caplog):
+    """Known local absent ByT5 -> ignored glyphs warn but do not split equal shapes."""
+    pre = get_ming_image_pre_process_func(pipeline.od_config)
+    a, b = request(), request("B", extra_args={"byte5_text": ["A", "B"]})
+    assert pre(a).batch_compatibility_key == pre(b).batch_compatibility_key
+    prepared(pipeline, b)
+    assert "no ByT5 encoder" in caplog.text
+
+
+@pytest.mark.parametrize("value", ["bad", -1.0, float("nan"), float("inf")])
+def test_invalid_cfg_normalization_fails_at_admission(pipeline, value):
+    """API cfg_normalize -> finite/nonnegative contract, before batch construction."""
+    with pytest.raises(ValueError, match="cfg_normalize"):
+        get_ming_image_pre_process_func(pipeline.od_config)(request(cfg_normalize=value))
+
+
+def test_missing_and_remote_config_paths_are_explicit(pipeline, monkeypatch, caplog):
+    """Downloader boundary produces a local root; VAE subfolder must come from checkpoint.
+
+    Expected source: downloader returns the resolved root and config JSON owns
+    vae_subfolder. Mock only network IO; use the actual parser and image processor.
+    Regression: HF identifier treated as filesystem path or bad JSON silently hidden.
+    """
+    local = pipeline.od_config.model
+    pipeline.od_config.tf_model_config = None
+    pipeline.od_config.model = "test-org/ming-checkpoint"
+    calls = []
+
+    def resolve(model, revision, patterns):
+        calls.append((model, revision))
+        return local
+
+    monkeypatch.setattr(pipeline_ming_imagegen, "download_weights_from_hf_specific", resolve)
+    post = get_ming_image_post_process_func(pipeline.od_config)
+    assert calls == [("test-org/ming-checkpoint", None)]
+    pixels = post(torch.zeros(1, 3, 16, 16), OmniDiffusionSamplingParams(output_type="pt"))
+    torch.testing.assert_close(pixels["payload"]["image"], torch.full((1, 3, 16, 16), 0.5))
+    (Path(local) / "custom_vae" / "config.json").unlink()
+    get_ming_image_post_process_func(pipeline.od_config)
+    assert "is missing" in caplog.text
+
+
+@pytest.mark.parametrize("shape", [(4, 8, 8), (1, 4, 7, 8), (2, 4, 8, 8)])
+def test_explicit_latent_geometry_matches_public_batch_layout(pipeline, shape):
+    """API latents require [n,C,H/scale,W/scale]; malformed geometry must fail early."""
+    with pytest.raises(ValueError, match="latents shape"):
+        prepared(pipeline, request(latents=torch.ones(shape)))
+
+
+@pytest.mark.parametrize("bad_config", ["{", "[]", '{"block_out_channels": []}'])
+def test_postprocess_bad_vae_config_is_not_silently_defaulted(pipeline, bad_config):
+    """Checkpoint corruption -> error, never silent scale=8."""
+    path = Path(pipeline.od_config.model) / "custom_vae" / "config.json"
+    path.write_text(bad_config, encoding="utf-8")
+    with pytest.raises(ValueError, match="Ming VAE config"):
+        get_ming_image_post_process_func(pipeline.od_config)
+
+
+@pytest.mark.parametrize("mutation", ["sign", "cfg_formula", "frame_axis", "shared_scheduler"])
+def test_critical_contracts_kill_deliberate_mutations(pipeline, monkeypatch, mutation):
+    """Same bridge inputs and independent Euler oracle must catch concrete wrong behavior.
+
+    Regression: tests must constrain behavior, not just execute code successfully.
+    """
+    a, b = prepared(pipeline, request(negative=True)), prepared(pipeline, request("B"))
+    if mutation == "sign":
+        original = pipeline.denoise_step
+        monkeypatch.setattr(pipeline, "denoise_step", lambda *a, **kw: -original(*a, **kw))
+    elif mutation == "cfg_formula":
+        monkeypatch.setattr(pipeline, "combine_cfg_noise", lambda p, n, scale, *a, **kw: p[0])
+    elif mutation == "frame_axis":
+        original = pipeline._build_denoise_kwargs
+
+        def wrong_axis(x, *args):
+            return original([sample.transpose(1, 2) for sample in x], *args)
+
+        monkeypatch.setattr(pipeline, "_build_denoise_kwargs", wrong_axis)
+    else:
+        with set_forward_context(omni_diffusion_config=pipeline.od_config):
+            assert_euler_tick(pipeline, [a])
+        b.scheduler = a.scheduler
+    with set_forward_context(omni_diffusion_config=pipeline.od_config):
+        with pytest.raises((AssertionError, ValueError, IndexError)):
+            assert_euler_tick(pipeline, [b, a])

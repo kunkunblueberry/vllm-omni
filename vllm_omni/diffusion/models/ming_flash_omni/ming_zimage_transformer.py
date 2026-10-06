@@ -46,7 +46,28 @@ class MingZImageTransformer2DModel(ZImageTransformer2DModel):
                 )
                 for i, img in enumerate(x)
             ]
-        return super().forward(x, t, cap_feats, patch_size=patch_size, f_patch_size=f_patch_size)
+        num_rows = len(x)
+        od_config = get_forward_context().omni_diffusion_config if is_forward_context_available() else None
+        capacity = max(1, int(getattr(od_config, "max_num_seqs", num_rows)))
+        predictions = []
+        for start in range(0, num_rows, capacity):
+            batch_x = x[start : start + capacity]
+            batch_cap_feats = cap_feats[start : start + capacity]
+            batch_t = t[start : start + capacity]
+            valid_rows = len(batch_x)
+            # Keep the DiT's GEMM/attention shapes stable across admission and
+            # retirement. Duplicate an existing row; padding owns no request,
+            # RNG or scheduler state and its prediction is discarded below.
+            padding = capacity - valid_rows
+            if padding:
+                batch_x = [*batch_x, *([batch_x[-1]] * padding)]
+                batch_cap_feats = [*batch_cap_feats, *([batch_cap_feats[-1]] * padding)]
+                batch_t = torch.cat([batch_t, batch_t[-1:].expand(padding)])
+            result = super().forward(
+                batch_x, batch_t, batch_cap_feats, patch_size=patch_size, f_patch_size=f_patch_size
+            )
+            predictions.extend(result[0][:valid_rows])
+        return predictions, {}
 
     def unpatchify(
         self,

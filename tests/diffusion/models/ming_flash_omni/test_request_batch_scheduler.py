@@ -56,8 +56,15 @@ def test_ming_incompatible_requests_are_not_merged():
     assert scheduler.schedule().scheduled_request_ids == ["A"]
 
 
-@pytest.mark.parametrize("max_wait, should_wait", [(0.0, False), (20.0, True)])
-def test_request_batch_admission_wait_respects_config(max_wait, should_wait):
-    scheduler = _scheduler(max_wait)
-    decision = scheduler.get_admission_wait_decision(now=0.0)
-    assert decision.should_wait is should_wait
+def test_high_throughput_wait_admits_second_compatible_ming_request():
+    """Regression: the wait window must preserve Ming's compatible wave admission.
+
+    Input source: preprocessed OmniDiffusionRequests, as in engine admission.
+    Expected source: RequestScheduler's configured wait and batching contract.
+    """
+    pre = get_ming_image_pre_process_func(SimpleNamespace())
+    scheduler = _scheduler(20.0)
+    scheduler.add_request(pre(_request("A")))
+    assert scheduler.get_admission_wait_decision(now=0.0).should_wait
+    scheduler.add_request(pre(_request("B")))
+    assert scheduler.schedule().scheduled_request_ids == ["A", "B"]
