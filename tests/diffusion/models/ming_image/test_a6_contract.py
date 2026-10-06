@@ -109,9 +109,19 @@ def _pipeline(monkeypatch, *, layered=False, fail_branch=None):
     pipeline._num_frames_per_prompt = 1
     pipeline._pending_prompt_embeds = pipeline._pending_negative_prompt_embeds = None
     pipeline._uses_cudagraph_trees = True
+    pipeline._interrupt = False
     pipeline.vae_scale_factor = 8
     pipeline.vae = _RGBA()
     pipeline.scheduler = _Euler()
+    # The B1/B2 loop uses a private scheduler, keep a test-only observation
+    # of the real dispatch instead of expecting mutation of the template.
+    original_step = _Euler.step
+
+    def observe_step(scheduler, *args, **kwargs):
+        pipeline.observed_scheduler = scheduler
+        return original_step(scheduler, *args, **kwargs)
+
+    monkeypatch.setattr(_Euler, "step", observe_step)
     conditioning = MingImageConditioning.__new__(MingImageConditioning)
     torch.nn.Module.__init__(conditioning)
     conditioning.query_encoder = _Query()
@@ -159,13 +169,13 @@ def test_bridge_to_dit_to_rgba(monkeypatch, layered, cfg):
     context = ForwardContext(direct_condition=torch.tensor([71]), ref_latent=torch.tensor([72]))
     old_direct, old_ref = context.direct_condition, context.ref_latent
     with override_forward_context(context):
-        output = pipeline.forward(_request(layered=layered, cfg=cfg))
+        output = pipeline.forward(_request(layered=layered, cfg=cfg))[0]
     assert context.direct_condition is old_direct and context.ref_latent is old_ref
     assert pipeline._pending_prompt_embeds is pipeline._pending_negative_prompt_embeds is None
     assert pipeline._num_frames_per_prompt == 1
     assert events == (["marker", "positive", "marker", "negative"] if cfg > 1 else ["marker", "positive"])
-    assert pipeline.scheduler.mu == pytest.approx(0.5 + (6 - 256) * (0.65 / 3840))
-    assert torch.equal(pipeline.scheduler.noise, torch.full((1, 4, frames, 4, 6), -4.0 if cfg > 1 else -2.0))
+    assert pipeline.observed_scheduler.mu == pytest.approx(0.5 + (6 - 256) * (0.65 / 3840))
+    assert torch.equal(pipeline.observed_scheduler.noise, torch.full((1, 4, frames, 4, 6), -4.0 if cfg > 1 else -2.0))
     assert torch.equal(pipeline.vae.latents.squeeze(2), expected_initial - (4 if cfg > 1 else 2))
     images = get_ming_image_post_process_func(None)(output.output)
     assert len(images) == frames and all(image.mode == "RGBA" for image in images)
@@ -267,7 +277,7 @@ def test_cfg_rank_dispatch_uses_branch_local_conditions(monkeypatch, rank):
         pipeline.forward(_request(layered=True))
     assert context.direct_condition is old_direct and context.ref_latent is old_ref
     assert events == ["marker", "positive" if rank == 0 else "negative"]
-    assert torch.equal(pipeline.scheduler.noise, torch.full((1, 4, 4, 4, 6), -4.0))
+    assert torch.equal(pipeline.observed_scheduler.noise, torch.full((1, 4, 4, 4, 6), -4.0))
 
 
 def test_transformer_rejects_fused_condition_on_single_branch(monkeypatch):
@@ -277,9 +287,9 @@ def test_transformer_rejects_fused_condition_on_single_branch(monkeypatch):
         pipeline.transformer([torch.zeros(4, 1, 4, 6)], torch.tensor([0.5]), [torch.ones(256, 2)])
 
 
-def test_single_request_guard(monkeypatch):
+def test_duplicate_request_id_guard(monkeypatch):
     pipeline, _ = _pipeline(monkeypatch)
     request = _request()
     request.requests.append(request.requests[0])
-    with pytest.raises(ValueError, match="exactly one request"):
+    with pytest.raises(ValueError, match="unique"):
         pipeline.forward(request)

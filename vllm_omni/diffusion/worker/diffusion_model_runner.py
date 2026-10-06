@@ -1079,6 +1079,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         finished_req_ids = scheduler_output.finished_req_ids
         for request_id in finished_req_ids:
             self.state_cache.pop(request_id, None)
+        self._discard_retired_input_batch()
 
         if (
             getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
@@ -1086,6 +1087,14 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             and finished_req_ids
         ):
             self.remove_diffusion_kv_requests(list(finished_req_ids))
+
+    def _discard_retired_input_batch(self) -> None:
+        # A cached gather owns states and tensors as well as IDs. Once any row
+        # retires (completion, abort or error), rebuild from live states next
+        # wave rather than retaining conditions/schedulers of released rows.
+        batch = getattr(self, "input_batch", None)
+        if batch is not None and any(request_id not in self.state_cache for request_id in batch.request_ids):
+            self.input_batch = None
 
     def _update_states(self, scheduler_output: DiffusionSchedulerOutput) -> tuple[list[StepRequestState], list[str]]:
         """Resolve cached state and create state for newly admitted requests."""
@@ -1216,6 +1225,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             prepared_states.append(state)
 
         if not prepared_states:
+            self._discard_retired_input_batch()
             return prepared_states, None, error_outputs
         input_batch = InputBatch.make_batch(
             prepared_states,
@@ -1247,6 +1257,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         for state in states:
             if interrupted or state.request_denoise_completed:
                 self.state_cache.pop(state.request_id, None)
+        self._discard_retired_input_batch()
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Execute one step for one scheduled request and return runner output."""
@@ -1394,7 +1405,13 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
             ):
                 clear_pipeline_stage_durations(pipeline)
-                noise_pred = pipeline.denoise_step(input_batch, states=states)
+                try:
+                    noise_pred = pipeline.denoise_step(input_batch, states=states)
+                except Exception:
+                    for state in states:
+                        self.state_cache.pop(state.request_id, None)
+                    self.input_batch = None
+                    raise
                 denoise_stage_durations = consume_pipeline_stage_durations(pipeline)
                 for state in states:
                     merge_stage_durations(

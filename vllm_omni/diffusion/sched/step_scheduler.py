@@ -37,6 +37,11 @@ class StepScheduler(BaseScheduler):
     def _reset_scheduler_state(self) -> None:
         self._request_progress.clear()
 
+    def has_requests(self) -> bool:
+        # Finished IDs still have to reach the worker even after the Engine
+        # consumes their terminal state. A last-row abort must not await admission.
+        return super().has_requests() or bool(self._finished_req_ids)
+
     def add_request(self, request: OmniDiffusionRequest) -> str:
         request_id = request.request_id
         total_steps = self._get_total_steps(request)

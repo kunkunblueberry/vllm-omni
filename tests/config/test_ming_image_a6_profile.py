@@ -21,19 +21,21 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.mark.parametrize(
-    ("profile", "devices", "cfg_size", "inline"),
+    ("profile", "devices", "cfg_size", "inline", "capacity", "step"),
     [
-        ("ming_image.yaml", ["0", "1"], 1, False),
-        ("ming_image_single_gpu.yaml", ["0", "0"], 1, True),
-        ("ming_image_cfg_parallel.yaml", ["0", "1,2"], 2, False),
+        ("ming_image.yaml", ["0", "1"], 1, False, 1, False),
+        ("ming_image_single_gpu.yaml", ["0", "0"], 1, True, 1, False),
+        ("ming_image_cfg_parallel.yaml", ["0", "1,2"], 2, False, 1, False),
+        ("ming_image_throughput.yaml", ["0", "1"], 1, False, 2, True),
     ],
 )
-def test_typed_ming_profiles_select_runtime_client(monkeypatch, profile, devices, cfg_size, inline):
+def test_typed_ming_profiles_select_runtime_client(monkeypatch, profile, devices, cfg_size, inline, capacity, step):
     deploy = load_deploy_config(get_deploy_config_path(profile))
     config = VllmOmniConfig.from_pipeline_config(MING_IMAGE_PIPELINE, user_deploy_config=deploy)
     assert [stage.runtime_config.devices for stage in config.stage_configs] == devices
-    assert config.stage_by_id(0).scheduler_config.max_num_seqs == 1
+    assert config.stage_by_id(0).scheduler_config.max_num_seqs == capacity
     stage = config.stage_by_id(1)
+    assert stage.scheduler_config.max_num_seqs == capacity
     assert stage.parallel_config.cfg_parallel_size == cfg_size
     assert stage.stage_pipeline_config.inline_diffusion is inline
     assert MING_IMAGE_PIPELINE.stages[1].inline_diffusion is False
@@ -49,16 +51,32 @@ def test_typed_ming_profiles_select_runtime_client(monkeypatch, profile, devices
     plan.stage_cfg = stage
     plan.metadata.runtime_cfg = {"devices": devices[1]}
     captured = {}
+    physical_devices = devices[1]
+    resources = StageReplicaResources(lock_fds=[71])
+    released = []
     monkeypatch.setattr(stage_runtime, "inject_kv_stage_info", lambda *args: None)
-    monkeypatch.setattr(runtime, "_stage_device_scope", lambda *args: nullcontext())
+
+    def resolve_devices(stage_id, runtime_cfg):
+        assert stage_id == 1 and runtime_cfg == {"devices": devices[1]}
+        return physical_devices
+
+    def runtime_env(stage_id, runtime_cfg):
+        assert stage_id == 1 and runtime_cfg == {"devices": devices[1]}
+        return nullcontext()
+
+    monkeypatch.setattr(runtime, "_resolve_replica_physical_devices", resolve_devices)
+    monkeypatch.setattr(stage_runtime, "stage_runtime_env", runtime_env)
+    monkeypatch.setattr(stage_runtime, "release_device_locks", released.extend)
 
     def launch(**kwargs):
         captured.update(kwargs)
-        return SimpleNamespace(), StageReplicaResources()
+        return SimpleNamespace(), resources
 
     monkeypatch.setattr(stage_runtime, "launch_diffusion_stage_replica", launch)
     runtime._initialize_local_diffusion_replica(plan, stage_init_timeout=1)
     assert captured["use_inline"] is inline
+    assert captured["stage_visible_devices"] == physical_devices
+    assert released == [71]
 
     # Keep the actual typed engine-args and OmniDiffusionConfig conversion.
     # Only device enumeration is replaced; no client, GPU or model is loaded.
@@ -70,6 +88,8 @@ def test_typed_ming_profiles_select_runtime_client(monkeypatch, profile, devices
     od_config = stage_init_utils.build_diffusion_config("local-ming", stage, plan.metadata)
     assert od_config.parallel_config.cfg_parallel_size == cfg_size
     assert od_config.num_gpus == cfg_size
+    assert od_config.max_num_seqs == capacity
+    assert od_config.step_execution is step
 
     # Run the real factory, replacing client constructors rather than the selection.
     inline_client, proc_client = object(), object()

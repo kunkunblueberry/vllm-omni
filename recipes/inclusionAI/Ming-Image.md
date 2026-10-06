@@ -164,7 +164,8 @@ first, followed by layers, preserving RGBA channels.
 For positive prediction `p`, negative prediction `n`, and guidance `s`, Ming
 uses `u = p + s*(p-n)` and passes `-u` to the FP32 scheduler. The shared loop's
 optional norm clamp considers the entire C/F/H/W sample and only shrinks values
-above `q*norm(p)`; Ming's public forward keeps normalization disabled. Negative
+above `q*norm(p)`; normalization is disabled by default and can be selected with
+`cfg_normalize`. Negative
 query and projected direct conditions are zero; zeroing raw direct states before
 the biased projector would produce a different condition. Each actual branch
 gets its own projected conditions, the same reference, and a graph step marker.
@@ -193,6 +194,63 @@ Real two-rank collectives, compiled graph replay over repeated shapes/layer
 counts, checkpoint numerical parity, memory capacity, and serving output are
 server validation boundaries. Weight-free doubles cannot establish them.
 
+## Optional request and continuous batching
+
+The default deployment still uses one inflight request. Select
+`vllm_omni/deploy/ming_image_throughput.yaml` to use the real Ming pipeline with
+the existing step scheduler, two inflight requests, AR on device 0 and DiT on
+device 1. This profile is opt-in; its memory capacity needs server validation.
+
+Each request owns its projected query/direct conditions, reference latent,
+seed/generator, `[1,C,F,H,W]` latent envelope and private Euler scheduler. Request
+mode returns a list of `DiffusionOutput` in scheduler order, including a singleton
+list for one request. Each output contains only that request's generated frames.
+Height, width, frame count, direct-prefix structure, reference presence and nominal
+CFG settings define compatible admission. Seeds and step progress stay private.
+
+`prepare_encode`, `denoise_step`, `step_scheduler` and `post_decode` implement
+the shared step protocol. A wave can contain unequal progress or a newly admitted
+request. CFG truncation uses each request's current timestep, so rows with
+different effective CFG run in separate transformer groups and predictions are
+scattered back to request order. Scheduler updates use private cursors. Completion,
+abort and errors invalidate the runner's cached batch when it retains a retired
+row. The next wave rebuilds from live states.
+
+The B1/B2 tests use the real `thinker2image` bridge, request/state dataclasses,
+`InputBatch`, `StepScheduler`, runner step core and RGBA consumer. Kernel doubles
+give independent `p=17+2*offset+ref+t+frame`, `n=ref+t+frame` predictions and a
+literal Euler delta of 1/4. Expectations use those formulas and seeded torch
+draws, rather than another pipeline execution. Coverage includes two distinct
+requests, both variants, per-sample normalization, custom schedules and supplied
+latents, unequal progress/effective CFG, late admission, early retirement, errors
+and a following request. Negative projected direct conditioning remains zero.
+
+On a supported server environment (no checkpoints required for these tests):
+
+```bash
+python -m pytest -q tests/diffusion/models/ming_image/test_a6_contract.py \
+  tests/diffusion/models/ming_image/test_batch_step_contract.py \
+  tests/config/test_ming_image_a6_profile.py \
+  tests/model_executor/models/ming_image/test_config_and_pipeline.py \
+  tests/diffusion/models/z_image/test_zimage_cfg_parallel.py
+python -m pytest -q -m cpu tests/diffusion/test_diffusion_step_pipeline.py \
+  tests/diffusion/batching/test_diffusion_batching.py
+```
+
+After those pass, serve a checkpoint that is already available on the server:
+
+```bash
+MODEL=/path/to/Ming-Image-0.1-Design
+vllm serve "$MODEL" --omni --deploy-config vllm_omni/deploy/ming_image_throughput.yaml --port 8091
+# Repeat with Design-Layer and the reference-image request above.
+```
+
+Compare two concurrent requests with their own seeded single-request outputs,
+including Layer composite order/alpha. Validate uneven step counts, late arrival,
+repeated compiled shapes, CFG ranks and checkpoint numerical parity on the server.
+Restricted local source diagnostics do not establish full production imports,
+native scheduler/VAE parity, serving or CUDA graph replay.
+
 ## Notes
 
 - The default deployment keeps Stage 0 eager and enables dynamic regional
@@ -200,7 +258,9 @@ server validation boundaries. Weight-free doubles cannot establish them.
   The first request for each new image shape or layer count pays compilation
   and graph-capture cost; warm up every production shape before measuring or
   serving latency-sensitive traffic.
-- Only one reference image and one request at a time are currently supported.
+- Each request supports one reference image and one output per prompt. Compatible
+  requests can share a denoise wave; each Layer output contains its own composite
+  and layers.
 - Design-Layer requires a reference image except during warmup.
 - A non-empty `negative_prompt` is rejected; Ming-Image uses zero negative conditioning.
 - Height and width must be divisible by 16.

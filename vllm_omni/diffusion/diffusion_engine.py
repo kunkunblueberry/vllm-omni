@@ -655,7 +655,10 @@ class DiffusionEngine:
 
             self._emit_request_started_outputs(sched_output)
 
-            if sched_output.is_empty:
+            step_retirement = self.execution_mode == DiffusionExecutionMode.STEP_BATCH and bool(
+                sched_output.finished_req_ids
+            )
+            if sched_output.is_empty and not step_retirement:
                 self._emit_finished_outputs(sched_output.finished_req_ids, None)
                 continue
 
@@ -663,13 +666,18 @@ class DiffusionEngine:
                 self._prepare_kv_for_forward(sched_output)
                 runner_output: BaseRunnerOutput = (
                     self.execute_fn(sched_output)
-                    if sched_output.scheduled_request_ids
+                    if sched_output.scheduled_request_ids or step_retirement
                     else BatchRunnerOutput.from_list([])
                 )
                 self._poll_native_kv()
                 worker_execution_completed = True
             except Exception as exc:
                 if self._closed:
+                    return
+                if step_retirement and not sched_output.scheduled_request_ids:
+                    # Cleanup failed after schedule consumed the retirement IDs.
+                    # Stop workers before releasing state rather than losing them.
+                    self._fail_engine(exc)
                     return
                 worker_execution_completed = False
                 logger.error(
