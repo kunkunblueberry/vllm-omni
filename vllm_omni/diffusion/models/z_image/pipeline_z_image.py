@@ -455,6 +455,8 @@ class ZImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin
 
     def predict_noise(self, *args: Any, **kwargs: Any) -> torch.Tensor | IntermediateTensors:
         """Adapt Z-Image's per-sample list output to the CFG framework."""
+        if getattr(self, "_uses_cudagraph_trees", False):
+            torch.compiler.cudagraph_mark_step_begin()
         result = self.transformer(*args, **kwargs)
         if isinstance(result, IntermediateTensors):
             return result
@@ -497,7 +499,7 @@ class ZImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin
                     current_guidance_scale = 0.0
             apply_cfg = do_true_cfg and current_guidance_scale > 0
             latents_typed = latents.to(self.od_config.dtype)
-            latent_model_input = latents_typed.unsqueeze(2)
+            latent_model_input = latents_typed.unsqueeze(2) if latents_typed.ndim == 4 else latents_typed
             latent_model_input_list = list(latent_model_input.unbind(dim=0))
             positive_kwargs = {
                 "x": latent_model_input_list,
@@ -521,7 +523,8 @@ class ZImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin
                 negative_kwargs=negative_kwargs,
                 cfg_normalize=cfg_normalize,
             )
-            noise_pred = noise_pred.squeeze(2) if isinstance(noise_pred, torch.Tensor) else noise_pred
+            if latents.ndim == 4 and isinstance(noise_pred, torch.Tensor):
+                noise_pred = noise_pred.squeeze(2)
             noise_pred = -noise_pred
             latents = self.scheduler_step_maybe_with_cfg(noise_pred.to(torch.float32), t, latents, apply_cfg)
             assert latents.dtype == torch.float32

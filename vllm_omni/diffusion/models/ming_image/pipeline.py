@@ -23,6 +23,8 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage impor
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
     set_forward_context_direct_condition,
     set_forward_context_ref_latent,
 )
@@ -223,6 +225,53 @@ class MingImageDiffusionPipeline(ZImagePipeline):
             raise RuntimeError("Ming-Image conditioning is only available during forward.")
         return self._pending_prompt_embeds, self._pending_negative_prompt_embeds
 
+    def predict_noise_maybe_with_cfg(
+        self,
+        do_true_cfg: bool,
+        true_cfg_scale: float,
+        positive_kwargs: dict[str, Any],
+        negative_kwargs: dict[str, Any] | None,
+        cfg_normalize: bool | float = True,
+        output_slice: int | None = None,
+        kwargs: dict[str, Any] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """Attach projected conditions to each branch before shared dispatch.
+
+        The mixin can execute either branch locally or on a dedicated CFG rank.
+        Negative direct conditioning is zero after the biased projection; both
+        branches use the same reference. Never expose a fused 2B context to a
+        transformer invocation with only B samples.
+        """
+        context = get_forward_context()
+        direct = context.direct_condition
+        if direct is None:
+            raise RuntimeError("Ming-Image denoising requires projected direct conditioning.")
+        positive_kwargs = dict(positive_kwargs, direct_condition=direct, ref_latent=context.ref_latent)
+        if negative_kwargs is not None:
+            negative_kwargs = dict(
+                negative_kwargs, direct_condition=torch.zeros_like(direct), ref_latent=context.ref_latent
+            )
+        return super().predict_noise_maybe_with_cfg(
+            do_true_cfg,
+            true_cfg_scale,
+            positive_kwargs,
+            negative_kwargs,
+            cfg_normalize=cfg_normalize,
+            output_slice=output_slice,
+            kwargs=kwargs,
+        )
+
+    def predict_noise(self, *args: Any, direct_condition: torch.Tensor, ref_latent: torch.Tensor | None, **kwargs: Any):
+        context = get_forward_context()
+        previous_direct, previous_ref = context.direct_condition, context.ref_latent
+        set_forward_context_direct_condition(direct_condition)
+        set_forward_context_ref_latent(ref_latent)
+        try:
+            return super().predict_noise(*args, **kwargs)
+        finally:
+            set_forward_context_direct_condition(previous_direct)
+            set_forward_context_ref_latent(previous_ref)
+
     def prepare_latents(self, batch_size, *args, **kwargs):
         frames = self._num_frames_per_prompt
         flat = super().prepare_latents(batch_size * frames, *args, **kwargs)
@@ -281,6 +330,23 @@ class MingImageDiffusionPipeline(ZImagePipeline):
 
     @torch.inference_mode()
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
+        # The runner owns the outer context. Restore its values on every exit,
+        # including failures during reference encoding before denoising starts.
+        context = get_forward_context() if is_forward_context_available() else None
+        previous_direct = context.direct_condition if context is not None else None
+        previous_ref = context.ref_latent if context is not None else None
+        try:
+            return self._forward(req)
+        finally:
+            set_forward_context_ref_latent(previous_ref)
+            set_forward_context_direct_condition(previous_direct)
+            self._pending_prompt_embeds = None
+            self._pending_negative_prompt_embeds = None
+            self._num_frames_per_prompt = 1
+
+    def _forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
+        if req.num_reqs != 1:
+            raise ValueError("Ming-Image currently supports exactly one request.")
         sampling = req.sampling_params
         if sampling.num_outputs_per_prompt != 1:
             # TODO(yuanheng-zhao): enable after supporting batching
@@ -290,6 +356,12 @@ class MingImageDiffusionPipeline(ZImagePipeline):
 
         extra = self._get_prompt_extra(req)
         extra_args = sampling.extra_args or {}
+        prompt = req.prompts[0]
+        negative_prompt = extra_args.get("negative_prompt")
+        if isinstance(prompt, dict):
+            negative_prompt = prompt.get("negative_prompt", negative_prompt)
+        if isinstance(negative_prompt, str) and negative_prompt.strip():
+            raise ValueError("Ming-Image uses zero negative conditioning and does not accept negative_prompt.")
 
         is_dummy_run = req.is_dummy_run()
         query_hidden = extra.get("query_hidden_states")
@@ -306,6 +378,10 @@ class MingImageDiffusionPipeline(ZImagePipeline):
             query_hidden = query_hidden.unsqueeze(0)
         if direct_hidden.ndim == 2:
             direct_hidden = direct_hidden.unsqueeze(0)
+        if query_hidden.ndim != 3 or query_hidden.shape[0] != 1 or query_hidden.shape[1:] != (256, 2048):
+            raise ValueError("Ming-Image query conditions must have shape [1, 256, 2048].")
+        if direct_hidden.ndim != 3 or direct_hidden.shape[0] != 1 or direct_hidden.shape[-1] != 6144:
+            raise ValueError("Ming-Image direct conditions must have shape [1, prefix_length, 6144].")
         query_hidden = query_hidden.to(device=self.device, dtype=self.od_config.dtype)
         direct_hidden = direct_hidden.to(device=self.device, dtype=self.od_config.dtype)
         cap_feats, direct_condition = self.conditioning(query_hidden, direct_hidden)
@@ -331,14 +407,6 @@ class MingImageDiffusionPipeline(ZImagePipeline):
         self._pending_prompt_embeds = positive
         self._pending_negative_prompt_embeds = negative
 
-        apply_cfg = cfg > 1
-        context_direct = (
-            torch.cat([direct_condition, torch.zeros_like(direct_condition)], dim=0) if apply_cfg else direct_condition
-        )
-        context_ref = ref_latent
-        if apply_cfg and context_ref is not None:
-            context_ref = context_ref.repeat(2, 1, 1, 1, 1)
-
         inner_sampling = OmniDiffusionSamplingParams(
             height=height,
             width=width,
@@ -357,23 +425,16 @@ class MingImageDiffusionPipeline(ZImagePipeline):
             ]
         )
 
-        set_forward_context_ref_latent(context_ref)
-        set_forward_context_direct_condition(context_direct)
-        try:
-            latent_output = super().forward(inner_req)
-            if not isinstance(latent_output.output, torch.Tensor):
-                raise TypeError("Ming-Image denoising must return latent tensors.")
-            image = self._decode_latent_frames(latent_output.output)
-            return DiffusionOutput(
-                output=image,
-                stage_durations=latent_output.stage_durations,
-            )
-        finally:
-            set_forward_context_ref_latent(None)
-            set_forward_context_direct_condition(None)
-            self._pending_prompt_embeds = None
-            self._pending_negative_prompt_embeds = None
-            self._num_frames_per_prompt = 1
+        set_forward_context_ref_latent(ref_latent)
+        set_forward_context_direct_condition(direct_condition)
+        latent_output = super().forward(inner_req)
+        if not isinstance(latent_output.output, torch.Tensor):
+            raise TypeError("Ming-Image denoising must return latent tensors.")
+        image = self._decode_latent_frames(latent_output.output)
+        return DiffusionOutput(
+            output=image,
+            stage_durations=latent_output.stage_durations,
+        )
 
     @staticmethod
     def _flatten_latent_frames(latents: torch.Tensor) -> torch.Tensor:

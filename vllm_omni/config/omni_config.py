@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Mapping
-from dataclasses import InitVar, dataclass, field, fields
+from dataclasses import InitVar, dataclass, field, fields, replace
 from functools import wraps
 from inspect import Parameter, signature
 from pathlib import Path
@@ -291,6 +291,7 @@ class _StageEngineValues:
     runtime: _RuntimeEngineOverrides
     parallel: _ParallelEngineOverrides
     diffusion: _DiffusionEngineOverrides
+    inline_diffusion: bool | None
     compilation_config: Mapping[str, Any] | VllmCompilationConfig | None
     profiler_config: Mapping[str, Any] | VllmProfilerConfig | None
 
@@ -1259,7 +1260,7 @@ _DIFFUSION_OWNED_STAGE_ENGINE_FIELDS = (
     _COMMON_STAGE_ENGINE_FIELDS
     | _DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS
     | _DIFFUSION_STAGE_ENGINE_FIELDS
-    | {"parallel_config"}
+    | {"parallel_config", "inline_diffusion"}
 )
 
 # This all-stage union is used only to discover global CLI candidates. Stage
@@ -1584,6 +1585,7 @@ def _stage_engine_values(
         runtime=cast(_RuntimeEngineOverrides, _select_engine_overrides(engine, runtime_engine_fields)),
         parallel=cast(_ParallelEngineOverrides, _select_engine_overrides(engine, _PARALLEL_ENGINE_FIELDS)),
         diffusion=_DiffusionEngineOverrides(_select_engine_overrides(diffusion_kwargs, _DIFFUSION_STAGE_ENGINE_FIELDS)),
+        inline_diffusion=engine.get("inline_diffusion"),
         compilation_config=_copy_value(engine.get("compilation_config")),
         profiler_config=_copy_value(engine.get("profiler_config")),
     )
@@ -1891,6 +1893,12 @@ def _build_diffusion_stage_config(
     *,
     model: str | None,
 ) -> VllmOmniDiffusionStageConfig:
+    if engine.inline_diffusion is not None:
+        if not isinstance(engine.inline_diffusion, bool):
+            raise ValueError("inline_diffusion must be a boolean.")
+        # StageRuntime reads this typed field. Copy the immutable topology so
+        # an opt-in deploy never changes the registry or another engine.
+        topology = replace(topology, inline_diffusion=engine.inline_diffusion)
     common_kwargs, input_proc, next_stage_proc = _build_common_stage_config_kwargs(
         pipeline,
         deploy,
