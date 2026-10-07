@@ -302,11 +302,13 @@ Hit spans come from adapter-classified `STARTED` events for new requests:
   hidden states should be sized so preemption does not occur while prefix
   caching is on. Same as before this refactor; tracked for Phase 2.
 
-The adapter is the sole owner of started-request observations. It emits
-`EXTENDED` for each observed request scheduled again, including ordinary
-decode and chunked prefill, not just IDs re-entering `scheduled_new_reqs`.
-`RESUMED` payloads follow the scheduler's cached-request order. Terminal
-events precede arrivals, so same-step ID reuse finishes the old request
+The adapter is the sole owner of started-request observations. Its single
+`translate_step` entry point captures an immutable `PrefixCacheStep`.
+`EXTENDED` is represented by `step.extended_req_ids`, with token counts in
+`step.scheduled_tokens`, avoiding per-request event allocation on every step.
+It covers ordinary decode, chunked prefill and IDs re-entering
+`scheduled_new_reqs`. `RESUMED` payloads follow the scheduler's cached-request
+order. Terminal events precede arrivals, so same-step ID reuse finishes the old request
 before `STARTED` classifies the new one. The manager keeps write/resource
 bookkeeping only, with no second `live_reqs` lifecycle classifier.
 `ABORTED` requires an explicit `aborted_req_ids` producer; without that
@@ -362,6 +364,13 @@ sid = cache.save_outputs(hidden, mm_outputs, num_tokens_unpadded=n,
                          num_tokens_padded=n_pad, write_layout=layout)
 outs = cache.materialize(sid, req_ids)    # or discard_step(sid)
 ```
+
+`new_step_starts` accepts only `PrefixCacheStep`; there is no bare-event or
+per-event count fallback. The runner builds the write layout from that step's
+captured counts. Before saving any rows, the manager cross-checks layout
+counts against the captured step for each prefix hit under `_state_lock`.
+A disagreement (including an omitted hit request) raises
+`OmniPrefixCacheUnmatchError` instead of merging into a wrongly sized buffer.
 
 Each step id is consumed exactly once. `req_ids` must be a subset of the save
 snapshot. At most `staging_depth` unused step ids may exist at once: every

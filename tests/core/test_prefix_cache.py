@@ -40,6 +40,7 @@ from vllm_omni.core.prefix_cache.adapter import (
     PrefixCacheEventKind,
     PrefixCacheRequestEvent,
     PrefixCacheSchedulerAdapter,
+    PrefixCacheStep,
 )
 from vllm_omni.core.prefix_cache.controller import StagingBufferHolder
 from vllm_omni.core.prefix_cache.group_view import (
@@ -153,9 +154,9 @@ def run_step(
     adapter = getattr(mgr, "_test_adapter", None)
     if adapter is None:
         adapter = mgr._test_adapter = PrefixCacheSchedulerAdapter()
-    events = adapter.translate_scheduler_output(sched_out)
-    layout = adapter.build_write_layout(view, num_scheduled_tokens=num_sched)
-    mgr.new_step_starts(events)
+    step = adapter.translate_step(sched_out)
+    mgr.new_step_starts(step)
+    layout = adapter.build_write_layout(view, num_scheduled_tokens=dict(step.scheduled_tokens))
     n = int(view.step_slot_mapping.numel())
     padded = n if num_tokens_padded is None else int(num_tokens_padded)
     return mgr.save_outputs(hidden, mm or {}, num_tokens_unpadded=n, num_tokens_padded=padded, write_layout=layout)
@@ -163,6 +164,28 @@ def run_step(
 
 def expected_rows(slots: torch.Tensor) -> torch.Tensor:
     return slots.to(DTYPE).unsqueeze(1).expand(slots.numel(), HIDDEN)
+
+
+@pytest.mark.parametrize("step_count,layout_count", [(6, 4), (2, 4), (4, 0)])
+def test_save_rejects_layout_that_disagrees_with_step(step_count, layout_count):
+    mgr, view = make_manager()
+    try:
+        mgr.materialize(run_step(mgr, view, {"a": ([0, 1], 0, 8)}), ["a"])
+        adapter = mgr._test_adapter
+        mgr.new_step_starts(adapter.translate_step(FakeSchedOut(finished=["a"])))
+        view.order = ["b"] if layout_count else []
+        view.req_blocks["b"], view.computed["b"] = [0, 1, 2], 8
+        hit = FakeNewReq("b", 8, [[0, 1, 2]])
+        mgr.new_step_starts(adapter.translate_step(FakeSchedOut(new_reqs=[hit], num_scheduled={"b": step_count})))
+        layout = adapter.build_write_layout(view, num_scheduled_tokens={"b": layout_count})
+        rows = expected_rows(view.slots_for("b", 8, 8 + layout_count)).clone()
+        with pytest.raises(OmniPrefixCacheUnmatchError, match="scheduled token count"):
+            mgr.save_outputs(
+                rows, {}, num_tokens_unpadded=layout_count, num_tokens_padded=layout_count, write_layout=layout
+            )
+        assert not mgr._step_ctxs  # Rejection must precede publication/staging.
+    finally:
+        mgr.shutdown()
 
 
 def plan_fetch(mgr, slots, key, *, req_id):
@@ -306,7 +329,11 @@ def test_manager_trusts_started_event_without_a_second_lifecycle_table():
         assert not hasattr(mgr._request_tasks, "live_reqs")
         # A new STARTED is authoritative even if the old ID wrote before.
         # Internal write bookkeeping is not a second lifecycle classifier.
-        mgr.new_step_starts((PrefixCacheRequestEvent("a", PrefixCacheEventKind.STARTED, hit_end=4, block_ids=((0,),)),))
+        mgr.new_step_starts(
+            PrefixCacheStep(
+                (PrefixCacheRequestEvent("a", PrefixCacheEventKind.STARTED, hit_end=4, block_ids=((0,),)),), ()
+            )
+        )
         assert mgr._hit_spans == {"a": (4, [0])}
     finally:
         mgr.shutdown()
@@ -432,7 +459,7 @@ def test_empty_hit_block_group_fails_at_register():
     mgr, _ = make_manager()
     event = PrefixCacheRequestEvent("empty", PrefixCacheEventKind.STARTED, hit_end=4, block_ids=((),))
     with pytest.raises(OmniPrefixCacheUnmatchError, match="carries no block_ids"):
-        mgr.new_step_starts((event,))
+        mgr.new_step_starts(PrefixCacheStep((event,), ()))
 
 
 def test_hit_not_block_aligned_fails_at_register():
@@ -506,7 +533,7 @@ def test_split_step_outputs_routes_immediate_deferred_leftover():
     n = 4
     sched = FakeSchedOut(new_reqs=[FakeNewReq("a")], num_scheduled={"a": n})
     adapter = PrefixCacheSchedulerAdapter()
-    mgr.new_step_starts(adapter.translate_scheduler_output(sched))
+    mgr.new_step_starts(adapter.translate_step(sched))
     hidden = torch.ones(n, HIDDEN)
     mm = {
         "codes.audio": torch.full((n, 2), 5.0),
@@ -1079,7 +1106,7 @@ def test_save_slot_mismatch_fails_fast():
     view.computed["a"] = 0
     sched = FakeSchedOut(new_reqs=[FakeNewReq("a")], num_scheduled={"a": 2})
     adapter = PrefixCacheSchedulerAdapter()
-    mgr.new_step_starts(adapter.translate_scheduler_output(sched))
+    mgr.new_step_starts(adapter.translate_step(sched))
     hidden = torch.zeros(4, HIDDEN, dtype=DTYPE)
     with pytest.raises(OmniPrefixCacheUnmatchError):
         mgr.save_outputs(
@@ -1244,7 +1271,7 @@ def test_eager_dispatch_failure_releases_step_and_all_task_owners(monkeypatch, f
         mgr.discard_step(preserved_sid)
         assert all(not holders for holders in ctrl._staging_pool._busy)
         with pytest.raises(OmniPrefixCacheUnmatchError, match="write failed"):
-            mgr.new_step_starts(())
+            mgr.new_step_starts(PrefixCacheStep((), ()))
     finally:
         mgr.shutdown()
 
@@ -1271,7 +1298,7 @@ def test_eager_escalation_failure_releases_deferred_tasks(monkeypatch):
         assert all(task.done.is_set() and task.host_ready.is_set() for task in tasks)
         assert all(not holders for holders in ctrl._staging_pool._busy)
         with pytest.raises(OmniPrefixCacheUnmatchError, match="write failed"):
-            mgr.new_step_starts(())
+            mgr.new_step_starts(PrefixCacheStep((), ()))
     finally:
         mgr.shutdown()
 
@@ -1941,3 +1968,15 @@ def test_from_vllm_config_uses_batched_tokens():
         scheduler_config=SimpleNamespace(max_num_batched_tokens=None, max_model_len=4096),
     )
     assert cfg_fallback.staging_capacity_tokens == 4096
+
+
+def test_new_step_requires_step_and_never_falls_back_to_event_counts():
+    mgr, _ = make_manager()
+    event = PrefixCacheRequestEvent("a", PrefixCacheEventKind.STARTED, scheduled_tokens=6)
+    try:
+        with pytest.raises(TypeError, match="PrefixCacheStep"):
+            mgr.new_step_starts((event,))
+        mgr.new_step_starts(PrefixCacheStep((event,), ()))
+        assert mgr._cur_num_scheduled == {}
+    finally:
+        mgr.shutdown()

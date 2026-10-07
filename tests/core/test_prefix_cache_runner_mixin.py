@@ -189,8 +189,6 @@ def test_materialize_requires_explicit_step_and_snapshot_req_ids():
 
 
 def test_step_begin_and_save_keep_the_translated_snapshot(monkeypatch):
-    from vllm_omni.core.prefix_cache.adapter import PrefixCacheEventKind
-
     _patch_pp(monkeypatch, is_last=True)
     runner = _Runner()
     stub = _CacheStub()
@@ -221,4 +219,5 @@ def test_step_begin_and_save_keep_the_translated_snapshot(monkeypatch):
         num_scheduled_tokens={"r": 1},
     )
     runner._prefix_cache_step_begin(continuation)
-    assert [event.kind for event in steps[-1]] == [PrefixCacheEventKind.EXTENDED]
+    assert steps[-1].events == ()
+    assert steps[-1].extended_req_ids == ("r",)

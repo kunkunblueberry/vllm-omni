@@ -63,7 +63,6 @@ import torch
 
 from vllm_omni.core.prefix_cache.adapter import (
     PrefixCacheEventKind,
-    PrefixCacheRequestEvent,
     PrefixCacheStep,
     PrefixCacheWriteLayout,
 )
@@ -475,13 +474,8 @@ class OmniPrefixCacheManager:
             self._slot_status.init_table(hk)
 
     @torch.inference_mode()
-    def new_step_starts(
-        self,
-        events: Iterable[PrefixCacheRequestEvent] | PrefixCacheStep,
-        *,
-        num_scheduled_tokens: Mapping[str, int] | None = None,
-    ) -> None:
-        """Handle one immutable lifecycle event batch.
+    def new_step_starts(self, step: PrefixCacheStep) -> None:
+        """Handle one immutable adapter-produced step.
 
         Engine thread only; before _update_states removes finished
         requests; exactly once per real step. Registers new-request prefix
@@ -491,6 +485,9 @@ class OmniPrefixCacheManager:
         abort included. ``escalate`` (eager: the copy + pool write) runs
         after ``_state_lock`` is released.
         """
+        if not isinstance(step, PrefixCacheStep):
+            raise TypeError("new_step_starts requires a PrefixCacheStep")
+        events = step.events
         to_escalate: list[int] = []
         with self._state_lock:
             # 1. Publish writes the committer has already written into the pool.
@@ -500,12 +497,6 @@ class OmniPrefixCacheManager:
             #    those block hashes are already in vLLM; dropping the write
             #    would leave future hits ABSENT. The next save waits
             #    join_host_ready. (Not leftover_mm — those are this-step reads.)
-            if isinstance(events, PrefixCacheStep):
-                step = events
-                events = step.events
-                num_scheduled_tokens = dict(step.scheduled_tokens)
-            else:
-                events = tuple(events)
             for event in events:
                 if event.kind not in (PrefixCacheEventKind.FINISHED, PrefixCacheEventKind.ABORTED):
                     continue
@@ -551,9 +542,7 @@ class OmniPrefixCacheManager:
             # 4. Gather those spans on the prefetch thread; overlaps this forward.
             while self._prefetch_queue and self._prefetch_queue[0][0].done():
                 self._prefetch_queue.popleft()
-            self._cur_num_scheduled = dict(
-                num_scheduled_tokens or {event.req_id: event.scheduled_tokens for event in events}
-            )
+            self._cur_num_scheduled = dict(step.scheduled_tokens)
             if self._hit_spans:
                 self._prefetch_hit_spans()
         if to_escalate:
@@ -598,6 +587,16 @@ class OmniPrefixCacheManager:
         req_order = [write.req_id for write in write_layout.writes]
         num_sched = {write.req_id: write.row_end - write.row_start for write in write_layout.writes}
         query_start = {write.req_id: write.row_start for write in write_layout.writes}
+        # Hit buffers were sized from the captured step, not this layout.
+        # Reject disagreement before cloning, staging or publishing rows.
+        with self._state_lock:
+            for req_id in self._hit_spans:
+                expected = self._cur_num_scheduled.get(req_id, 0)
+                actual = num_sched.get(req_id, 0)
+                if actual != expected:
+                    raise OmniPrefixCacheUnmatchError(
+                        f"scheduled token count mismatch for req {req_id}: step={expected}, layout={actual}"
+                    )
 
         slots_cpu: torch.Tensor | None = write_layout.slots_cpu
         mm_outputs = mm_outputs or {}

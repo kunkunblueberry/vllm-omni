@@ -48,9 +48,9 @@ class PrefixCacheRequestEvent:
 class PrefixCacheStep:
     events: tuple[PrefixCacheRequestEvent, ...]
     scheduled_tokens: tuple[tuple[str, int], ...]
-
-    def __iter__(self):
-        return iter(self.events)
+    # EXTENDED has no payload beyond counts already captured above. Avoid
+    # allocating one event per running request on every decode step.
+    extended_req_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,8 +101,9 @@ class PrefixCacheSchedulerAdapter:
             return (tuple(int(block) for block in blocks),)
         return tuple(tuple(int(block) for block in group) for group in blocks)
 
-    def translate_scheduler_output(self, scheduler_output: Any) -> tuple[PrefixCacheRequestEvent, ...]:
+    def translate_step(self, scheduler_output: Any) -> PrefixCacheStep:
         events: list[PrefixCacheRequestEvent] = []
+        extended: list[str] = []
         cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
         resumed = {str(req_id) for req_id in (getattr(cached, "resumed_req_ids", ()) or ())}
         finished = {str(req_id) for req_id in (getattr(scheduler_output, "finished_req_ids", ()) or ())}
@@ -118,24 +119,28 @@ class PrefixCacheSchedulerAdapter:
         emitted: set[str] = set()
         for data in getattr(scheduler_output, "scheduled_new_reqs", ()) or ():
             req_id = self._req_id(data)
-            kind = PrefixCacheEventKind.EXTENDED if req_id in self._observed_req_ids else PrefixCacheEventKind.STARTED
+            if req_id in emitted:
+                continue
+            emitted.add(req_id)
+            if req_id in self._observed_req_ids:
+                extended.append(req_id)
+                continue
             self._observed_req_ids.add(req_id)
             computed_tokens = int(getattr(data, "num_computed_tokens", 0) or 0)
             blocks = self._blocks_value(getattr(data, "block_ids", None)) if computed_tokens > 0 else ()
             events.append(
                 PrefixCacheRequestEvent(
                     req_id,
-                    kind,
+                    PrefixCacheEventKind.STARTED,
                     hit_end=computed_tokens,
                     block_ids=blocks,
                     scheduled_tokens=int(scheduled_tokens.get(req_id, 0)),
                 )
             )
-            emitted.add(req_id)
 
         # Only resumed requests need a cached-request payload snapshot.
         # Iterate req_ids (scheduler order), not the resumed membership set.
-        req_ids = tuple(getattr(cached, "req_ids", ()) or ())
+        req_ids = (getattr(cached, "req_ids", ()) or ()) if resumed else ()
         computed = getattr(cached, "num_computed_tokens", ()) or ()
         new_blocks = getattr(cached, "new_block_ids", ()) or ()
         output_tokens = getattr(cached, "num_output_tokens", ()) or ()
@@ -167,18 +172,13 @@ class PrefixCacheSchedulerAdapter:
             )
             emitted.add(req_id)
 
-        for raw_req_id, count in scheduled_tokens.items():
-            req_id = str(raw_req_id)
-            if int(count) > 0 and req_id in self._observed_req_ids and req_id not in emitted:
-                events.append(
-                    PrefixCacheRequestEvent(req_id, PrefixCacheEventKind.EXTENDED, scheduled_tokens=int(count))
-                )
-        return tuple(events)
-
-    def translate_step(self, scheduler_output: Any) -> PrefixCacheStep:
-        events = self.translate_scheduler_output(scheduler_output)
-        scheduled = getattr(scheduler_output, "num_scheduled_tokens", {}) or {}
-        return PrefixCacheStep(events, tuple((str(req_id), int(count)) for req_id, count in scheduled.items()))
+        counts: list[tuple[str, int]] = []
+        for raw_req_id, raw_count in scheduled_tokens.items():
+            req_id, count = str(raw_req_id), int(raw_count)
+            counts.append((req_id, count))
+            if count > 0 and req_id in self._observed_req_ids and req_id not in emitted:
+                extended.append(req_id)
+        return PrefixCacheStep(tuple(events), tuple(counts), tuple(extended))
 
     def build_write_layout(
         self,

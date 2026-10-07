@@ -55,26 +55,27 @@ def output(*, new=(), resumed=(), finished=(), aborted=(), cached=None, schedule
 
 def test_scheduler_events_are_explicit_and_immutable():
     adapter = PrefixCacheSchedulerAdapter()
-    first = adapter.translate_scheduler_output(
+    first = adapter.translate_step(
         output(new=[SimpleNamespace(req_id="a", num_computed_tokens=4, block_ids=[[2]])])
-    )
+    ).events
     assert first[0] == PrefixCacheRequestEvent("a", PrefixCacheEventKind.STARTED, hit_end=4, block_ids=((2,),))
     with pytest.raises(AttributeError):
         first[0].req_id = "b"
 
-    second = adapter.translate_scheduler_output(output(new=[SimpleNamespace(req_id="a", num_computed_tokens=0)]))
-    assert second[0].kind is PrefixCacheEventKind.EXTENDED
+    second = adapter.translate_step(output(new=[SimpleNamespace(req_id="a", num_computed_tokens=0)]))
+    assert second.events == ()
+    assert second.extended_req_ids == ("a",)
 
 
 def test_resume_and_abort_require_explicit_sources():
     adapter = PrefixCacheSchedulerAdapter()
-    events = adapter.translate_scheduler_output(output(resumed={"r"}, finished={"f"}, aborted={"a"}))
+    events = adapter.translate_step(output(resumed={"r"}, finished={"f"}, aborted={"a"})).events
     assert [(e.req_id, e.kind) for e in events] == [
         ("a", PrefixCacheEventKind.ABORTED),
         ("f", PrefixCacheEventKind.FINISHED),
         ("r", PrefixCacheEventKind.RESUMED),
     ]
-    events = adapter.translate_scheduler_output(output(finished={"x"}))
+    events = adapter.translate_step(output(finished={"x"})).events
     assert events[0].kind is PrefixCacheEventKind.FINISHED
 
 
@@ -86,13 +87,13 @@ def test_missing_abort_side_channel_never_infers_aborted():
         finished_req_ids={"finished"},
         num_scheduled_tokens={},
     )
-    events = adapter.translate_scheduler_output(scheduler_output)
+    events = adapter.translate_step(scheduler_output).events
     assert [(event.req_id, event.kind) for event in events] == [("finished", PrefixCacheEventKind.FINISHED)]
 
 
 def test_resumed_event_snapshots_cached_request_payload():
     adapter = PrefixCacheSchedulerAdapter()
-    events = adapter.translate_scheduler_output(
+    events = adapter.translate_step(
         output(
             resumed={"r"},
             cached={
@@ -102,7 +103,7 @@ def test_resumed_event_snapshots_cached_request_payload():
                 "num_output_tokens": [1, 6],
             },
         )
-    )
+    ).events
     event = events[0]
     assert (event.kind, event.req_id, event.hit_end) == (PrefixCacheEventKind.RESUMED, "r", 8)
     assert event.block_ids == ((4, 5),)
@@ -113,12 +114,12 @@ def test_resumed_event_snapshots_cached_request_payload():
 def test_resumed_block_snapshot_is_immutable():
     blocks = [[7, 8]]
     adapter = PrefixCacheSchedulerAdapter()
-    event = adapter.translate_scheduler_output(
+    event = adapter.translate_step(
         output(
             resumed={"r"},
             cached={"req_ids": ["r"], "new_block_ids": [blocks], "num_computed_tokens": [8]},
         )
-    )[0]
+    ).events[0]
     blocks[0][0] = 99
     assert event.block_ids == ((7, 8),)
 
@@ -126,12 +127,12 @@ def test_resumed_block_snapshot_is_immutable():
 @pytest.mark.parametrize("terminal", ["finished", "aborted"])
 def test_same_id_terminal_and_new_is_started(terminal):
     adapter = PrefixCacheSchedulerAdapter()
-    adapter.translate_scheduler_output(output(new=[SimpleNamespace(req_id="r")]))
-    events = adapter.translate_scheduler_output(output(new=[SimpleNamespace(req_id="r")], **{terminal: {"r"}}))
+    adapter.translate_step(output(new=[SimpleNamespace(req_id="r")]))
+    events = adapter.translate_step(output(new=[SimpleNamespace(req_id="r")], **{terminal: {"r"}})).events
     terminal_kind = PrefixCacheEventKind.FINISHED if terminal == "finished" else PrefixCacheEventKind.ABORTED
     assert [event.kind for event in events] == [terminal_kind, PrefixCacheEventKind.STARTED]
-    events = adapter.translate_scheduler_output(output(new=[SimpleNamespace(req_id="r")]))
-    assert [event.kind for event in events] == [PrefixCacheEventKind.EXTENDED]
+    step = adapter.translate_step(output(new=[SimpleNamespace(req_id="r")]))
+    assert step.events == () and step.extended_req_ids == ("r",)
 
 
 @pytest.mark.parametrize("count", [1, 128], ids=["decode", "chunked-prefill"])
@@ -139,7 +140,7 @@ def test_regular_scheduled_requests_emit_extended(count):
     adapter = PrefixCacheSchedulerAdapter()
     adapter.translate_step(output(new=[SimpleNamespace(req_id="r")], scheduled={"r": 256}))
     step = adapter.translate_step(output(cached={"req_ids": ["r"]}, scheduled={"r": count}))
-    assert step.events == (PrefixCacheRequestEvent("r", PrefixCacheEventKind.EXTENDED, scheduled_tokens=count),)
+    assert step.events == () and step.extended_req_ids == ("r",)
     assert step.scheduled_tokens == (("r", count),)
 
 
@@ -147,8 +148,9 @@ def test_only_scheduled_live_requests_emit_extended():
     adapter = PrefixCacheSchedulerAdapter()
     adapter.translate_step(output(new=[SimpleNamespace(req_id="a"), SimpleNamespace(req_id="b")]))
     step = adapter.translate_step(output(cached={"req_ids": ["a", "b"]}, scheduled={"b": 2, "a": 0}))
-    assert [(e.req_id, e.kind) for e in step] == [("b", PrefixCacheEventKind.EXTENDED)]
-    assert not adapter.translate_step(output()).events
+    assert step.events == () and step.extended_req_ids == ("b",)
+    idle = adapter.translate_step(output())
+    assert idle.events == () and idle.extended_req_ids == ()
 
 
 def test_resumed_order_follows_scheduler_and_has_no_duplicate_extended():
@@ -161,29 +163,30 @@ def test_resumed_order_follows_scheduler_and_has_no_duplicate_extended():
             scheduled={"a": 1, "b": 2, "running": 3},
         )
     )
-    assert [(e.req_id, e.kind, e.scheduled_tokens) for e in step] == [
+    assert [(e.req_id, e.kind, e.scheduled_tokens) for e in step.events] == [
         ("b", PrefixCacheEventKind.RESUMED, 2),
         ("a", PrefixCacheEventKind.RESUMED, 1),
-        ("running", PrefixCacheEventKind.EXTENDED, 3),
     ]
-    assert [e.hit_end for e in step.events[:2]] == [8, 12]
+    assert step.extended_req_ids == ("running",)
+    assert [e.hit_end for e in step.events] == [8, 12]
 
 
 def test_new_continuation_is_not_duplicated_by_scheduled_tokens():
     adapter = PrefixCacheSchedulerAdapter()
     adapter.translate_step(output(new=[SimpleNamespace(req_id="r")]))
     step = adapter.translate_step(output(new=[SimpleNamespace(req_id="r")], scheduled={"r": 4}))
-    assert len(step.events) == 1
-    assert step.events[0].kind is PrefixCacheEventKind.EXTENDED
+    assert step.events == () and step.extended_req_ids == ("r",)
 
 
 def test_finished_ids_are_retired_before_classification():
     adapter = PrefixCacheSchedulerAdapter()
     adapter.translate_step(output(new=[SimpleNamespace(req_id="r")]))
     step = adapter.translate_step(output(finished={"r"}, scheduled={"r": 1}))
-    assert [e.kind for e in step] == [PrefixCacheEventKind.FINISHED]
+    assert [e.kind for e in step.events] == [PrefixCacheEventKind.FINISHED]
+    assert step.extended_req_ids == ()
     step = adapter.translate_step(output(new=[SimpleNamespace(req_id="r")]))
-    assert [e.kind for e in step] == [PrefixCacheEventKind.STARTED]
+    assert [e.kind for e in step.events] == [PrefixCacheEventKind.STARTED]
+    assert step.extended_req_ids == ()
 
 
 def test_abort_ids_are_normalized_before_membership_check():
@@ -298,7 +301,7 @@ def test_real_vllm_scheduler_contract():
         num_output_tokens=[1],
     )
     step = adapter.translate_step(real_output(cached=cached, scheduled={"r": 1}))
-    assert step.events == (PrefixCacheRequestEvent("r", PrefixCacheEventKind.EXTENDED, scheduled_tokens=1),)
+    assert step.events == () and step.extended_req_ids == ("r",)
     cached.resumed_req_ids = {"r"}
     cached.num_computed_tokens = [8]
     cached.new_block_ids = [([5, 6, 7],)]
@@ -306,6 +309,25 @@ def test_real_vllm_scheduler_contract():
     assert step.events[0].kind is PrefixCacheEventKind.RESUMED
     assert step.events[0].block_ids == ((5, 6, 7),) and step.events[0].hit_end == 8
     step = adapter.translate_step(real_output(new_reqs=[new], scheduled={"r": 4}, finished={"r"}))
-    assert [e.kind for e in step] == [PrefixCacheEventKind.FINISHED, PrefixCacheEventKind.STARTED]
+    assert [e.kind for e in step.events] == [PrefixCacheEventKind.FINISHED, PrefixCacheEventKind.STARTED]
     step = adapter.translate_step(real_output(cached=cached, scheduled={"r": 1}))
     assert step.events[0].kind is PrefixCacheEventKind.RESUMED
+
+
+def test_extended_ids_are_deduplicated_immutable_and_need_no_payload():
+    class UnusedBlocks:
+        def __bool__(self):
+            raise AssertionError("continuation block table must not be inspected")
+
+    adapter = PrefixCacheSchedulerAdapter()
+    adapter.translate_step(output(new=[SimpleNamespace(req_id="r")]))
+    data = SimpleNamespace(req_id="r", num_computed_tokens=8, block_ids=UnusedBlocks())
+    scheduler_output = output(new=[data, data], scheduled={"r": 4})
+    step = adapter.translate_step(scheduler_output)
+    scheduler_output.scheduled_new_reqs.clear()
+    scheduler_output.num_scheduled_tokens["r"] = 99
+    assert step.events == ()
+    assert step.extended_req_ids == ("r",)
+    assert step.scheduled_tokens == (("r", 4),)
+    with pytest.raises(AttributeError):
+        step.extended_req_ids = ()
