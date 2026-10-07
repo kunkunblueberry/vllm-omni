@@ -40,6 +40,7 @@ if TYPE_CHECKING:
         QuantizationConfig,
     )
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
 from vllm_omni.diffusion.distributed.sp_plan import (
@@ -347,16 +348,15 @@ class ZImageAttention(nn.Module):
         dtype = query.dtype
         query, key = query.to(dtype), key.to(dtype)
 
-        # From [batch, seq_len] to [batch, 1, 1, seq_len] -> broadcast to [batch, heads, seq_len, seq_len]
-        if attention_mask is not None and attention_mask.ndim == 2:
-            attention_mask = attention_mask[:, None, None, :]
+        # Preserve the key-valid mask for backend/parallel-strategy handling.
+        attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
 
         # Compute joint attention
         hidden_states = self.attn(
             query,
             key,
             value,
-            # attn_mask=attention_mask, # we don't support multi prompts now.
+            attn_metadata=attn_metadata,
         )
 
         # Reshape back

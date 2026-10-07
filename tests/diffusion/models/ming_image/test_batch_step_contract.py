@@ -249,6 +249,69 @@ def test_scheduler_input_batch_runner_late_admission_retirement_and_next_request
     assert scheduler._request_progress == {}
 
 
+@pytest.mark.parametrize("layered", [False, True])
+def test_selected_input_batch_has_no_capacity_padding_and_keeps_frame_axis(monkeypatch, layered):
+    pipeline, _ = _wave_pipeline(monkeypatch, layered=layered)
+    states = []
+    for index in range(3):
+        request = _owned_request(str(index), layered=layered, offset=index, seed=42 + index, steps=3)
+        states.append(
+            pipeline.prepare_encode(StepRequestState(request.request_id, request.sampling_params, request.prompt))
+        )
+    frames = 4 if layered else 1
+    # Shared InputBatch is actual selected rows, not a max_num_seqs bucket.
+    for mapping in ([2, 0, 1], [1], [1, 2], [2]):
+        batch = InputBatch.make_batch(states, idx_mapping=torch.tensor(mapping))
+        assert batch.num_reqs == batch.num_reqs_after_padding == len(mapping)
+        assert batch.request_ids == [str(i) for i in mapping]
+        assert batch.latents.shape == (len(mapping), 4, frames, 4, 6)
+        assert batch.prompt_embeds.shape == (len(mapping), 256, 2)
+        assert batch.prompt_embeds_mask is None
+        for row, state_index in enumerate(mapping):
+            torch.testing.assert_close(batch.latents[row : row + 1], _initial(42 + state_index, frames))
+            assert float(batch.prompt_embeds[row, 0, 0]) == 5 + state_index
+            assert batch.states[row] is states[state_index]
+            assert batch.states[row].extra["direct_condition"].shape == (1, 4, 3)
+
+
+def test_scheduler_admits_three_real_rows_and_separates_direct_shape(monkeypatch):
+    pipeline, _ = _wave_pipeline(monkeypatch)
+    runner = _runner(monkeypatch, pipeline)
+    scheduler = StepScheduler()
+    scheduler.initialize(SimpleNamespace(max_num_seqs=4))
+    preprocess = get_ming_image_pre_process_func(
+        SimpleNamespace(step_execution=True, tf_model_config=SimpleNamespace(multi_frame_output=False))
+    )
+    for index in range(4):
+        request = _owned_request(str(index), steps=3)
+        if index == 3:
+            request.prompt["extra"]["direct_hidden_states"] = request.prompt["extra"]["direct_hidden_states"][:2]
+        preprocess(request)
+        scheduler.add_request(request)
+    first = scheduler.schedule()
+    assert first.scheduled_request_ids == ["0", "1", "2"]
+    output = runner._execute_stepwise_core(first, record_output_peak_memory=False)
+    scheduler.update_from_output(first, output)
+    assert runner.input_batch.num_reqs == runner.input_batch.num_reqs_after_padding == 3
+    assert runner.input_batch.latents.shape[0:3] == (3, 4, 1)
+    assert set(runner.state_cache) == {"0", "1", "2"}
+    for request_id in ("0", "1", "2"):
+        scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
+        scheduler.pop_request_state(request_id)
+    second = scheduler.schedule()
+    assert second.scheduled_request_ids == ["3"]
+    runner._cleanup_finished_step_requests(second)
+    output = runner._execute_stepwise_core(second, record_output_peak_memory=False)
+    assert runner.input_batch.num_reqs == runner.input_batch.num_reqs_after_padding == 1
+    assert runner.input_batch.states[0].extra["direct_condition"].shape == (1, 2, 3)
+    torch.testing.assert_close(runner.input_batch.latents, _initial(42, 1) - 0.25 * _prediction(0, 1, 0.1))
+    scheduler.finish_requests("3", DiffusionRequestStatus.FINISHED_ABORTED)
+    scheduler.pop_request_state("3")
+    runner._cleanup_finished_step_requests(scheduler.schedule())
+    assert runner.state_cache == {} and runner.input_batch is None
+    assert scheduler._request_progress == {}
+
+
 def test_empty_duplicate_and_invalid_inputs_fail_without_context_leak(monkeypatch):
     pipeline, _ = _wave_pipeline(monkeypatch, layered=True)
     with pytest.raises(ValueError, match="empty"):
