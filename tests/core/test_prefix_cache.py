@@ -1985,3 +1985,18 @@ def test_new_step_requires_step_and_never_falls_back_to_event_counts():
         assert mgr._cur_num_scheduled == {}
     finally:
         mgr.shutdown()
+
+
+def test_negative_hit_step_is_rejected_before_manager_prefetch(monkeypatch):
+    mgr, _ = make_manager()
+    prefetched = []
+    monkeypatch.setattr(mgr, "_prefetch_hit_spans", lambda: prefetched.append(True))
+    scheduler_output = FakeSchedOut(new_reqs=[FakeNewReq("r", 8, [[0, 1]])], num_scheduled={"r": -1})
+    try:
+        with pytest.raises(OmniPrefixCacheUnmatchError, match="negative scheduled token count for req r: -1"):
+            mgr.new_step_starts(PrefixCacheSchedulerAdapter().translate_step(scheduler_output))
+        assert not prefetched
+        assert mgr._hit_spans == {}
+        assert mgr._cur_num_scheduled == {}
+    finally:
+        mgr.shutdown()

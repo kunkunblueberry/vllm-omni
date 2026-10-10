@@ -331,3 +331,14 @@ def test_extended_ids_are_deduplicated_immutable_and_need_no_payload():
     assert step.scheduled_tokens == (("r", 4),)
     with pytest.raises(AttributeError):
         step.extended_req_ids = ()
+
+
+@pytest.mark.parametrize("count", [-1, -512])
+@pytest.mark.parametrize("hit_end", [0, 8])
+def test_negative_scheduled_tokens_fail_at_step_boundary(count, hit_end):
+    scheduler_output = output(
+        new=[SimpleNamespace(req_id="r", num_computed_tokens=hit_end, block_ids=[[0, 1]])],
+        scheduled={"r": count},
+    )
+    with pytest.raises(OmniPrefixCacheUnmatchError, match=f"negative scheduled token count for req r: {count}"):
+        PrefixCacheSchedulerAdapter().translate_step(scheduler_output)

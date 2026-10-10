@@ -175,6 +175,8 @@ class PrefixCacheSchedulerAdapter:
         counts: list[tuple[str, int]] = []
         for raw_req_id, raw_count in scheduled_tokens.items():
             req_id, count = str(raw_req_id), int(raw_count)
+            if count < 0:
+                raise OmniPrefixCacheUnmatchError(f"negative scheduled token count for req {req_id}: {count}")
             counts.append((req_id, count))
             if count > 0 and req_id in self._observed_req_ids and req_id not in emitted:
                 extended.append(req_id)
