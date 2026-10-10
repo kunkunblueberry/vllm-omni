@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""MiniMax-H3 video geometry and native three-axis position grids for SolarWM.
+# Vendored from SolarWM (Apache-2.0), commit ce1da4e7705391eda8eeda6016c0fd3f614b975e,
+# src/solarwm/backends/minimax_h3/geometry.py. Body kept byte-for-byte.
+"""MiniMax-H3 video geometry and native three-axis position grids.
 
-Adapted from SolarWM reference implementation.
-This module is intentionally NumPy-only to avoid heavy imports.
+This module is intentionally NumPy-only. Importing the H3 plugin must not import
+PyTorch, Diffusers, or materialize the 33B transformer.
 """
 
 from __future__ import annotations

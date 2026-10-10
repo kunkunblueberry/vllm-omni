@@ -26,14 +26,18 @@ convention (LingBot's `t=0` commit is SolarWM's `t=1.0`).
 | Part | Class | Note |
 | --- | --- | --- |
 | `geometry.py` | reuse (vendored) | NumPy-only constants and position grids |
+| `torch_geometry.py` | reuse (vendored) | The torch position grids the SGF attention reads |
 | `flow.py` | reuse (vendored) | `torch_flow` variant: `v = x0 - noise`, `t=1` clean |
 | `layout.py` | reuse (vendored) | Packed document: text / anchor / audio / target video |
 | `row_timesteps.py` | reuse (ported) | Only the rollout entry point of `torch_layout` |
+| `camera.py` | reuse (vendored) | Trajectory validation and the fused-PRoPE contract |
+| `prope.py` | reuse (vendored) | The head-dim `[96:128)` camera projection |
+| `sgf.py` | reuse (vendored) | Window geometry and the four-evaluation schedule |
+| `sgf_attention.py` | reuse (vendored) | Raw-KV window and the segmented attention |
+| `sgf_rollout.py` | reuse (vendored) | The 4-probe + 1-commit chunk loop |
 | H3 DiT | adapt | `MiniMaxH3DiTModel` needs a SolarWM attention path |
-| Camera PRoPE | **new** | vLLM-Omni's H3 has none; see below |
-| Raw-KV write timing | **new** | Must write pre-RoPE K/V, not post-RoPE |
-| SGF rollout loop | **new** | Drives the 4 + 1 forwards and the commit |
-| AR-Diffusion binding | adapt | Session/tick binding, following LingBot |
+| AR-Diffusion binding | adapt | Stepwise binding, following LingBot World |
+| Offline oracle pipeline | **new** | One request, request-local KV, ten chunks |
 
 ## Findings that shape the design
 
@@ -69,22 +73,54 @@ convention (LingBot's `t=0` commit is SolarWM's `t=1.0`).
    blend. A bf16 step therefore carries bf16 error, which the flow tests pin
    rather than assume away.
 
+6. **The whole rollout can be verified without weights.** SolarWM's
+   `h3_sgf_rollout` takes the student as a callable, so the reference and the
+   port can be driven by one shared stub that routes its output through the
+   real SGF attention. With identical inputs the two produce **bit-identical**
+   `cache_target` and `noisy_at_exit`, which is what the committed golden
+   values encode.
+
 ## Status
 
-Landed: the model-semantics layer plus its tests.
+Landed: the model-semantics layer, the SGF rollout, and their tests. Nothing
+here needs the checkpoint or a GPU.
 
 | File | State |
 | --- | --- |
-| `solarwm_h3/{geometry,flow,layout,row_timesteps}.py` | vendored, reference-parity checked |
-| `tests/diffusion/models/solarwm_h3/` | 20 contract tests, 1 committed fixture |
-| Pipeline, AR-Diffusion binding | not started |
+| `solarwm_h3/geometry.py` | vendored, byte-identical to upstream |
+| `solarwm_h3/layout.py` | vendored, byte-identical |
+| `solarwm_h3/camera.py` | vendored, byte-identical |
+| `solarwm_h3/torch_geometry.py` | vendored, byte-identical |
+| `solarwm_h3/flow.py` | vendored from `torch_flow.py`, byte-identical |
+| `solarwm_h3/prope.py` | vendored from `torch_prope.py`, byte-identical (keeps PRoPE's MIT notice) |
+| `solarwm_h3/sgf.py` | vendored, one recorded import retarget |
+| `solarwm_h3/sgf_attention.py` | vendored, one recorded import retarget |
+| `solarwm_h3/sgf_rollout.py` | vendored, three recorded edits (two retargets, SP shim) |
+| `solarwm_h3/row_timesteps.py` | ported subset of `torch_layout.py` (rollout entry point only) |
+| `tests/diffusion/models/solarwm_h3/` | 30 contract tests, 2 committed fixtures |
+| H3 transformer wiring, pipeline, AR-Diffusion binding | not started |
+
+Evidence run locally: every vendored body regenerates from upstream plus only
+the recorded edits; a stub-driven 10-chunk rollout is bit-equal to the
+reference, including the per-call history (no forward sees its own or a later
+chunk) and the commit pattern (four non-committing probes, then one committing
+forward, all under `no_grad`).
 
 ## Next step
 
-Build the offline oracle first: one request, request-local cache, all 10
-chunks in a single `forward()`, compared chunk-by-chunk against SolarWM's
-`h3_sgf_rollout` latents. That separates model semantics from the AR runtime —
-if the realtime path later mismatches, the semantic layer is already ruled out.
+Wire the SGF rollout into a `SolarWMH3Pipeline` that runs as a single request
+with request-local KV: the offline oracle. That is the layer that then has to
+be re-expressed against the AR-Diffusion stepwise contract, and the one that
+needs the checkpoint to be meaningful.
+
+## Scope boundaries
+
+- **Sequence parallelism is not supported.** `sgf_rollout`'s SP broadcast is
+  replaced by a shim that raises, so an `sp_enabled=True` run fails loudly
+  instead of silently computing the wrong thing. Everything else in the
+  vendored layer is SP-agnostic.
+- **SGF replay and the Stage 1 / `anyflow` training paths are not carried
+  over.** They are not on the inference path.
 
 ## Blockers
 
