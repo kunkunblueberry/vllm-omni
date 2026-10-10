@@ -536,7 +536,13 @@ class OmniPrefixCacheManager:
                         raise OmniPrefixCacheUnmatchError(
                             f"prefix hit not block aligned (req={req_id}, hit_upto={num_computed}, block_size={bs})"
                         )
-                    hit_blocks = list(block_groups[0][: num_computed // bs])
+                    needed = num_computed // bs
+                    if len(block_groups[0]) < needed:
+                        raise OmniPrefixCacheUnmatchError(
+                            f"prefix hit for req {req_id} ({num_computed} tokens) has "
+                            f"{len(block_groups[0])} group-0 blocks, need {needed}"
+                        )
+                    hit_blocks = list(block_groups[0][:needed])
                     self._hit_spans[req_id] = (num_computed, hit_blocks)
 
             # 4. Gather those spans on the prefetch thread; overlaps this forward.

@@ -2000,3 +2000,32 @@ def test_negative_hit_step_is_rejected_before_manager_prefetch(monkeypatch):
         assert mgr._cur_num_scheduled == {}
     finally:
         mgr.shutdown()
+
+
+@pytest.mark.parametrize("blocks", [[[0]], [[0], [1, 2]]])
+def test_short_hit_block_group_fails_at_register(monkeypatch, blocks):
+    mgr, _ = make_manager()
+    prefetched = []
+    monkeypatch.setattr(mgr, "_prefetch_hit_spans", lambda: prefetched.append(True))
+    adapter = PrefixCacheSchedulerAdapter()
+    step = adapter.translate_step(FakeSchedOut(new_reqs=[FakeNewReq("short", 8, blocks)], num_scheduled={"short": 1}))
+    try:
+        with pytest.raises(OmniPrefixCacheUnmatchError, match="has 1 group-0 blocks, need 2"):
+            mgr.new_step_starts(step)
+        assert mgr._hit_spans == {}
+        assert not prefetched
+    finally:
+        mgr.shutdown()
+
+
+@pytest.mark.parametrize("blocks", [[0, 1], [0, 1, 2]])
+def test_hit_block_group_accepts_complete_prefix_and_ignores_tail(blocks):
+    mgr, view = make_manager()
+    try:
+        mgr.materialize(run_step(mgr, view, {"a": ([0, 1], 0, 8)}), ["a"])
+        sid = run_step(mgr, view, {"b": (blocks + [3], 8, 1)}, new_hits={"b": 8}, finished=["a"])
+        result = mgr.materialize(sid, ["b"])
+        expected = expected_rows(view.slots_for("b", 0, 9))
+        assert torch.equal(result.hidden_states["b"], expected)
+    finally:
+        mgr.shutdown()
