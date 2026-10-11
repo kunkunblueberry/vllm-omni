@@ -15,8 +15,10 @@ from vllm_omni.diffusion.models.helios.pipeline_helios import (
 )
 from vllm_omni.diffusion.models.helios.scheduling_helios import HeliosScheduler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched.request_scheduler import RequestScheduler
 from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.diffusion.worker.utils import RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -39,9 +41,11 @@ class _SmallTransformer:
 
 
 class _SmallVAE:
-    config = SimpleNamespace(z_dim=1, latents_mean=[0.0], latents_std=[1.0])
     dtype = torch.float32
     device = torch.device("cpu")
+
+    def __init__(self):
+        self.config = SimpleNamespace(z_dim=1, latents_mean=[0.0], latents_std=[1.0])
 
     def decode(self, latents, **kwargs):
         return (latents,)
@@ -65,7 +69,12 @@ def _runtime(monkeypatch, max_num_seqs=2):
     pipeline.is_distilled = False
     pipeline.vae_scale_factor_temporal = 4
     pipeline.vae_scale_factor_spatial = 8
-    monkeypatch.setattr(pipeline, "encode_prompt", lambda **kwargs: (torch.ones((1, 2, 3)), None))
+
+    def encode_prompt(*, prompt, num_videos_per_prompt=1, **kwargs):
+        count = len(prompt) if isinstance(prompt, list) else 1
+        return torch.ones((count * num_videos_per_prompt, 2, 3)), None
+
+    monkeypatch.setattr(pipeline, "encode_prompt", encode_prompt)
 
     runner = DiffusionModelRunner(None, config, torch.device("cpu"))
     runner.pipeline = pipeline
@@ -141,6 +150,129 @@ def _run(monkeypatch, stage_steps, *, delayed_batch, admit_tick=1, seed=65):
         assert runner.pipeline.transformer.batch_rows == [2, 2, 2]
         assert runner.pipeline.transformer.spatial_shapes == [(2, 2), (4, 4), (8, 8)]
     return completed
+
+
+def test_standard_latent_output_skips_vae_in_real_step_runtime(monkeypatch, mocker):
+    config, scheduler, runner = _runtime(monkeypatch)
+    request = _request(config, "latent", 65, [1, 1, 1])
+    request.sampling_params.output_type = "latent"
+    request.sampling_params.extra_args.pop("output_type")
+    runner.pipeline.vae.config.latents_mean = [3.0]
+    runner.pipeline.vae.config.latents_std = [2.0]
+
+    def unexpected_decode(*args, **kwargs):
+        pytest.fail("latent output must not invoke VAE.decode")
+
+    monkeypatch.setattr(runner.pipeline.vae, "decode", unexpected_decode)
+    step = mocker.spy(runner.pipeline, "step_scheduler")
+    scheduler.add_request(request)
+    result = None
+    for _ in range(3):
+        wave = scheduler.schedule()
+        result = runner.execute_stepwise(wave)
+        scheduler.update_from_output(wave, result)
+    assert result is not None
+    output = result.get_request_output("latent")
+    assert output.finished
+    assert output.result.output.shape == (1, 1, 3, 8, 8)
+    torch.testing.assert_close(output.result.output, step.call_args.args[0].latents)
+    assert not scheduler.has_requests()
+    assert not runner.state_cache
+
+
+def _request_mode_run(monkeypatch, seeds, *, num_outputs=1):
+    config, _, runner = _runtime(monkeypatch, max_num_seqs=len(seeds))
+    config.streaming_output = False
+    scheduler = RequestScheduler()
+    scheduler.initialize(config)
+
+    def unexpected_decode(*args, **kwargs):
+        pytest.fail("request-mode latent output must not invoke VAE.decode")
+
+    monkeypatch.setattr(runner.pipeline.vae, "decode", unexpected_decode)
+    for index, seed in enumerate(seeds):
+        request = _request(config, str(index), seed, [1, 1, 1], num_frames=17)
+        request.sampling_params.output_type = "latent"
+        request.sampling_params.num_outputs_per_prompt = num_outputs
+        scheduler.add_request(request)
+    # Isolate only CPU-unavailable memory telemetry, never the execution path.
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(runner, "_sample_peak_memory_mb", lambda: 0.0)
+    wave = scheduler.schedule()
+    assert wave.scheduled_request_ids == [str(index) for index in range(len(seeds))]
+    result = runner.execute_model_batch(wave, config)
+    assert result.request_ids == wave.scheduled_request_ids
+    assert all(output.finished and output.result.error is None for output in result.runner_outputs)
+    scheduler.update_from_output(wave, result)
+    assert not scheduler.has_requests()
+    assert runner.pipeline.transformer.batch_rows == [len(seeds) * num_outputs] * 6
+    return result
+
+
+def test_request_scheduler_fuses_helios_forward_and_preserves_each_seed(monkeypatch):
+    serial_a = _request_mode_run(monkeypatch, [65], num_outputs=2)
+    serial_b = _request_mode_run(monkeypatch, [66], num_outputs=2)
+    batch = _request_mode_run(monkeypatch, [65, 66], num_outputs=2)
+    for index, serial in enumerate((serial_a, serial_b)):
+        actual = batch.get_request_output(str(index)).result.output
+        assert actual.shape == (2, 1, 6, 8, 8)
+        torch.testing.assert_close(actual, serial.get_request_output("0").result.output)
+    assert not torch.equal(batch.runner_outputs[0].result.output, batch.runner_outputs[1].result.output)
+
+
+def test_nonstreaming_step_completion_returns_all_latent_chunks(monkeypatch):
+    serial = _request_mode_run(monkeypatch, [65])
+    config, scheduler, runner = _runtime(monkeypatch)
+    config.streaming_output = False
+    runner.pipeline.vae.config.latents_mean = [3.0]
+    runner.pipeline.vae.config.latents_std = [2.0]
+    request = _request(config, "all-chunks", 65, [1, 1, 1], num_frames=17)
+    request.sampling_params.output_type = "latent"
+    scheduler.add_request(request)
+    completed: list[RunnerOutput] = []
+    for _ in range(6):
+        wave = scheduler.schedule()
+        result = runner.execute_stepwise(wave)
+        assert result.request_ids == ["all-chunks"]
+        completed.extend(output for output in result.runner_outputs if output.finished)
+        scheduler.update_from_output(wave, result)
+    assert len(completed) == 1
+    assert completed[0].result.output.shape == (1, 1, 6, 8, 8)
+    torch.testing.assert_close(completed[0].result.output, serial.get_request_output("0").result.output)
+    assert not scheduler.has_requests()
+    assert not runner.state_cache
+
+
+def test_nonstreaming_video_decodes_each_chunk_and_returns_full_history(monkeypatch, mocker):
+    config, scheduler, runner = _runtime(monkeypatch)
+    config.streaming_output = False
+    runner.pipeline.vae.config.latents_mean = [3.0]
+    runner.pipeline.vae.config.latents_std = [2.0]
+    request = _request(config, "video", 65, [1, 1, 1], num_frames=17)
+    # The standard field takes precedence over the legacy extra_args latent field.
+    request.sampling_params.output_type = "np"
+    decode = mocker.spy(runner.pipeline.vae, "decode")
+    step = mocker.spy(runner.pipeline, "step_scheduler")
+    scheduler.add_request(request)
+    chunks: list[torch.Tensor] = []
+    for _ in range(6):
+        wave = scheduler.schedule()
+        result = runner.execute_stepwise(wave)
+        if decode.call_count > len(chunks):
+            model_latents = step.call_args.args[0].extra["history_latents"][:, :, -3:]
+            # Wan's checkpoint normalization is x / (1/std) + mean.
+            torch.testing.assert_close(decode.call_args.args[0], model_latents * 2 + 3)
+            chunks.append(decode.spy_return[0].clone())
+        scheduler.update_from_output(wave, result)
+    assert decode.call_count == 2
+    output = result.get_request_output("video")
+    assert output.finished
+    torch.testing.assert_close(output.result.output, torch.cat(chunks, dim=2))
+    assert output.result.output.shape == (1, 1, 6, 8, 8)
+    assert not scheduler.has_requests()
+    assert not runner.state_cache
 
 
 @pytest.mark.parametrize("stage_steps", [[1, 1, 1], [2, 2, 2]], ids=["different_at_admission", "diverge_after_step"])

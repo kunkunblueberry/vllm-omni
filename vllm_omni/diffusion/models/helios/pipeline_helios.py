@@ -28,10 +28,12 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.interaction.mixin import InteractionMixin
 from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.helios.helios_transformer import HeliosTransformer3DModel
 from vllm_omni.diffusion.models.helios.scheduling_helios import HeliosScheduler
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
@@ -250,6 +252,10 @@ class HeliosPipeline(
 
         model = od_config.model
         local_files_only = os.path.exists(model)
+        helios_subfolders = ["scheduler", "text_encoder", "vae", "tokenizer"]
+        prefetch_subfolders(model, helios_subfolders)
+        cpu_offload = resolve_offload_strategy(self.od_config) is OffloadStrategy.MODEL_LEVEL
+        enc_vae_device = torch.device("cpu") if cpu_offload else self.device
 
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
@@ -271,12 +277,23 @@ class HeliosPipeline(
         # that ``embed_tokens`` shares ``shared.weight`` as intended.
         text_enc_cfg = AutoConfig.from_pretrained(model, subfolder="text_encoder", local_files_only=local_files_only)
         text_enc_cfg.tie_word_embeddings = True
-        self.text_encoder = UMT5EncoderModel.from_pretrained(
-            model, subfolder="text_encoder", config=text_enc_cfg, torch_dtype=dtype, local_files_only=local_files_only
-        ).to(self.device)
-        self.vae = AutoencoderKLWan.from_pretrained(
-            model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only
-        ).to(self.device)
+        self.text_encoder = from_pretrained_with_prefetch(
+            UMT5EncoderModel.from_pretrained,
+            model,
+            subfolder="text_encoder",
+            prefetch_list=helios_subfolders,
+            config=text_enc_cfg,
+            torch_dtype=dtype,
+            local_files_only=local_files_only,
+        ).to(enc_vae_device)
+        self.vae = from_pretrained_with_prefetch(
+            AutoencoderKLWan.from_pretrained,
+            model,
+            subfolder="vae",
+            prefetch_list=helios_subfolders,
+            torch_dtype=torch.float32,
+            local_files_only=local_files_only,
+        ).to(enc_vae_device)
 
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
         self.transformer = create_transformer_from_config(
@@ -362,7 +379,7 @@ class HeliosPipeline(
         width = (int(state.sampling.width or extra.get("width", 640)) // 16) * 16
         num_frames = max(int(state.sampling.num_frames or frame_num), 1)
         num_steps = int(state.sampling.num_inference_steps or extra.get("num_inference_steps", 50))
-        output_type = extra.get("output_type", "np")
+        output_type = state.sampling.output_type or extra.get("output_type", "np")
 
         image = extra.get("image")
         video = extra.get("video")
@@ -400,10 +417,10 @@ class HeliosPipeline(
         latents_mean = (
             torch.tensor(self.vae.config.latents_mean)
             .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(self.vae.device, self.vae.dtype)
+            .to(device, self.vae.dtype)
         )
         latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-            self.vae.device, self.vae.dtype
+            device, self.vae.dtype
         )
 
         add_noise_to_image_latents = bool(extra.get("add_noise_to_image_latents", True))
@@ -573,7 +590,6 @@ class HeliosPipeline(
                 "total_generated_latent_frames": total_generated_latent_frames,
                 "use_cfg_zero_star": bool(extra.get("use_cfg_zero_star", False)),
                 "use_zero_init": bool(extra.get("use_zero_init", True)),
-                "vae_dtype": self.vae.dtype,
                 "width": width,
                 "window_num_frames": window_num_frames,
                 "zero_steps": int(extra.get("zero_steps", 1)),
@@ -1099,6 +1115,20 @@ class HeliosPipeline(
             extra["stage2_start_point_list"].append(state.latents)
         self._set_stage2_timesteps(state)
 
+    def _decode_latents(
+        self,
+        latents: torch.Tensor,
+        latents_mean: torch.Tensor,
+        latents_std: torch.Tensor,
+        output_type: str,
+    ) -> torch.Tensor:
+        # Match Qwen-Image: latent output stays in model space and skips VAE.
+        if output_type == "latent":
+            return latents
+        latents = latents.to(self.vae.dtype)
+        latents = latents / latents_std.to(latents) + latents_mean.to(latents)
+        return self.vae.decode(latents, return_dict=False)[0]
+
     def post_decode(
         self,
         state: StepRequestState,
@@ -1116,18 +1146,22 @@ class HeliosPipeline(
         extra["total_generated_latent_frames"] += state.latents.shape[2]
         extra["history_latents"] = torch.cat([extra["history_latents"], state.latents], dim=2)
         real_history_latents = extra["history_latents"][:, :, -extra["total_generated_latent_frames"] :]
-        current_latents = (
-            real_history_latents[:, :, -extra["num_latent_frames_per_chunk"] :].to(extra["vae_dtype"])
-            / extra["latents_std"]
-            + extra["latents_mean"]
+        current_output = self._decode_latents(
+            real_history_latents[:, :, -extra["num_latent_frames_per_chunk"] :],
+            extra["latents_mean"],
+            extra["latents_std"],
+            extra["output_type"],
         )
-        current_video = self.vae.decode(current_latents, return_dict=False)[0]
-        if extra["history_video"] is None:
-            extra["history_video"] = current_video
-        else:
-            extra["history_video"] = torch.cat([extra["history_video"], current_video], dim=2)
+        if extra["output_type"] != "latent":
+            if extra["history_video"] is None:
+                extra["history_video"] = current_output
+            else:
+                extra["history_video"] = torch.cat([extra["history_video"], current_output], dim=2)
 
-        output = current_latents if extra["output_type"] == "latent" else current_video
+        if self.od_config.streaming_output:
+            output = current_output
+        else:
+            output = real_history_latents if extra["output_type"] == "latent" else extra["history_video"]
         completed_chunk_index = state.chunk_index
         state.chunk_index += 1
         finished = state.request_denoise_completed
@@ -1315,10 +1349,10 @@ class HeliosPipeline(
         latents_mean = (
             torch.tensor(self.vae.config.latents_mean)
             .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(self.vae.device, self.vae.dtype)
+            .to(device, self.vae.dtype)
         )
         latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-            self.vae.device, self.vae.dtype
+            device, self.vae.dtype
         )
 
         # Prepare I2V image latents
@@ -1469,8 +1503,6 @@ class HeliosPipeline(
         if attention_kwargs is None:
             attention_kwargs = {}
 
-        vae_dtype = self.vae.dtype
-
         # Chunked denoising loop
         for k in range(num_latent_chunk):
             is_first_chunk = k == 0
@@ -1584,13 +1616,14 @@ class HeliosPipeline(
                 slice(-num_latent_frames_per_chunk, None),
             )
 
-            current_latents = real_history_latents[index_slice].to(vae_dtype) / latents_std + latents_mean
-            current_video = self.vae.decode(current_latents, return_dict=False)[0]
-
-            if history_video is None:
-                history_video = current_video
-            else:
-                history_video = torch.cat([history_video, current_video], dim=2)
+            if output_type != "latent":
+                current_video = self._decode_latents(
+                    real_history_latents[index_slice], latents_mean, latents_std, output_type
+                )
+                if history_video is None:
+                    history_video = current_video
+                else:
+                    history_video = torch.cat([history_video, current_video], dim=2)
 
         if current_omni_platform.is_available():
             current_omni_platform.empty_cache()
