@@ -181,9 +181,8 @@ def get_helios_pre_process_func(
         guidance_scale = float(extra.get("guidance_scale", 5.0))
         if getattr(sampling, "guidance_scale_provided", False):
             guidance_scale = float(sampling.guidance_scale)
-        prompt = request.prompt
-        negative_prompt = prompt.get("negative_prompt") if isinstance(prompt, dict) else None
-        effective_cfg = guidance_scale > 1.0 and negative_prompt is not None
+        # Helios synthesizes an empty negative prompt when CFG is requested.
+        effective_cfg = guidance_scale > 1.0
         request.batch_compatibility_key = (
             "helios-v1",
             history_sizes,
@@ -200,7 +199,7 @@ def get_helios_pre_process_func(
             bool(extra.get("use_cfg_zero_star", False)),
             bool(extra.get("use_zero_init", True)),
             int(extra.get("zero_steps", 1)),
-            ("effective_cfg", effective_cfg, guidance_scale, negative_prompt is not None),
+            ("effective_cfg", effective_cfg, guidance_scale),
             attention_key,
             bool(extra.get("add_noise_to_image_latents", True)),
             float(extra.get("image_noise_sigma_min", 0.111)),
@@ -406,7 +405,7 @@ class HeliosPipeline(
         prompt_embeds, negative_prompt_embeds = self.encode_prompt(
             prompt=prompt,
             negative_prompt=negative_prompt,
-            do_classifier_free_guidance=guidance_scale > 1.0 and negative_prompt is not None,
+            do_classifier_free_guidance=guidance_scale > 1.0,
             num_videos_per_prompt=state.sampling.num_outputs_per_prompt or 1,
             max_sequence_length=state.sampling.max_sequence_length or 226,
             device=device,
@@ -438,6 +437,7 @@ class HeliosPipeline(
                 latents_mean=latents_mean,
                 latents_std=latents_std,
                 num_latent_frames_per_chunk=num_latent_frames_per_chunk,
+                num_videos_per_prompt=state.sampling.num_outputs_per_prompt or 1,
                 dtype=torch.float32,
                 device=device,
                 generator=generator,
@@ -445,17 +445,21 @@ class HeliosPipeline(
 
         if image_latents is not None and add_noise_to_image_latents:
             image_noise_sigma = (
-                torch.rand(1, device=device, generator=generator) * (image_noise_sigma_max - image_noise_sigma_min)
+                self._rand_per_sample((image_latents.shape[0],), generator=generator, device=device)
+                * (image_noise_sigma_max - image_noise_sigma_min)
                 + image_noise_sigma_min
             )
+            image_noise_sigma = image_noise_sigma.view(-1, 1, 1, 1, 1)
             image_latents = (
                 image_noise_sigma * randn_tensor(image_latents.shape, generator=generator, device=device)
                 + (1 - image_noise_sigma) * image_latents
             )
             fake_image_noise_sigma = (
-                torch.rand(1, device=device, generator=generator) * (video_noise_sigma_max - video_noise_sigma_min)
+                self._rand_per_sample((fake_image_latents.shape[0],), generator=generator, device=device)
+                * (video_noise_sigma_max - video_noise_sigma_min)
                 + video_noise_sigma_min
             )
+            fake_image_noise_sigma = fake_image_noise_sigma.view(-1, 1, 1, 1, 1)
             fake_image_latents = (
                 fake_image_noise_sigma * randn_tensor(fake_image_latents.shape, generator=generator, device=device)
                 + (1 - fake_image_noise_sigma) * fake_image_latents
@@ -468,6 +472,7 @@ class HeliosPipeline(
                 latents_mean=latents_mean,
                 latents_std=latents_std,
                 num_latent_frames_per_chunk=num_latent_frames_per_chunk,
+                num_videos_per_prompt=state.sampling.num_outputs_per_prompt or 1,
                 dtype=torch.float32,
                 device=device,
                 generator=generator,
@@ -475,9 +480,11 @@ class HeliosPipeline(
 
         if video_latents is not None and add_noise_to_video_latents:
             image_noise_sigma = (
-                torch.rand(1, device=device, generator=generator) * (image_noise_sigma_max - image_noise_sigma_min)
+                self._rand_per_sample((image_latents.shape[0],), generator=generator, device=device)
+                * (image_noise_sigma_max - image_noise_sigma_min)
                 + image_noise_sigma_min
             )
+            image_noise_sigma = image_noise_sigma.view(-1, 1, 1, 1, 1)
             image_latents = (
                 image_noise_sigma * randn_tensor(image_latents.shape, generator=generator, device=device)
                 + (1 - image_noise_sigma) * image_latents
@@ -490,11 +497,11 @@ class HeliosPipeline(
                 latent_chunk = video_latents[:, :, chunk_start:chunk_end, :, :]
                 chunk_frames = latent_chunk.shape[2]
                 frame_sigmas = (
-                    torch.rand(chunk_frames, device=device, generator=generator)
+                    self._rand_per_sample((latent_chunk.shape[0], chunk_frames), generator=generator, device=device)
                     * (video_noise_sigma_max - video_noise_sigma_min)
                     + video_noise_sigma_min
                 )
-                frame_sigmas = frame_sigmas.view(1, 1, chunk_frames, 1, 1)
+                frame_sigmas = frame_sigmas.view(latent_chunk.shape[0], 1, chunk_frames, 1, 1)
                 noisy_chunk = (
                     frame_sigmas * randn_tensor(latent_chunk.shape, generator=generator, device=device)
                     + (1 - frame_sigmas) * latent_chunk
@@ -1243,7 +1250,10 @@ class HeliosPipeline(
                 raise ValueError(f"Helios request batch contains mixed provided and missing {name} values.")
             if any(not isinstance(value, torch.Tensor) for value in values):
                 raise ValueError(f"Helios request batch {name} values must be tensors.")
-            tensors = [value if value.ndim >= 4 else value.unsqueeze(0) for value in values]
+            batch_rank = 5 if name == "video" else 4
+            tensors = [value if value.ndim == batch_rank else value.unsqueeze(0) for value in values]
+            if any(value.ndim != batch_rank for value in tensors):
+                raise ValueError(f"Helios request batch {name} has invalid dimensions.")
             first = tensors[0]
             if any(value.shape[1:] != first.shape[1:] for value in tensors[1:]):
                 raise ValueError(f"Helios request batch contains incompatible {name} shapes.")
@@ -1364,6 +1374,7 @@ class HeliosPipeline(
                 latents_mean=latents_mean,
                 latents_std=latents_std,
                 num_latent_frames_per_chunk=num_latent_frames_per_chunk,
+                num_videos_per_prompt=common_sampling.num_outputs_per_prompt or 1,
                 dtype=torch.float32,
                 device=device,
                 generator=generator,
@@ -1399,6 +1410,7 @@ class HeliosPipeline(
                 latents_mean=latents_mean,
                 latents_std=latents_std,
                 num_latent_frames_per_chunk=num_latent_frames_per_chunk,
+                num_videos_per_prompt=common_sampling.num_outputs_per_prompt or 1,
                 dtype=torch.float32,
                 device=device,
                 generator=generator,
@@ -2048,6 +2060,7 @@ class HeliosPipeline(
         dtype: torch.dtype | None = None,
         device: torch.device | None = None,
         generator: torch.Generator | list[torch.Generator] | None = None,
+        num_videos_per_prompt: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode a single image into VAE latent space for I2V generation.
 
@@ -2056,6 +2069,13 @@ class HeliosPipeline(
         history buffer for the first denoising chunk.
         """
         device = device or self.device
+        if image.ndim == 3:
+            image = image.unsqueeze(0)
+        if image.ndim != 4:
+            raise ValueError("Helios image input must have shape (C,H,W) or (B,C,H,W).")
+        # Match prompt embeddings and collated generators: [A0,A1,B0,B1].
+        if num_videos_per_prompt > 1:
+            image = image.repeat_interleave(num_videos_per_prompt, dim=0)
         image = image.unsqueeze(2).to(device=device, dtype=self.vae.dtype)
         latents = self.vae.encode(image).latent_dist.sample(generator=generator)
         latents = (latents - latents_mean) * latents_std
@@ -2077,6 +2097,7 @@ class HeliosPipeline(
         dtype: torch.dtype | None = None,
         device: torch.device | None = None,
         generator: torch.Generator | list[torch.Generator] | None = None,
+        num_videos_per_prompt: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode a video into VAE latent space for V2V generation.
 
@@ -2084,6 +2105,12 @@ class HeliosPipeline(
         is used as the image prefix, and video_latents fills the history buffer.
         """
         device = device or self.device
+        if video.ndim == 4:
+            video = video.unsqueeze(0)
+        if video.ndim != 5:
+            raise ValueError("Helios video input must have shape (C,T,H,W) or (B,C,T,H,W).")
+        if num_videos_per_prompt > 1:
+            video = video.repeat_interleave(num_videos_per_prompt, dim=0)
         video = video.to(device=device, dtype=self.vae.dtype)
 
         num_frames = video.shape[2]

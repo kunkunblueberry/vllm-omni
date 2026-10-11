@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.interaction.coordinator import InteractionCoordinator
@@ -37,7 +38,9 @@ class _SmallTransformer:
     def __call__(self, *, hidden_states, **kwargs):
         self.batch_rows.append(hidden_states.shape[0])
         self.spatial_shapes.append(tuple(hidden_states.shape[-2:]))
-        return (hidden_states * 0.1,)
+        prompt = kwargs["encoder_hidden_states"].mean(dim=(1, 2)).view(-1, 1, 1, 1, 1)
+        history = kwargs["latents_history_short"].mean(dim=(1, 2, 3, 4)).view(-1, 1, 1, 1, 1)
+        return (hidden_states * 0.1 + prompt * 0.01 + history * 0.01,)
 
 
 class _SmallVAE:
@@ -49,6 +52,12 @@ class _SmallVAE:
 
     def decode(self, latents, **kwargs):
         return (latents,)
+
+    def encode(self, video):
+        # Only VAE arithmetic is isolated; use its real posterior/RNG contract.
+        mean = video[:, :1, ::4, ::8, ::8]
+        posterior = DiagonalGaussianDistribution(torch.cat([mean, torch.zeros_like(mean)], dim=1))
+        return SimpleNamespace(latent_dist=posterior)
 
 
 def _runtime(monkeypatch, max_num_seqs=2):
@@ -180,11 +189,15 @@ def test_standard_latent_output_skips_vae_in_real_step_runtime(monkeypatch, mock
     assert not runner.state_cache
 
 
-def _request_mode_run(monkeypatch, seeds, *, num_outputs=1):
+def _request_mode_run(
+    monkeypatch, seeds, *, num_outputs=1, modality=None, unbatched=False, guidance=1.0, per_output_generators=False
+):
     config, _, runner = _runtime(monkeypatch, max_num_seqs=len(seeds))
     config.streaming_output = False
     scheduler = RequestScheduler()
     scheduler.initialize(config)
+    if guidance > 1:
+        _use_real_prompt_encoding(monkeypatch, runner.pipeline)
 
     def unexpected_decode(*args, **kwargs):
         pytest.fail("request-mode latent output must not invoke VAE.decode")
@@ -194,6 +207,17 @@ def _request_mode_run(monkeypatch, seeds, *, num_outputs=1):
         request = _request(config, str(index), seed, [1, 1, 1], num_frames=17)
         request.sampling_params.output_type = "latent"
         request.sampling_params.num_outputs_per_prompt = num_outputs
+        request.sampling_params.guidance_scale = guidance
+        if per_output_generators:
+            request.sampling_params.generator = [
+                torch.Generator().manual_seed(seed + output_index * 100) for output_index in range(num_outputs)
+            ]
+        if modality is not None:
+            shape = (1, 3, 64, 64) if modality == "image" else (1, 3, 9, 64, 64)
+            request.sampling_params.extra_args[modality] = torch.full(shape, float(seed) / 100)
+            if unbatched:
+                request.sampling_params.extra_args[modality] = request.sampling_params.extra_args[modality].squeeze(0)
+        request = get_helios_pre_process_func(config)(request)
         scheduler.add_request(request)
     # Isolate only CPU-unavailable memory telemetry, never the execution path.
     from vllm_omni.platforms import current_omni_platform
@@ -207,8 +231,149 @@ def _request_mode_run(monkeypatch, seeds, *, num_outputs=1):
     assert all(output.finished and output.result.error is None for output in result.runner_outputs)
     scheduler.update_from_output(wave, result)
     assert not scheduler.has_requests()
-    assert runner.pipeline.transformer.batch_rows == [len(seeds) * num_outputs] * 6
+    assert runner.pipeline.transformer.batch_rows == [len(seeds) * num_outputs] * (12 if guidance > 1 else 6)
     return result
+
+
+@pytest.mark.parametrize("modality", ["image", "video"])
+@pytest.mark.parametrize("num_outputs", [1, 2])
+@pytest.mark.parametrize("unbatched", [False, True], ids=["with_batch_axis", "without_batch_axis"])
+def test_conditioned_request_batch_preserves_posterior_seed_and_output_rows(
+    monkeypatch, mocker, modality, num_outputs, unbatched
+):
+    sample = mocker.spy(DiagonalGaussianDistribution, "sample")
+    batch = _request_mode_run(monkeypatch, [65, 66], num_outputs=num_outputs, modality=modality, unbatched=unbatched)
+    # Two real posterior draws: first-frame plus repeated-image/video chunk.
+    assert sample.call_count == 2
+    for call in sample.call_args_list:
+        posterior = call.args[0]
+        assert posterior.mean.shape[0] == 2 * num_outputs
+        torch.testing.assert_close(
+            posterior.mean[:, 0, 0, 0, 0],
+            torch.tensor([0.65] * num_outputs + [0.66] * num_outputs),
+        )
+        generators = call.kwargs["generator"]
+        assert [generator.initial_seed() for generator in generators] == [65] * num_outputs + [66] * num_outputs
+    serial_a = _request_mode_run(monkeypatch, [65], num_outputs=num_outputs, modality=modality)
+    serial_b = _request_mode_run(monkeypatch, [66], num_outputs=num_outputs, modality=modality)
+    frames = 7 if modality == "image" else 9
+    for index, serial in enumerate((serial_a, serial_b)):
+        actual = batch.get_request_output(str(index)).result.output
+        assert actual.shape == (num_outputs, 1, frames, 8, 8)
+        torch.testing.assert_close(actual, serial.get_request_output("0").result.output)
+    assert not torch.equal(batch.runner_outputs[0].result.output, batch.runner_outputs[1].result.output)
+
+
+@pytest.mark.parametrize("modality", ["image", "video"])
+@pytest.mark.parametrize("per_output_generators", [False, True], ids=["request_seed", "output_generator_list"])
+def test_conditioned_step_multi_output_matches_request_mode(monkeypatch, mocker, modality, per_output_generators):
+    reference = _request_mode_run(
+        monkeypatch, [65], num_outputs=2, modality=modality, per_output_generators=per_output_generators
+    )
+    config, scheduler, runner = _runtime(monkeypatch)
+    config.streaming_output = False
+    request = _request(config, "conditioned", 65, [1, 1, 1], num_frames=17)
+    request.sampling_params.output_type = "latent"
+    request.sampling_params.num_outputs_per_prompt = 2
+    if per_output_generators:
+        request.sampling_params.generator = [torch.Generator().manual_seed(seed) for seed in (65, 165)]
+    shape = (3, 64, 64) if modality == "image" else (3, 9, 64, 64)
+    request.sampling_params.extra_args[modality] = torch.full(shape, 0.65)
+    request = get_helios_pre_process_func(config)(request)
+    sample = mocker.spy(DiagonalGaussianDistribution, "sample")
+    scheduler.add_request(request)
+    for _ in range(6):
+        wave = scheduler.schedule()
+        result = runner.execute_stepwise(wave)
+        scheduler.update_from_output(wave, result)
+    assert sample.call_count == 2
+    assert all(call.args[0].mean.shape[0] == 2 for call in sample.call_args_list)
+    output = result.get_request_output("conditioned")
+    assert output.finished and output.result.error is None
+    torch.testing.assert_close(output.result.output, reference.get_request_output("0").result.output)
+    assert output.result.output.shape == (2, 1, 7 if modality == "image" else 9, 8, 8)
+    assert runner.pipeline.transformer.batch_rows == [2] * 6
+    assert not scheduler.has_requests() and not runner.state_cache
+
+
+def test_fused_string_prompt_cfg_preserves_each_request(monkeypatch):
+    serial_a = _request_mode_run(monkeypatch, [65], guidance=5.0)
+    serial_b = _request_mode_run(monkeypatch, [66], guidance=5.0)
+    batch = _request_mode_run(monkeypatch, [65, 66], guidance=5.0)
+    for index, serial in enumerate((serial_a, serial_b)):
+        actual = batch.get_request_output(str(index)).result.output
+        assert actual.shape == (1, 1, 6, 8, 8)
+        torch.testing.assert_close(actual, serial.get_request_output("0").result.output)
+    assert not torch.equal(batch.runner_outputs[0].result.output, batch.runner_outputs[1].result.output)
+
+
+class _SmallTextEncoder:
+    dtype = torch.float32
+
+    def __call__(self, ids, mask):
+        return SimpleNamespace(last_hidden_state=ids.float().unsqueeze(-1).expand(-1, -1, 3))
+
+
+def _use_real_prompt_encoding(monkeypatch, pipeline):
+    def tokenize(texts, *, max_length, **kwargs):
+        # Heavy text components only; production prompt/negative/output expansion stays real.
+        ids = torch.zeros(len(texts), max_length, dtype=torch.long)
+        ids[:, 0] = torch.tensor([int(bool(text)) for text in texts])
+        mask = torch.zeros_like(ids)
+        mask[:, 0] = 1
+        return SimpleNamespace(input_ids=ids, attention_mask=mask)
+
+    pipeline.tokenizer = tokenize
+    pipeline.text_encoder = _SmallTextEncoder()
+    monkeypatch.setattr(pipeline, "encode_prompt", HeliosPipeline.encode_prompt.__get__(pipeline))
+
+
+@pytest.mark.parametrize("guidance", [1.0, 5.0])
+def test_string_prompt_cfg_matches_request_mode_through_real_runtime(monkeypatch, mocker, guidance):
+    config, scheduler, runner = _runtime(monkeypatch)
+    config.streaming_output = False
+    _use_real_prompt_encoding(monkeypatch, runner.pipeline)
+    request = _request(config, "cfg", 65, [1, 1, 1])
+    request.sampling_params.guidance_scale = guidance
+    request.sampling_params.output_type = "latent"
+    request = get_helios_pre_process_func(config)(request)
+    encode = mocker.spy(runner.pipeline, "encode_prompt")
+    prepare = mocker.spy(runner.pipeline, "prepare_encode")
+    scheduler.add_request(request)
+    for _ in range(3):
+        wave = scheduler.schedule()
+        step_result = runner.execute_stepwise(wave)
+        scheduler.update_from_output(wave, step_result)
+    state = prepare.spy_return
+    assert state.do_true_cfg is (guidance > 1)
+    assert (state.negative_prompt_embeds is not None) is (guidance > 1)
+    assert encode.call_args.kwargs["do_classifier_free_guidance"] is (guidance > 1)
+    assert runner.pipeline.transformer.batch_rows == [1] * (6 if guidance > 1 else 3)
+    assert not scheduler.has_requests() and not runner.state_cache
+
+    request_config, _, request_runner = _runtime(monkeypatch)
+    request_config.streaming_output = False
+    _use_real_prompt_encoding(monkeypatch, request_runner.pipeline)
+    request_scheduler = RequestScheduler()
+    request_scheduler.initialize(request_config)
+    request = _request(request_config, "cfg", 65, [1, 1, 1])
+    request.sampling_params.guidance_scale = guidance
+    request.sampling_params.output_type = "latent"
+    request = get_helios_pre_process_func(request_config)(request)
+    request_scheduler.add_request(request)
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(request_runner, "_sample_peak_memory_mb", lambda: 0.0)
+    wave = request_scheduler.schedule()
+    request_result = request_runner.execute_model_batch(wave, request_config)
+    request_scheduler.update_from_output(wave, request_result)
+    assert not request_scheduler.has_requests()
+    assert request_runner.pipeline.transformer.batch_rows == [1] * (6 if guidance > 1 else 3)
+    torch.testing.assert_close(
+        step_result.get_request_output("cfg").result.output,
+        request_result.get_request_output("cfg").result.output,
+    )
 
 
 def test_request_scheduler_fuses_helios_forward_and_preserves_each_seed(monkeypatch):

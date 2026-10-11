@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Helios request- and step-batching contract tests."""
 
 from __future__ import annotations
@@ -246,8 +247,12 @@ def test_helios_zero_star_groups_by_stage2_progress() -> None:
     assert [[state.request_id for state in group] for group in groups] == [["first"], ["second"]]
 
 
-def test_helios_step_batch_uses_production_runner_path(monkeypatch) -> None:
-    """Exercise scheduler output -> runner state -> InputBatch -> Helios denoise."""
+def test_helios_runner_routes_batched_denoise_with_isolated_lifecycle(monkeypatch) -> None:
+    """Unit-test runner/denoise wiring with isolated preparation/advance/decode.
+
+    Real Helios initialization, scheduler and chunk transitions are covered in
+    test_helios_pyramid_runtime.py; this test does not validate those behaviors.
+    """
     pipeline = _step_pipeline()
 
     def prepare_encode(self, state):
@@ -367,11 +372,13 @@ def test_helios_preprocess_key_separates_effective_cfg_modes() -> None:
         _request(
             "no-cfg",
             prompt={"prompt": "prompt-no-cfg", "negative_prompt": None},
-            guidance_scale=None,
+            guidance_scale=1.0,
         )
     )
 
     assert cfg_request.batch_compatibility_key != no_cfg_request.batch_compatibility_key
+    empty_negative_cfg = preprocess(_request("empty-cfg", prompt="a cat", guidance_scale=None))
+    assert cfg_request.batch_compatibility_key == empty_negative_cfg.batch_compatibility_key
 
 
 def _batch_pipeline() -> HeliosPipeline:
