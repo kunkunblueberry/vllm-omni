@@ -851,6 +851,10 @@ class HeliosPipeline(
             ),
         )
 
+    def group_step_states(self, states: Sequence[StepRequestState]) -> list[list[StepRequestState]]:
+        """Form physical batches before InputBatch gathers dynamic pyramid latents."""
+        return self._split_step_groups(states)
+
     def _split_step_groups(self, states: Sequence[StepRequestState]) -> list[list[StepRequestState]]:
         grouped: dict[tuple[Any, ...], list[StepRequestState]] = {}
         for state in states:
