@@ -401,6 +401,10 @@ class HeliosPipeline(
         if generator is None and state.sampling.seed is not None:
             generator = torch.Generator(device=device).manual_seed(state.sampling.seed)
             state.sampling.generator = generator
+        # CUDA RNG depends on draw shape; use the same output rows as request batching.
+        generator = DiffusionRequestBatch.collate_sampling_param_generators(
+            [state.sampling], state.sampling.num_outputs_per_prompt or 1, generator
+        )
 
         prompt_embeds, negative_prompt_embeds = self.encode_prompt(
             prompt=prompt,
@@ -1327,15 +1331,11 @@ class HeliosPipeline(
         device = self.device
         dtype = self.transformer.dtype
 
-        if req.num_reqs > 1:
-            generator = req.collate_request_generators(
-                common_sampling.num_outputs_per_prompt or 1,
-                generator,
-            )
-        elif generator is None:
-            generator = common_sampling.generator
+        generator = req.collate_request_generators(common_sampling.num_outputs_per_prompt or 1, generator)
         if generator is None and common_sampling.seed is not None:
             generator = torch.Generator(device=device).manual_seed(common_sampling.seed)
+            if (common_sampling.num_outputs_per_prompt or 1) > 1:
+                generator = [generator] * common_sampling.num_outputs_per_prompt
         # Encode prompts
         if prompt_embeds is None:
             prompt_embeds, negative_prompt_embeds = self.encode_prompt(

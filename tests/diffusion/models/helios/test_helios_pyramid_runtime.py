@@ -264,6 +264,33 @@ def test_conditioned_request_batch_preserves_posterior_seed_and_output_rows(
     assert not torch.equal(batch.runner_outputs[0].result.output, batch.runner_outputs[1].result.output)
 
 
+@pytest.mark.parametrize("mode", ["request", "step"])
+def test_single_request_multi_output_uses_output_row_generators(mocker, monkeypatch, mode):
+    # Qwen-Image collates output generators even for one logical request.
+    # CUDA normal draws for shape (2, ...) differ from two (1, ...) draws;
+    # preserve that same sampling granularity before real posterior sampling.
+    sample = mocker.spy(DiagonalGaussianDistribution, "sample")
+    if mode == "request":
+        _request_mode_run(monkeypatch, [65], num_outputs=2, modality="image")
+    else:
+        config, scheduler, runner = _runtime(monkeypatch)
+        request = _request(config, "conditioned", 65, [1, 1, 1])
+        request.sampling_params.num_outputs_per_prompt = 2
+        request.sampling_params.extra_args["image"] = torch.full((3, 64, 64), 0.65)
+        scheduler.add_request(get_helios_pre_process_func(config)(request))
+        wave = scheduler.schedule()
+        result = runner.execute_stepwise(wave)
+        assert result.request_ids == ["conditioned"]
+        scheduler.update_from_output(wave, result)
+    assert sample.call_count == 2
+    for call in sample.call_args_list:
+        generators = call.kwargs["generator"]
+        assert isinstance(generators, list)
+        assert len(generators) == 2
+        assert generators[0] is generators[1]
+        assert [generator.initial_seed() for generator in generators] == [65, 65]
+
+
 @pytest.mark.parametrize("modality", ["image", "video"])
 @pytest.mark.parametrize("per_output_generators", [False, True], ids=["request_seed", "output_generator_list"])
 def test_conditioned_step_multi_output_matches_request_mode(monkeypatch, mocker, modality, per_output_generators):
