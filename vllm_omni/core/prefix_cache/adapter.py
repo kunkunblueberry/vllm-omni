@@ -76,9 +76,11 @@ class PrefixCacheSchedulerAdapter:
     the old request before starting the new one. EXTENDED covers ordinary
     decode, chunked prefill and a live ID re-entering scheduled_new_reqs.
 
-    Explicit cancellation fields (``discarded_req_ids`` from the Omni
-    scheduler and optional ``aborted_req_ids``) produce ABORTED. Without
-    either side channel, finished IDs are not guessed to be aborted.
+    ABORTED requires an explicit optional cancellation field:
+    ``discarded_req_ids`` (the producer proposed in PR #7681) or
+    ``aborted_req_ids``. Neither is produced by the current scheduler
+    contract; until a producer lands, production terminals remain FINISHED.
+    These fields are accepted for forward compatibility, not inferred.
     """
 
     def __init__(self) -> None:

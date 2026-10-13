@@ -312,8 +312,15 @@ It covers ordinary decode, chunked prefill and IDs re-entering
 order. Terminal events precede arrivals, so same-step ID reuse finishes the old request
 before `STARTED` classifies the new one. The manager keeps write/resource
 bookkeeping only, with no second `live_reqs` lifecycle classifier.
-`ABORTED` requires explicit `discarded_req_ids` (Omni scheduler) or optional
-`aborted_req_ids`; without either side channel finished IDs remain `FINISHED`.
+`ABORTED` accepts explicit optional `discarded_req_ids` or `aborted_req_ids`.
+The current `OmniSchedulerOutput` and upstream scheduler contract produce
+neither field: the `discarded_req_ids` producer is proposed in
+[PR #7681](https://github.com/vllm-project/vllm-omni/pull/7681), which has not
+landed. Until that dependency lands, production terminals remain `FINISHED`.
+The adapter's synthetic-input tests cover optional-field interpretation and
+ABORTED-over-FINISHED precedence, not production cancellation delivery.
+When #7681 lands, pin the producer/adapter contract with a real
+`OmniSchedulerOutput` test so a field rename cannot silently drop ABORTED.
 `REPLACED` belongs to item 5.
 Hit payloads describe prefixes `[0, hit_end)`; arbitrary read ranges and
 resume delivery watermarks are follow-up contracts, not inferred here.
