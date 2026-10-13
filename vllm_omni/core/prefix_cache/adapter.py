@@ -76,9 +76,9 @@ class PrefixCacheSchedulerAdapter:
     the old request before starting the new one. EXTENDED covers ordinary
     decode, chunked prefill and a live ID re-entering scheduled_new_reqs.
 
-    ``aborted_req_ids`` is deliberately optional: current vLLM/Omni scheduler
-    outputs do not carry an explicit abort side channel yet. Finished IDs are
-    never guessed to be aborted; ABORTED requires an explicit producer.
+    Explicit cancellation fields (``discarded_req_ids`` from the Omni
+    scheduler and optional ``aborted_req_ids``) produce ABORTED. Without
+    either side channel, finished IDs are not guessed to be aborted.
     """
 
     def __init__(self) -> None:
@@ -108,6 +108,7 @@ class PrefixCacheSchedulerAdapter:
         resumed = {str(req_id) for req_id in (getattr(cached, "resumed_req_ids", ()) or ())}
         finished = {str(req_id) for req_id in (getattr(scheduler_output, "finished_req_ids", ()) or ())}
         aborted = {str(req_id) for req_id in (getattr(scheduler_output, "aborted_req_ids", ()) or ())}
+        aborted.update(str(req_id) for req_id in (getattr(scheduler_output, "discarded_req_ids", ()) or ()))
         scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", {}) or {}
         terminal_ids = finished | aborted
 
@@ -134,7 +135,7 @@ class PrefixCacheSchedulerAdapter:
                     PrefixCacheEventKind.STARTED,
                     hit_end=computed_tokens,
                     block_ids=blocks,
-                    scheduled_tokens=int(scheduled_tokens.get(req_id, 0)),
+                    scheduled_tokens=max(0, int(scheduled_tokens.get(req_id, 0))),
                 )
             )
 
@@ -155,7 +156,7 @@ class PrefixCacheSchedulerAdapter:
                     PrefixCacheEventKind.RESUMED,
                     hit_end=int(computed[index]) if index < len(computed) else 0,
                     block_ids=self._blocks_value(new_blocks[index]) if index < len(new_blocks) else (),
-                    scheduled_tokens=int(scheduled_tokens.get(req_id, 0)),
+                    scheduled_tokens=max(0, int(scheduled_tokens.get(req_id, 0))),
                     num_output_tokens=int(output_tokens[index]) if index < len(output_tokens) else 0,
                 )
             )
@@ -167,7 +168,7 @@ class PrefixCacheSchedulerAdapter:
             self._observed_req_ids.add(req_id)
             events.append(
                 PrefixCacheRequestEvent(
-                    req_id, PrefixCacheEventKind.RESUMED, scheduled_tokens=int(scheduled_tokens.get(req_id, 0))
+                    req_id, PrefixCacheEventKind.RESUMED, scheduled_tokens=max(0, int(scheduled_tokens.get(req_id, 0)))
                 )
             )
             emitted.add(req_id)
@@ -176,7 +177,11 @@ class PrefixCacheSchedulerAdapter:
         for raw_req_id, raw_count in scheduled_tokens.items():
             req_id, count = str(raw_req_id), int(raw_count)
             if count < 0:
-                raise OmniPrefixCacheUnmatchError(f"negative scheduled token count for req {req_id}: {count}")
+                if any(e.req_id == req_id and e.kind is PrefixCacheEventKind.STARTED and e.hit_end > 0 for e in events):
+                    raise OmniPrefixCacheUnmatchError(f"negative scheduled token count for req {req_id}: {count}")
+                # #5269: ordinary non-positive spans are no-ops. A STARTED
+                # hit cannot use a negative count to size its prefetch buffer.
+                count = 0
             counts.append((req_id, count))
             if count > 0 and req_id in self._observed_req_ids and req_id not in emitted:
                 extended.append(req_id)

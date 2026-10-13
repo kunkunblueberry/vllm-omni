@@ -562,7 +562,7 @@ class OmniPrefixCacheManager:
         *,
         num_tokens_unpadded: int,
         num_tokens_padded: int,
-        write_layout: PrefixCacheWriteLayout | None = None,
+        write_layout: PrefixCacheWriteLayout,
     ) -> int:
         """Write this step's outputs into the cache; returns the step id.
 

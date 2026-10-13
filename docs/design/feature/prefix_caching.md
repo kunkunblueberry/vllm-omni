@@ -312,8 +312,9 @@ It covers ordinary decode, chunked prefill and IDs re-entering
 order. Terminal events precede arrivals, so same-step ID reuse finishes the old request
 before `STARTED` classifies the new one. The manager keeps write/resource
 bookkeeping only, with no second `live_reqs` lifecycle classifier.
-`ABORTED` requires an explicit `aborted_req_ids` producer; without that
-side channel aborts remain `FINISHED`. `REPLACED` belongs to item 5.
+`ABORTED` requires explicit `discarded_req_ids` (Omni scheduler) or optional
+`aborted_req_ids`; without either side channel finished IDs remain `FINISHED`.
+`REPLACED` belongs to item 5.
 Hit payloads describe prefixes `[0, hit_end)`; arbitrary read ranges and
 resume delivery watermarks are follow-up contracts, not inferred here.
 
@@ -372,6 +373,14 @@ captured counts. Before saving any rows, the manager cross-checks layout
 counts against the captured step for each prefix hit under `_state_lock`.
 A disagreement (including an omitted hit request) raises
 `OmniPrefixCacheUnmatchError` instead of merging into a wrongly sized buffer.
+
+Ordinary negative scheduled spans are normalized to zero (the runner's
+non-positive-span no-op contract). A negative count for a `STARTED` prefix
+hit raises before manager prefetch; write layouts still reject negative
+counts supplied independently. Runner initialization creates manager,
+adapter and view together; a partial unit fails before the forward.
+Shutdown stops the manager and clears the adapter, view, step snapshot and
+staged config together, releasing the view's reference to the input batch.
 
 Each step id is consumed exactly once. `req_ids` must be a subset of the save
 snapshot. At most `staging_depth` unused step ids may exist at once: every

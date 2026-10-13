@@ -339,7 +339,7 @@ def test_manager_trusts_started_event_without_a_second_lifecycle_table():
         mgr.shutdown()
 
 
-@pytest.mark.parametrize("terminal", ["finished", "aborted"])
+@pytest.mark.parametrize("terminal", ["finished", "aborted", "discarded"])
 def test_same_step_terminal_id_reuse_merges_only_the_new_start(terminal):
     mgr, view = make_manager()
     try:
@@ -352,7 +352,7 @@ def test_same_step_terminal_id_reuse_merges_only_the_new_start(terminal):
             # explicit side channel as a real producer would supply it.
             adapter = mgr._test_adapter
             sched = FakeSchedOut(new_reqs=[FakeNewReq("a", 4, [[0, 1]])], num_scheduled={"a": 1})
-            sched.aborted_req_ids = {"a"}
+            setattr(sched, f"{terminal}_req_ids", {"a"})
             mgr.new_step_starts(adapter.translate_step(sched))
             view.order = ["a"]
             view.req_blocks["a"] = [0, 1]
@@ -374,11 +374,14 @@ def test_same_step_terminal_id_reuse_merges_only_the_new_start(terminal):
         mgr.shutdown()
 
 
-def test_save_requires_write_layout_with_cache_contract_error():
+def test_save_requires_write_layout_before_waiting(monkeypatch):
     mgr, _ = make_manager()
+    waited = []
+    monkeypatch.setattr(mgr, "_wait_for_host_ready", lambda: waited.append(True))
     try:
-        with pytest.raises(OmniPrefixCacheUnmatchError, match="adapter-produced write_layout"):
+        with pytest.raises(TypeError, match="write_layout"):
             mgr.save_outputs(torch.zeros(1, HIDDEN), {}, num_tokens_unpadded=1, num_tokens_padded=1)
+        assert not waited
     finally:
         mgr.shutdown()
 

@@ -340,5 +340,37 @@ def test_negative_scheduled_tokens_fail_at_step_boundary(count, hit_end):
         new=[SimpleNamespace(req_id="r", num_computed_tokens=hit_end, block_ids=[[0, 1]])],
         scheduled={"r": count},
     )
-    with pytest.raises(OmniPrefixCacheUnmatchError, match=f"negative scheduled token count for req r: {count}"):
-        PrefixCacheSchedulerAdapter().translate_step(scheduler_output)
+    adapter = PrefixCacheSchedulerAdapter()
+    if hit_end:
+        with pytest.raises(OmniPrefixCacheUnmatchError, match=f"negative scheduled token count for req r: {count}"):
+            adapter.translate_step(scheduler_output)
+    else:
+        step = adapter.translate_step(scheduler_output)
+        assert step.scheduled_tokens == (("r", 0),)
+        assert step.events[0].scheduled_tokens == 0
+        assert step.events[0].kind is PrefixCacheEventKind.STARTED
+
+
+def test_discarded_ids_are_aborted_and_retired_before_id_reuse():
+    adapter = PrefixCacheSchedulerAdapter()
+    adapter.translate_step(output(new=[SimpleNamespace(req_id="r")]))
+    scheduler_output = output(new=[SimpleNamespace(req_id="r")], finished={"r", "f"}, aborted={"a"})
+    scheduler_output.discarded_req_ids = {"r", 7}
+    step = adapter.translate_step(scheduler_output)
+    assert [(event.req_id, event.kind) for event in step.events] == [
+        ("7", PrefixCacheEventKind.ABORTED),
+        ("a", PrefixCacheEventKind.ABORTED),
+        ("f", PrefixCacheEventKind.FINISHED),
+        ("r", PrefixCacheEventKind.ABORTED),
+        ("r", PrefixCacheEventKind.STARTED),
+    ]
+
+
+def test_negative_continuation_does_not_become_a_new_hit():
+    adapter = PrefixCacheSchedulerAdapter()
+    adapter.translate_step(output(new=[SimpleNamespace(req_id="r")]))
+    step = adapter.translate_step(
+        output(new=[SimpleNamespace(req_id="r", num_computed_tokens=8, block_ids=[[0, 1]])], scheduled={"r": -1})
+    )
+    assert step.events == ()
+    assert step.scheduled_tokens == (("r", 0),)
