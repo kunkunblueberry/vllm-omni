@@ -674,9 +674,9 @@ class DiffusionEngine:
             except Exception as exc:
                 if self._closed:
                     return
-                if step_retirement and not sched_output.scheduled_request_ids:
-                    # Cleanup failed after schedule consumed the retirement IDs.
-                    # Stop workers before releasing state rather than losing them.
+                if step_retirement:
+                    # RPC failure cannot confirm retirement, even with active rows.
+                    # schedule() consumed these IDs; do not silently lose cleanup.
                     self._fail_engine(exc)
                     return
                 worker_execution_completed = False

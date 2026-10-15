@@ -142,6 +142,8 @@ class MingImageForConditionalGeneration(MingFlashOmniThinkerForConditionalGenera
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         torch.nn.Module.__init__(self)
+        if vllm_config.scheduler_config.enable_chunked_prefill:
+            raise ValueError("Ming-Image query embeddings require enable_chunked_prefill=False")
         thinker_config = vllm_config.model_config.hf_config
         if not isinstance(thinker_config, BailingMM2Config):
             raise TypeError(f"Expected BailingMM2Config, got {type(thinker_config).__name__}")

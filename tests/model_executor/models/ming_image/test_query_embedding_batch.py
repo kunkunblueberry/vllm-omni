@@ -92,3 +92,9 @@ def test_embed_input_ids_merges_reference_and_injects_every_packed_query():
     for start in (260, 519):
         torch.testing.assert_close(output[start : start + 256], model.query_tokens_dict["16x16"], rtol=0, atol=0)
     assert torch.all(output[[0, 257, 258, 259, 516, 517, 518, 775]] == -19)
+
+
+def test_chunked_prefill_is_rejected_before_model_or_checkpoint_construction():
+    config = SimpleNamespace(scheduler_config=SimpleNamespace(enable_chunked_prefill=True))
+    with pytest.raises(ValueError, match="Ming-Image.*enable_chunked_prefill=False"):
+        MingImageForConditionalGeneration(vllm_config=config)

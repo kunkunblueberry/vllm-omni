@@ -195,15 +195,17 @@ def test_client_abort_retires_step_rows_without_following_request(monkeypatch, t
         assert not engine.worker_thread.is_alive(), "busy loop did not stop"
 
 
-def test_failed_step_retirement_stops_workers_before_scheduler_close(monkeypatch):
-    case = _abort_engine(monkeypatch, "idle", ("a",))
+@pytest.mark.parametrize("peers", [("a",), ("a", "b")])
+def test_failed_step_retirement_stops_workers_before_scheduler_close(monkeypatch, peers):
+    case = _abort_engine(monkeypatch, "idle", peers)
     engine = case.engine
     rpc = engine.executor.collective_rpc
     scheduler_close = case.scheduler.close
     closed = []
 
     def fail_retirement(method, *, args, **kwargs):
-        if not args[0].scheduled_request_ids:
+        if "a" in args[0].finished_req_ids:
+            assert set(args[0].scheduled_request_ids) == set(peers) - {"a"}
             raise RuntimeError("injected retirement failure")
         return rpc(method, args=args, **kwargs)
 
@@ -228,6 +230,10 @@ def test_failed_step_retirement_stops_workers_before_scheduler_close(monkeypatch
         assert engine._out_streams["a"].qsize() == 1
         output = engine._out_streams["a"].get_nowait()
         assert output.finished and "injected retirement failure" in output.error
+        if "b" in peers:
+            assert engine._out_streams["b"].qsize() == 1
+            peer_output = engine._out_streams["b"].get_nowait()
+            assert peer_output.finished and "injected retirement failure" in peer_output.error
     finally:
         case.release.set()
         with engine._cv:

@@ -36,6 +36,7 @@ def test_typed_ming_profiles_select_runtime_client(
     config = VllmOmniConfig.from_pipeline_config(MING_IMAGE_PIPELINE, user_deploy_config=deploy)
     assert [stage.runtime_config.devices for stage in config.stage_configs] == devices
     assert config.stage_by_id(0).scheduler_config.max_num_seqs == capacity
+    assert config.stage_by_id(0).scheduler_config.enable_chunked_prefill is False
     stage = config.stage_by_id(1)
     assert stage.scheduler_config.max_num_seqs == capacity
     assert stage.parallel_config.cfg_parallel_size == cfg_size

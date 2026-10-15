@@ -29,7 +29,19 @@ def _state(name, *, prompt=None, extra=None):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("invalid", ["negative_prompt", "multiple_references", "zero_layers"])
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "negative_prompt",
+        "multiple_references",
+        "zero_layers",
+        "string_layers",
+        "null_layers",
+        "list_layers",
+        "dict_layers",
+        "infinite_layers",
+    ],
+)
 async def test_real_ming_bridge_rejection_retires_only_bad_request_and_allows_next(invalid):
     ar = FakeStageClient()
     dit = FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
@@ -41,7 +53,14 @@ async def test_real_ming_bridge_rejection_retires_only_bad_request_and_allows_ne
     elif invalid == "multiple_references":
         prompt["multi_modal_data"] = {"img2img": [object(), object()]}
     else:
-        extra["num_layers"] = 0
+        extra["num_layers"] = {
+            "zero_layers": 0,
+            "string_layers": "abc",
+            "null_layers": None,
+            "list_layers": [],
+            "infinite_layers": float("inf"),
+            "dict_layers": {},
+        }[invalid]
     bad, peer = _state("bad", prompt=prompt, extra=extra), _state("peer")
     orchestrator.request_states.update(bad=bad, peer=peer)
     for pool in orchestrator.stage_pools:

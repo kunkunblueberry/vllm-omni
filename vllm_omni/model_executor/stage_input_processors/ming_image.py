@@ -103,7 +103,10 @@ def thinker2image(
         if reference is not None:
             extra["reference_image"] = reference
 
-    num_layers = int(extra_args.get("num_layers", 1))
+    try:
+        num_layers = int(extra_args.get("num_layers", 1))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise OmniClientError("num_layers must be an integer of at least 1.") from exc
     if num_layers < 1:
         raise OmniClientError("num_layers must be at least 1.")
     extra["num_layers"] = num_layers

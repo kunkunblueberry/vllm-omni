@@ -253,7 +253,8 @@ native scheduler/VAE parity, serving or CUDA graph replay.
 
 ## Validated end-to-end scope
 
-The Design and Design-Layer checkpoints have been exercised through the complete
+Before the final review fixes below, the Design and Design-Layer checkpoints were
+exercised through the complete
 online image-generation path: HTTP chat completions, the AR model, captured query
 and direct conditions, the shared-memory stage connector, step-batched DiT
 execution, VAE decode, and RGBA responses. This is functional end-to-end validation,
@@ -283,6 +284,23 @@ checkpoint CFG-parallel-size-2 serving, full-model compiled/CUDA-graph serving,
 default-mode bitwise batch invariance, and vendor image accuracy remain outside
 this end-to-end validation claim. Continuous batching does not imply a throughput
 improvement for every checkpoint or workload.
+
+### Final review fixes and validation boundary
+
+The subsequent review fixes convert malformed `num_layers` values to request-scoped
+client errors, fail closed when a mixed active/retirement RPC cannot confirm
+cleanup, and reject AR chunked prefill before model loading. All four Ming
+deployment profiles now set `enable_chunked_prefill: false`. This disables
+splitting one AR prompt across prefill chunks; request-level continuous batching
+remains enabled by the throughput profile. Custom deployments must also disable
+chunked prefill. Full-prompt prefill requires a token budget large enough for the
+supported prompt length.
+
+These final fixes have targeted local CPU source-body regression and static-check
+coverage, but normal-import and GPU serving tests have not been rerun after them.
+The end-to-end evidence above therefore describes the preceding validated version,
+not a fresh end-to-end certification of the final snapshot. Use the commands below
+to repeat validation in a supported runtime before upstream integration.
 
 With a matching Linux runtime and both checkpoints already present locally:
 
