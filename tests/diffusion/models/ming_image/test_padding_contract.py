@@ -68,6 +68,7 @@ def _attention():
     attention.head_dim = 4
     attention.norm_q = attention.norm_k = nn.Identity()
     attention.rope = RotaryEmbedding(is_neox_style=False)
+    attention.rope._forward_method = attention.rope.forward_native
     attention.attn = shared
     attention.to_out = nn.ModuleList([nn.Identity()])
     return attention

@@ -227,6 +227,39 @@ def _restore_linear_output_shape(output: torch.Tensor, input_: torch.Tensor) -> 
     return output
 
 
+class ZImageRotaryEmbedding(RotaryEmbedding):
+    """Keep the checkpoint's FP32 complex rotation before rounding Q/K."""
+
+    def forward(self, x, cos, sin):
+        if not self.half_head_dim:
+            cos = cos[..., ::2]
+            sin = sin[..., ::2]
+        rotary_dim = cos.shape[-1] * 2
+        pairs = torch.view_as_complex(x[..., :rotary_dim].float().reshape(*x.shape[:-1], -1, 2))
+        frequencies = torch.complex(cos.float(), sin.float()).unsqueeze(-2)
+        rotated = torch.view_as_real(pairs * frequencies).flatten(-2)
+        return torch.cat((rotated.to(x.dtype), x[..., rotary_dim:]), dim=-1)
+
+
+def _apply_batched_rope(rope, query, key, cos, sin):
+    query_dtype, key_dtype = query.dtype, key.dtype
+    # Ming/Z-Image's reference rotates in FP32 and rounds Q/K only once.
+    query, key = query.float(), key.float()
+    cos, sin = cos.float(), sin.float()
+    if cos.ndim == 3 and cos.shape[:2] == query.shape[:2]:
+        query_shape, key_shape = query.shape, key.shape
+        query, key = apply_rope_to_qk(
+            rope,
+            query.flatten(0, 1).unsqueeze(0),
+            key.flatten(0, 1).unsqueeze(0),
+            (cos.flatten(0, 1), sin.flatten(0, 1)),
+        )
+        query, key = query.reshape(query_shape), key.reshape(key_shape)
+    else:
+        query, key = apply_rope_to_qk(rope, query, key, (cos, sin))
+    return query.to(query_dtype), key.to(key_dtype)
+
+
 class TimestepEmbedder(nn.Module):
     def __init__(
         self, out_size, mid_size=None, frequency_embedding_size=256, quant_config: "QuantizationConfig | None" = None
@@ -321,7 +354,7 @@ class ZImageAttention(nn.Module):
             causal=False,
             num_kv_heads=self.to_qkv.num_kv_heads,
         )
-        self.rope = RotaryEmbedding(is_neox_style=False)
+        self.rope = ZImageRotaryEmbedding(is_neox_style=False)
 
     def forward(
         self,
@@ -343,7 +376,7 @@ class ZImageAttention(nn.Module):
         query = self.norm_q(query)
         key = self.norm_k(key)
 
-        query, key = apply_rope_to_qk(self.rope, query, key, (cos, sin))
+        query, key = _apply_batched_rope(self.rope, query, key, cos, sin)
         # Cast to correct dtype
         dtype = query.dtype
         query, key = query.to(dtype), key.to(dtype)

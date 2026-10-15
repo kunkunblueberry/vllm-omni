@@ -483,6 +483,8 @@ class OnlineOmniClient:
         """Wall clock from *before* ``chat.completions.create`` through image decode."""
         result = DiffusionResponse()
         try:
+            if getattr(chat_completion, "error", None):
+                raise ValueError(f"Diffusion response contains an error: {chat_completion.error}")
             images = []
             audios = []
             for choice in chat_completion.choices:
@@ -495,9 +497,9 @@ class OnlineOmniClient:
                         else:
                             image_url_obj = getattr(item, "image_url", None)
                             image_url = getattr(image_url_obj, "url", None) if image_url_obj else None
-                        if image_url and image_url.startswith("data:image"):
+                        if image_url and image_url.startswith("data:image/"):
                             b64_data = image_url.split(",", 1)[1]
-                            img = Image.open(io.BytesIO(base64.b64decode(b64_data)))
+                            img = Image.open(io.BytesIO(base64.b64decode(b64_data, validate=True)))
                             img.load()
                             images.append(img)
 
@@ -512,6 +514,8 @@ class OnlineOmniClient:
                             "expires_at": getattr(audio_obj, "expires_at", None),
                         }
                     )
+            if not images and not audios:
+                raise ValueError("Diffusion response contains no decoded media")
             result.images = images if images else None
             result.audios = audios if audios else None
             result.e2e_latency = time.perf_counter() - wall_start
@@ -1615,6 +1619,7 @@ class OnlineOmniClient:
         Send OpenAI requests for diffusion models.
         If ``extra_body`` has list ``height``/``width``, sends one chat completion per index in parallel
         (scalar h/w, ``num_outputs_per_prompt=1`` each) and merges images in list order.
+        A list of request configurations returns responses in input order, not completion order.
 
         Args:
             request_config: A single request configuration dict, or a list of
@@ -1646,6 +1651,7 @@ class OnlineOmniClient:
                 raise ValueError("request_config list must not be empty")
             if request_num != 1:
                 raise ValueError("request_num is not supported when request_config is a list")
+            ordered_responses: list[DiffusionResponse | None] = [None] * len(request_config)
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(request_config)) as executor:
                 futures = {
                     executor.submit(_create_from_config, cfg): (i + 1, cfg) for i, cfg in enumerate(request_config)
@@ -1661,8 +1667,9 @@ class OnlineOmniClient:
                         )
                     else:
                         self._print_client_stat(f"[diffusion] request#{request_idx} completed")
-                    responses.append(response)
-            return responses
+                    ordered_responses[request_idx - 1] = response
+            assert all(response is not None for response in ordered_responses)
+            return cast(list[DiffusionResponse], ordered_responses)
 
         size_splits = _split_request_config_by_per_output_sizes(request_config)
         if size_splits is not None:

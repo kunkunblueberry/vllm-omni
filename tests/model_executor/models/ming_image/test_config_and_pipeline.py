@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -297,28 +298,20 @@ def test_stage1_compile_uses_configured_dynamic_regional_cuda_graph(monkeypatch)
     assert pipeline._uses_cudagraph_trees
 
 
-def test_explicit_pipeline_loads_component_config_without_model_index(monkeypatch):
+def test_explicit_pipeline_loads_component_config_without_model_index(tmp_path):
     transformer_config = {
         "_class_name": "DiffusionTransformer",
         "alignment_padding_mode": "zero_masked",
         "multi_frame_output": False,
     }
 
-    def _get_hf_file_to_dict(filename, model, revision=None):
-        del model, revision
-        return transformer_config if filename == "transformer/config.json" else None
-
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.utils.hf_utils.get_diffusion_model_index",
-        lambda *_args, **_kwargs: None,
-    )
-    monkeypatch.setattr(
-        "vllm.transformers_utils.config.get_hf_file_to_dict",
-        _get_hf_file_to_dict,
-    )
+    transformer_dir = tmp_path / "transformer"
+    transformer_dir.mkdir()
+    (transformer_dir / "config.json").write_text(json.dumps(transformer_config))
+    assert not (tmp_path / "model_index.json").exists()
 
     config = OmniDiffusionConfig(
-        model="org/model",
+        model=str(tmp_path),
         model_class_name="MingImageDiffusionPipeline",
     )
     config.enrich_config()

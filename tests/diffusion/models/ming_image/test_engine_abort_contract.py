@@ -137,7 +137,10 @@ def _abort_engine(monkeypatch, timing, peers):
     )
 
 
-@pytest.mark.parametrize(("timing", "peers"), [("idle", ("a",)), ("midwave", ("a",)), ("midwave", ("a", "b"))])
+@pytest.mark.parametrize(
+    ("timing", "peers"),
+    [("idle", ("a",)), ("midwave", ("a",)), ("idle", ("a", "b")), ("midwave", ("a", "b"))],
+)
 def test_client_abort_retires_step_rows_without_following_request(monkeypatch, timing, peers):
     case = _abort_engine(monkeypatch, timing, peers)
     engine = case.engine
@@ -168,7 +171,8 @@ def test_client_abort_retires_step_rows_without_following_request(monkeypatch, t
         if "b" in peers:
             survivor = next(output for name, output in terminals if name == "b")
             assert not survivor.aborted and survivor.error is None and survivor.output is not None
-            assert [ids for ids, _ in case.calls if ids] == [["a", "b"], ["a", "b"], ["b"]]
+            expected_calls = [["a", "b"], ["b"], ["b"]] if timing == "idle" else [["a", "b"], ["a", "b"], ["b"]]
+            assert [ids for ids, _ in case.calls if ids] == expected_calls
         else:
             assert sum(bool(ids) for ids, _ in case.calls) == (1 if timing == "idle" else 2)
         assert any("a" in finished for _, finished in case.calls), "abort ID never reached worker"

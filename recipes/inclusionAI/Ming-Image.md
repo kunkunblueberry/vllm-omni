@@ -251,6 +251,59 @@ repeated compiled shapes, CFG ranks and checkpoint numerical parity on the serve
 Restricted local source diagnostics do not establish full production imports,
 native scheduler/VAE parity, serving or CUDA graph replay.
 
+## Validated end-to-end scope
+
+The Design and Design-Layer checkpoints have been exercised through the complete
+online image-generation path: HTTP chat completions, the AR model, captured query
+and direct conditions, the shared-memory stage connector, step-batched DiT
+execution, VAE decode, and RGBA responses. This is functional end-to-end validation,
+not an image-quality comparison against the vendor implementation.
+
+The validated placement used three RTX 4080 SUPER GPUs with the original BF16
+checkpoints: AR TP2 on devices 0 and 1, and DiT TP1 / CFG parallel size 1 on device
+2. Both stages were eager, diffusion attention used `TORCH_SDPA`, and exact
+batch-versus-singleton comparisons enabled `VLLM_BATCH_INVARIANT=1`. The deployment
+fixture in the expansion module builds this placement from the throughput profile;
+the unmodified throughput YAML uses a different placement.
+
+Coverage includes eight distinct prompts with seeds 0 through 7 and unequal
+3/4/5-step schedules for both checkpoints, exact decoded-pixel comparisons with
+each request's singleton output, actual multi-request denoise waves, Layer
+reference input and composite-plus-layer RGBA outputs, non-square geometry,
+guidance defaults, and shape/frame-count replay. An additional live-server error
+sequence verifies that rejected requests do not prevent a later valid request
+from reproducing its seeded output. Unsupported negative prompts return HTTP 400;
+some worker-side invalid geometry, step-count, and reference errors still return
+request-scoped HTTP 500 responses.
+
+The weight-backed late-admission and cancellation checks separately exercise the
+production scheduler, InputBatch, runner and engine with transport boundaries
+isolated. They are not proof of HTTP-disconnect or native-KV cancellation. Full
+checkpoint CFG-parallel-size-2 serving, full-model compiled/CUDA-graph serving,
+default-mode bitwise batch invariance, and vendor image accuracy remain outside
+this end-to-end validation claim. Continuous batching does not imply a throughput
+improvement for every checkpoint or workload.
+
+With a matching Linux runtime and both checkpoints already present locally:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 model_prefix= MING_IMAGE_CHECKPOINT_ROOT=/models \
+  python -m pytest -sv \
+  tests/e2e/online_serving/test_ming_image_0_1_design_expansion.py \
+  -m 'full_model and diffusion and H100 and cards_3' --run-level full_model
+
+CUDA_VISIBLE_DEVICES=0,1,2 model_prefix= MING_IMAGE_CHECKPOINT_ROOT=/models \
+  python -m pytest -sv \
+  tests/dfx/reliability/invalid_param_test/test_invalid_omni_chat.py \
+  -k ming_chat_error_retirement --run-level full_model
+```
+
+`MING_IMAGE_CHECKPOINT_ROOT` must contain both model directories including their
+`mllm`, sibling `mlp`, `transformer`, and VAE components. The H100 marker is the
+repository's test-routing convention, not the hardware used for the reported
+manual run. These local-checkpoint expansion cases are not yet wired to an
+automatic nightly checkpoint-provisioning job.
+
 ## Notes
 
 - The default deployment keeps Stage 0 eager and enables dynamic regional

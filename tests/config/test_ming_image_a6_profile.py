@@ -29,7 +29,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
         ("ming_image_throughput.yaml", ["0", "1"], 1, False, 2, True),
     ],
 )
-def test_typed_ming_profiles_select_runtime_client(monkeypatch, profile, devices, cfg_size, inline, capacity, step):
+def test_typed_ming_profiles_select_runtime_client(
+    monkeypatch, tmp_path, profile, devices, cfg_size, inline, capacity, step
+):
     deploy = load_deploy_config(get_deploy_config_path(profile))
     config = VllmOmniConfig.from_pipeline_config(MING_IMAGE_PIPELINE, user_deploy_config=deploy)
     assert [stage.runtime_config.devices for stage in config.stage_configs] == devices
@@ -42,7 +44,7 @@ def test_typed_ming_profiles_select_runtime_client(monkeypatch, profile, devices
 
     runtime = stage_runtime.StageRuntime(
         stage_configs=list(config.stage_configs),
-        model="local-ming",
+        model=str(tmp_path),
         config_path=None,
         stage_init_timeout=1,
         async_chunk=False,
@@ -83,9 +85,9 @@ def test_typed_ming_profiles_select_runtime_client(monkeypatch, profile, devices
     monkeypatch.setattr(
         stage_init_utils,
         "current_omni_platform",
-        SimpleNamespace(device_control_env_var=None, get_device_count=lambda: 3),
+        SimpleNamespace(device_control_env_var=None, get_device_count=lambda: 3, is_rocm=lambda: False),
     )
-    od_config = stage_init_utils.build_diffusion_config("local-ming", stage, plan.metadata)
+    od_config = stage_init_utils.build_diffusion_config(str(tmp_path), stage, plan.metadata)
     assert od_config.parallel_config.cfg_parallel_size == cfg_size
     assert od_config.num_gpus == cfg_size
     assert od_config.max_num_seqs == capacity
@@ -103,7 +105,7 @@ def test_typed_ming_profiles_select_runtime_client(monkeypatch, profile, devices
         stage_diffusion_client.StageDiffusionClient, "from_addresses", lambda *args, **kwargs: proc_client
     )
     result = stage_diffusion_client.create_diffusion_client(
-        "local-ming", od_config, plan.metadata, 1, use_inline=captured["use_inline"]
+        str(tmp_path), od_config, plan.metadata, 1, use_inline=captured["use_inline"]
     )
     assert result is (inline_client if inline else proc_client)
 

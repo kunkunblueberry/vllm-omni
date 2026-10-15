@@ -4,16 +4,30 @@
 
 from __future__ import annotations
 
+import base64
+import io
 import json
+import os
+from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
+from PIL import Image, ImageDraw
 
-from tests.helpers.mark import hardware_test
-from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient, dummy_messages_from_mix_data
+from tests.helpers.assertions import assert_diffusion_images_equal, assert_http_error_payload
+from tests.helpers.fixtures.runtime import omni_fixture_lock
+from tests.helpers.mark import hardware_marks, hardware_test
+from tests.helpers.runtime import (
+    OmniServer,
+    OmniServerParams,
+    OnlineOmniClient,
+    dummy_messages_from_mix_data,
+    iter_omni_server,
+)
 from tests.helpers.stage_config import get_deploy_config_path
 
-pytestmark = [pytest.mark.slow, pytest.mark.omni]
+pytestmark = [pytest.mark.slow]
 
 
 def _minimal_chat_json(omni_server: OmniServer) -> dict[str, object]:
@@ -89,6 +103,7 @@ def _chat_completions_request_without_expectations(omni_server: OmniServer, case
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize(
     "case_id, err_code, err_message",
@@ -177,6 +192,7 @@ def test_chat_completions_invalid_requests(
 _VIDEO_CHAT_WS_SESSION_MODALITIES_SCALAR = object()
 
 
+@pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize(
     "send_frames_spec, err_message",
@@ -221,6 +237,7 @@ _REALTIME_WS_MODEL_MISMATCH = object()
 _REALTIME_WS_INVALID_AUDIO_APPEND = object()
 
 
+@pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize(
     "send_frames_spec, ws_error_code, err_message",
@@ -292,3 +309,159 @@ def test_realtime_invalid_requests(
             "err_message": err_message,
         }
     )
+
+
+# ─── POST /v1/chat/completions: local Ming image diffusion ────────────────────
+# Linux prerequisites and invocation (no HF downloads; three CUDA cards):
+# model_prefix= MING_IMAGE_CHECKPOINT_ROOT=/models CUDA_VISIBLE_DEVICES=0,1,2 \
+#   pytest -sv tests/dfx/reliability/invalid_param_test/test_invalid_omni_chat.py \
+#   -k ming -m 'slow and diffusion and H100 and cards_3' --run-level full_model
+_MING_IMAGE_SERVERS = [
+    pytest.param(checkpoint, id=case_id, marks=hardware_marks(res={"cuda": "H100"}, num_cards=3))
+    for checkpoint, case_id in (
+        ("Ming-Image-0.1-Design", "design"),
+        ("Ming-Image-0.1-Design-Layer", "layer"),
+    )
+]
+
+
+@pytest.fixture(scope="module")
+def omni_server(request, run_level, tmp_path_factory):
+    """Keep existing servers unchanged; prepare the Ming local three-card deploy."""
+    if isinstance(request.param, OmniServerParams):
+        yield from iter_omni_server(request, run_level, omni_fixture_lock)
+        return
+    root = os.environ.get("MING_IMAGE_CHECKPOINT_ROOT")
+    if not root:
+        pytest.fail("Set MING_IMAGE_CHECKPOINT_ROOT to the prepared local checkpoint parent")
+    if os.environ.get("model_prefix"):
+        pytest.fail("Unset model_prefix: Ming checkpoints are absolute local paths")
+    model = Path(root).resolve() / request.param
+    for component in ("mllm", "transformer"):
+        if not (model / component / "config.json").is_file():
+            pytest.fail(f"Missing prepared checkpoint: {model / component / 'config.json'}")
+    deploy = yaml.safe_load(Path(get_deploy_config_path("ming_image_throughput.yaml")).read_text())
+    ar, dit = deploy["stages"]
+    ar.update(
+        tensor_parallel_size=2,
+        devices="0,1",
+        gpu_memory_utilization=0.8,
+        max_model_len=2048,
+        max_num_batched_tokens=2048,
+    )
+    dit.update(devices="2", enforce_eager=True)
+    dit.pop("diffusion_compile_granularity", None)
+    dit.pop("diffusion_compile_dynamic", None)
+    dit["engine_args"]["diffusion_attention_config"] = {"default": {"backend": "TORCH_SDPA"}}
+    config = tmp_path_factory.mktemp("ming-invalid-chat") / "ming_tp2_step.yaml"
+    config.write_text(yaml.safe_dump(deploy, sort_keys=False))
+    request.param = OmniServerParams(
+        model=str(model),
+        stage_config_path=str(config),
+        env_dict={
+            "VLLM_BATCH_INVARIANT": "1",
+            "VLLM_NO_USAGE_STATS": "1",
+            "VLLM_USE_FLASHINFER_SAMPLER": "0",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "OMP_NUM_THREADS": "4",
+        },
+        startup_timeout=360,
+    )
+    # Weekly reliability defaults to core_model; never substitute tiny weights here.
+    yield from iter_omni_server(request, "full_model", omni_fixture_lock)
+
+
+@pytest.fixture(scope="module")
+def ming_reference_url():
+    image = Image.new("RGBA", (64, 64), (240, 240, 240, 255))
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((8, 8, 40, 40), fill=(230, 30, 30, 255))
+    draw.rectangle((20, 46, 55, 57), fill=(25, 80, 220, 255))
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+
+def _minimal_ming_chat_json(omni_server, reference):
+    layered = Path(omni_server.model).name.endswith("-Layer")
+    text = "a cup of coffee on a table"
+    if layered:
+        text = "Decompose into two layers: red circle and blue rectangle. " + text
+    content = (
+        [{"type": "image_url", "image_url": {"url": reference}}, {"type": "text", "text": text}] if layered else text
+    )
+    extra = {"height": 64, "width": 64, "seed": 0, "num_inference_steps": 3}
+    if layered:
+        extra["num_layers"] = 2
+    return {
+        "model": omni_server.model,
+        "messages": [{"role": "user", "content": content}],
+        "modalities": ["image"],
+        "extra_body": extra,
+    }
+
+
+@pytest.mark.diffusion
+@pytest.mark.local_model
+@pytest.mark.parametrize("omni_server", _MING_IMAGE_SERVERS, indirect=True)
+@pytest.mark.parametrize(
+    "override",
+    [
+        pytest.param({"height": 17}, id="unaligned_height"),
+        pytest.param({"num_inference_steps": 0}, id="zero_steps"),
+        pytest.param({"negative_prompt": "avoid blur"}, id="unsupported_negative_prompt"),
+    ],
+)
+def test_ming_chat_invalid_diffusion_parameters(omni_server, online_client, ming_reference_url, override):
+    body = _minimal_ming_chat_json(omni_server, ming_reference_url)
+    body["extra_body"].update(override)
+    responses = online_client.send_chat_completions_http_request(
+        {"json": body, "timeout": 30, "err_code": 400 if "negative_prompt" in override else tuple(range(400, 600))}
+    )
+    assert_http_error_payload(responses[0])
+
+
+@pytest.mark.diffusion
+@pytest.mark.local_model
+@pytest.mark.parametrize("omni_server", [_MING_IMAGE_SERVERS[1]], indirect=True)
+def test_ming_layer_chat_requires_reference_image(omni_server, online_client, ming_reference_url):
+    body = _minimal_ming_chat_json(omni_server, ming_reference_url)
+    body["messages"][0]["content"] = "a cup of coffee on a table"
+    responses = online_client.send_chat_completions_http_request(
+        {"json": body, "timeout": 30, "err_code": tuple(range(400, 600))}
+    )
+    assert_http_error_payload(responses[0])
+
+
+@pytest.mark.diffusion
+@pytest.mark.local_model
+@pytest.mark.parametrize("omni_server", _MING_IMAGE_SERVERS, indirect=True)
+def test_ming_chat_error_retirement_preserves_exact_seed(omni_server, online_client, ming_reference_url):
+    """The original invalid sequence must not poison exact replay of seed zero."""
+    body = _minimal_ming_chat_json(omni_server, ming_reference_url)
+    layered = Path(omni_server.model).name.endswith("-Layer")
+    success_config = {
+        **body,
+        "expected_image_count": 3 if layered else 1,
+        "expected_image_mode": "RGBA",
+    }
+    baseline = online_client.send_diffusion_request(success_config)
+    for override in ({"height": 17}, {"num_inference_steps": 0}, {"negative_prompt": "avoid blur"}):
+        invalid = {**body, "extra_body": {**body["extra_body"], **override}}
+        responses = online_client.send_chat_completions_http_request(
+            {
+                "json": invalid,
+                "timeout": 30,
+                "err_code": 400 if "negative_prompt" in override else tuple(range(400, 600)),
+            }
+        )
+        assert_http_error_payload(responses[0])
+    if layered:
+        invalid = {**body, "messages": [{"role": "user", "content": "a cup of coffee on a table"}]}
+        responses = online_client.send_chat_completions_http_request(
+            {"json": invalid, "timeout": 30, "err_code": tuple(range(400, 600))}
+        )
+        assert_http_error_payload(responses[0])
+    repeated = online_client.send_diffusion_request(success_config)
+    assert_diffusion_images_equal(repeated, baseline)

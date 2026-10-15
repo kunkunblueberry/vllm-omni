@@ -219,7 +219,9 @@ def assert_image_diffusion_response(
                 "width": ...,
                 "height": ...,
                 ...
-            }
+            },
+            "expected_image_count": ...,  # Optional decoded frame count (e.g. composite + layers)
+            "expected_image_mode": ...,  # Optional PIL mode, e.g. "RGBA"
         }
     """
     assert response.images is not None, "Image response is None"
@@ -233,7 +235,15 @@ def assert_image_diffusion_response(
             f"Expected {num_outputs_per_prompt} images, got {len(response.images)}"
         )
 
-    if run_level in {"advanced_model", "full_model"}:
+    expected_count = request_config.get("expected_image_count")
+    if expected_count is not None:
+        assert len(response.images) == expected_count, f"Expected {expected_count} images, got {len(response.images)}"
+    expected_mode = request_config.get("expected_image_mode")
+    if expected_mode is not None:
+        for image in response.images:
+            assert image.mode == expected_mode, f"Expected {expected_mode}, got {image.mode}"
+
+    if run_level in {"advanced_model", "full_model"} or expected_count is not None:
         width = extra_body.get("width")
         height = extra_body.get("height")
 
@@ -252,6 +262,18 @@ def assert_image_diffusion_response(
                         width=_maybe_int(width) if width is not None else None,
                         height=_maybe_int(height) if height is not None else None,
                     )
+
+
+def assert_diffusion_images_equal(actual: list["DiffusionResponse"], expected: list["DiffusionResponse"]) -> None:
+    """Assert seed replay/batch parity with exact decoded arrays, in request/frame order."""
+    assert len(actual) == len(expected), "Different response counts"
+    for actual_response, expected_response in zip(actual, expected, strict=True):
+        assert actual_response.images is not None and expected_response.images is not None
+        assert len(actual_response.images) == len(expected_response.images), "Different frame counts"
+        for actual_image, expected_image in zip(actual_response.images, expected_response.images, strict=True):
+            assert actual_image.mode == expected_image.mode, "Different image modes"
+            assert actual_image.size == expected_image.size, "Different image sizes"
+            np.testing.assert_array_equal(np.asarray(actual_image), np.asarray(expected_image))
 
 
 def assert_images_generations_response(
@@ -1189,12 +1211,20 @@ def assert_http_error(
     return payload
 
 
+def assert_http_error_payload(resp: Any) -> None:
+    """Require a nonempty OpenAI-style error object, including for 5xx responses."""
+    payload = getattr(resp, "json_body", None)
+    assert isinstance(payload, dict) and payload.get("error"), payload
+
+
 __all__ = [
     "assert_audio_diffusion_response",
     "assert_audio_speech_response",
     "assert_diffusion_response",
+    "assert_diffusion_images_equal",
     "assert_err_message_in_text",
     "assert_http_error",
+    "assert_http_error_payload",
     "assert_image_diffusion_response",
     "assert_image_valid",
     "assert_omni_response",

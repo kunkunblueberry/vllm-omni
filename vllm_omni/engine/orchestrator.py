@@ -2318,12 +2318,23 @@ class OrchestratorBase:
                         _extra_kwargs["sampling_params"] = params
                 except (TypeError, ValueError):
                     pass
-                diffusion_prompt = _fn(
-                    diffusion_source_outputs,
-                    req_state.prompt,
-                    requires_multimodal_data,
-                    **_extra_kwargs,
-                )
+                try:
+                    diffusion_prompt = _fn(
+                        diffusion_source_outputs,
+                        req_state.prompt,
+                        requires_multimodal_data,
+                        **_extra_kwargs,
+                    )
+                except OmniClientError as exc:
+                    await self._fail_request_client_error(
+                        req_id,
+                        next_logical,
+                        str(exc),
+                        status_code=exc.status_code,
+                        error_type=exc.error_type,
+                        release_owners=req_state.session_owned,
+                    )
+                    return
                 _dt_ar2d = (_time.perf_counter() - _t_ar2d) * 1000
                 req_state.pipeline_timings["ar2diffusion_ms"] = _dt_ar2d
                 logger.info(
