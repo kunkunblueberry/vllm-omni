@@ -261,7 +261,11 @@ def test_pure_consumer_preserves_defaults_and_separate_cfg_owners(mock_engine_cl
     assert response.error.message == "No output generated from AsyncOmni"
 
 
-def test_mixed_consumer_keeps_root_common_args_with_nested_extras(mock_engine_client, mocker: MockerFixture):
+@pytest.mark.parametrize("request_style", ["root", "nested"])
+@pytest.mark.parametrize("guidance", [None, 1.0, 2.0])
+def test_mixed_consumer_keeps_root_common_args_with_nested_extras(
+    mock_engine_client, mocker: MockerFixture, request_style, guidance
+):
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
     mock_engine_client.stage_configs = [
@@ -306,6 +310,11 @@ def test_mixed_consumer_keeps_root_common_args_with_nested_extras(mock_engine_cl
         _log_inputs=mocker.Mock(),
         chat_completion_full_generator=mocker.AsyncMock(return_value="done"),
     )
+    overrides = {"seed": 43}
+    if guidance is not None:
+        overrides["guidance_scale"] = guidance
+    request_kwargs = overrides if request_style == "root" else {}
+    nested_overrides = overrides if request_style == "nested" else {}
     request = ChatCompletionRequest(
         model="test",
         messages=[{"role": "user", "content": "prompt"}],
@@ -313,7 +322,8 @@ def test_mixed_consumer_keeps_root_common_args_with_nested_extras(mock_engine_cl
         num_inference_steps=7,
         size="768x512",
         negative_prompt="avoid blur",
-        extra_body={"extra_args": {"solver": "euler"}},
+        extra_body={"extra_args": {"solver": "euler"}, **nested_overrides},
+        **request_kwargs,
     )
 
     assert asyncio.run(serving_chat._create_chat_completion(request)) == "done"
@@ -322,6 +332,10 @@ def test_mixed_consumer_keeps_root_common_args_with_nested_extras(mock_engine_cl
     assert sampling_params_list[0].extra_args == {"target_h": 512, "target_w": 768}
     diffusion_params = sampling_params_list[1]
     assert diffusion_params.num_inference_steps == 7
+    assert diffusion_params.seed == 43
+    assert diffusion_params.guidance_scale == guidance
+    assert mock_engine_client.default_sampling_params_list[1].seed is None
+    assert mock_engine_client.default_sampling_params_list[1].guidance_scale is None
     assert diffusion_params.quality is None
     assert (diffusion_params.height, diffusion_params.width) == (512, 768)
     assert diffusion_params.extra_args == {"solver": "euler"}

@@ -757,6 +757,8 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "Cosmos3OmniPipeline": "get_cosmos3_pre_process_func",
     "MammothModa2DiTPipeline": "get_mammoth_moda2_pre_process_func",
     "MingImagePipeline": "get_ming_image_pre_process_func",
+    "MingImageDiffusionPipeline": "get_ming_image_pre_process_func",
+    "MingImageLayeredDiffusionPipeline": "get_ming_image_pre_process_func",
 }
 
 

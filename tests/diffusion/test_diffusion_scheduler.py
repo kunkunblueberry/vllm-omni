@@ -1868,6 +1868,8 @@ class TestStepScheduler:
         assert finished == {req_id}
         assert self.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_COMPLETED
         assert request.sampling_params.step_index == 3
+        assert self.scheduler.has_requests() is True
+        assert self.scheduler.schedule().finished_req_ids == {req_id}
         assert self.scheduler.has_requests() is False
 
     def test_fifo_single_request_scheduling(self) -> None:
@@ -1915,6 +1917,8 @@ class TestStepScheduler:
         state = self.scheduler.get_request_state(req_id)
         assert state.status == DiffusionRequestStatus.FINISHED_ERROR
         assert state.error == "worker failed"
+        assert self.scheduler.has_requests() is True
+        assert self.scheduler.schedule().finished_req_ids == {req_id}
         assert self.scheduler.has_requests() is False
 
     def test_missing_step_index_marks_finished_error(self) -> None:
@@ -1948,6 +1952,8 @@ class TestStepScheduler:
 
         self.scheduler.finish_requests(req_id_a, DiffusionRequestStatus.FINISHED_ABORTED)
         assert self.scheduler.get_request_state(req_id_a).status == DiffusionRequestStatus.FINISHED_ABORTED
+        assert self.scheduler.has_requests() is True
+        assert self.scheduler.schedule().finished_req_ids == {req_id_a}
         assert self.scheduler.has_requests() is False
 
     def test_has_requests_state_transition(self) -> None:
@@ -1965,6 +1971,8 @@ class TestStepScheduler:
         )
         assert finished == {req_id}
         assert self.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_COMPLETED
+        assert self.scheduler.has_requests() is True
+        assert self.scheduler.schedule().finished_req_ids == {req_id}
         assert self.scheduler.has_requests() is False
 
     def test_scheduled_request_aborted_before_update_is_returned_finished(self) -> None:

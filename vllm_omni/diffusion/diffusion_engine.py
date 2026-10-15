@@ -655,7 +655,10 @@ class DiffusionEngine:
 
             self._emit_request_started_outputs(sched_output)
 
-            if sched_output.is_empty:
+            step_retirement = self.execution_mode == DiffusionExecutionMode.STEP_BATCH and bool(
+                sched_output.finished_req_ids
+            )
+            if sched_output.is_empty and not step_retirement:
                 self._emit_finished_outputs(sched_output.finished_req_ids, None)
                 continue
 
@@ -663,7 +666,7 @@ class DiffusionEngine:
                 self._prepare_kv_for_forward(sched_output)
                 runner_output: BaseRunnerOutput = (
                     self.execute_fn(sched_output)
-                    if sched_output.scheduled_request_ids
+                    if sched_output.scheduled_request_ids or step_retirement
                     else BatchRunnerOutput.from_list([])
                 )
                 self._poll_native_kv()
@@ -673,6 +676,11 @@ class DiffusionEngine:
                 # the loop tail so pending RPCs are failed instead of left waiting.
                 if self._closed:
                     break
+                if step_retirement:
+                    # RPC failure cannot confirm retirement, even with active rows.
+                    # schedule() consumed these IDs; do not silently lose cleanup.
+                    self._fail_engine(exc)
+                    return
                 worker_execution_completed = False
                 logger.error(
                     "Execution failed for diffusion requests %s", sched_output.scheduled_request_ids, exc_info=True

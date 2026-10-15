@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from vllm.config import VllmConfig
 from vllm.inputs import MultiModalDataDict
 from vllm.model_executor.models.qwen2_5_vl import Qwen2_5_VisionTransformer
-from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
+from vllm.model_executor.models.utils import WeightsMapper, _merge_multimodal_embeddings, maybe_prefix
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.parse import MultiModalDataParser
 
@@ -142,6 +142,8 @@ class MingImageForConditionalGeneration(MingFlashOmniThinkerForConditionalGenera
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         torch.nn.Module.__init__(self)
+        if vllm_config.scheduler_config.enable_chunked_prefill:
+            raise ValueError("Ming-Image query embeddings require enable_chunked_prefill=False")
         thinker_config = vllm_config.model_config.hf_config
         if not isinstance(thinker_config, BailingMM2Config):
             raise TypeError(f"Expected BailingMM2Config, got {type(thinker_config).__name__}")
@@ -188,6 +190,45 @@ class MingImageForConditionalGeneration(MingFlashOmniThinkerForConditionalGenera
         with torch.amp.autocast(pixel_values.device.type, dtype=torch.bfloat16):
             image_embeds = self.vision(pixel_values, grid_thw=grid_thw.tolist())
         return F.normalize(self.linear_proj(image_embeds), dim=-1)
+
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings=None,
+        *,
+        is_multimodal: torch.Tensor | None = None,
+        handle_oov_mm_token: bool = False,
+    ) -> torch.Tensor:
+        inputs_embeds = self.language_model.model.word_embeddings(input_ids)
+        if multimodal_embeddings is not None and len(multimodal_embeddings) > 0:
+            assert is_multimodal is not None
+            inputs_embeds = _merge_multimodal_embeddings(
+                inputs_embeds=inputs_embeds,
+                multimodal_embeddings=multimodal_embeddings,
+                is_multimodal=is_multimodal,
+            )
+        self._maybe_inject_image_gen_query_embeds(input_ids, inputs_embeds, is_multimodal=is_multimodal)
+        return inputs_embeds
+
+    def _maybe_inject_image_gen_query_embeds(self, input_ids, inputs_embeds, *, is_multimodal=None) -> None:
+        flat = input_ids.reshape(-1).to(device=inputs_embeds.device)
+        if flat.numel() == 0:
+            return
+        query = self.query_tokens_dict["16x16"].to(inputs_embeds)
+        count = query.shape[0]
+        indices = torch.arange(flat.numel(), device=flat.device)
+        patch = flat == self.config.image_patch_token
+        starts = torch.where(~patch, indices, -1).cummax(0).values
+        offsets = indices - starts - 1
+        ends = starts + count + 1
+        valid = patch & (starts >= 0) & (ends < flat.numel()) & (offsets >= 0) & (offsets < count)
+        valid &= flat[starts.clamp(min=0)] == self.config.image_start_token
+        valid &= flat[ends.clamp(0, flat.numel() - 1)] == self.config.image_end_token
+        if is_multimodal is not None:
+            valid &= ~is_multimodal.reshape(-1).to(device=inputs_embeds.device, dtype=torch.bool)
+        replacement = query[offsets.clamp(0, count - 1)]
+        embedded = inputs_embeds.reshape(-1, inputs_embeds.shape[-1])
+        embedded.copy_(torch.where(valid[:, None], replacement, embedded))
 
     def compute_logits(
         self,

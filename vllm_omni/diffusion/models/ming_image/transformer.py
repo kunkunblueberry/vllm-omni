@@ -24,6 +24,10 @@ class MingImageTransformer2DModel(ZImageTransformer2DModel):
         patch_size=2,
         f_patch_size=1,
     ):
+        if not x or any(item.ndim != 4 for item in x):
+            raise ValueError("Ming-Image DiT samples must have shape [C, F, H, W].")
+        if len(cap_feats) != len(x):
+            raise ValueError("Ming-Image query conditions must match the DiT branch batch.")
         generated_frames = [item.shape[1] for item in x]
         ref_x = None
         cap_feats_2 = None
@@ -42,6 +46,11 @@ class MingImageTransformer2DModel(ZImageTransformer2DModel):
                 ref_x = [item.to(device=x[0].device, dtype=x[0].dtype) for item in reference.unbind(dim=0)]
             if direct is not None:
                 cap_feats_2 = [item.to(device=x[0].device, dtype=x[0].dtype) for item in direct.unbind(dim=0)]
+
+        if cap_feats_2 is None or len(cap_feats_2) != len(x):
+            raise ValueError("Ming-Image projected direct conditions must match the DiT branch batch.")
+        if ref_x is not None and len(ref_x) != len(x):
+            raise ValueError("Ming-Image reference latents must match the DiT branch batch.")
 
         output, metadata = super().forward(
             x,

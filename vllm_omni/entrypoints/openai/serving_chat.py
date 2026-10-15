@@ -900,6 +900,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         self._set_if_supported(
                             sp,
                             quality=quality,
+                            seed=extra_body.get("seed"),
+                            guidance_scale=extra_body.get("guidance_scale"),
                         )
                         apply_normalized_diffusion_request_extra_args(sp, normalized_extra_args)
                     else:

@@ -4,9 +4,10 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import Any, ClassVar
 
 import torch
@@ -23,6 +24,8 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage impor
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
     set_forward_context_direct_condition,
     set_forward_context_ref_latent,
 )
@@ -30,12 +33,13 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch
 from vllm_omni.diffusion.models.ming_image.condition import MingImageConditioning
 from vllm_omni.diffusion.models.ming_image.transformer import MingImageTransformer2DModel
-from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
+from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline, calculate_shift, retrieve_timesteps
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 logger = logging.getLogger(__name__)
@@ -101,7 +105,8 @@ def _validate_variant_config(
 class MingImageDiffusionPipeline(ZImagePipeline):
     """Ming-Image component adapter around the canonical Z-Image loop."""
 
-    supports_request_batch = False
+    supports_request_batch = True
+    supports_step_execution = True
 
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["conditioning"]
@@ -144,6 +149,7 @@ class MingImageDiffusionPipeline(ZImagePipeline):
         self._pending_prompt_embeds: list[torch.Tensor] | None = None
         self._pending_negative_prompt_embeds: list[torch.Tensor] | None = None
         self._uses_cudagraph_trees = False
+        self._interrupt = False
 
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
@@ -223,6 +229,53 @@ class MingImageDiffusionPipeline(ZImagePipeline):
             raise RuntimeError("Ming-Image conditioning is only available during forward.")
         return self._pending_prompt_embeds, self._pending_negative_prompt_embeds
 
+    def predict_noise_maybe_with_cfg(
+        self,
+        do_true_cfg: bool,
+        true_cfg_scale: float,
+        positive_kwargs: dict[str, Any],
+        negative_kwargs: dict[str, Any] | None,
+        cfg_normalize: bool | float = True,
+        output_slice: int | None = None,
+        kwargs: dict[str, Any] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """Attach projected conditions to each branch before shared dispatch.
+
+        The mixin can execute either branch locally or on a dedicated CFG rank.
+        Negative direct conditioning is zero after the biased projection; both
+        branches use the same reference. Never expose a fused 2B context to a
+        transformer invocation with only B samples.
+        """
+        context = get_forward_context()
+        direct = context.direct_condition
+        if direct is None:
+            raise RuntimeError("Ming-Image denoising requires projected direct conditioning.")
+        positive_kwargs = dict(positive_kwargs, direct_condition=direct, ref_latent=context.ref_latent)
+        if negative_kwargs is not None:
+            negative_kwargs = dict(
+                negative_kwargs, direct_condition=torch.zeros_like(direct), ref_latent=context.ref_latent
+            )
+        return super().predict_noise_maybe_with_cfg(
+            do_true_cfg,
+            true_cfg_scale,
+            positive_kwargs,
+            negative_kwargs,
+            cfg_normalize=cfg_normalize,
+            output_slice=output_slice,
+            kwargs=kwargs,
+        )
+
+    def predict_noise(self, *args: Any, direct_condition: torch.Tensor, ref_latent: torch.Tensor | None, **kwargs: Any):
+        context = get_forward_context()
+        previous_direct, previous_ref = context.direct_condition, context.ref_latent
+        set_forward_context_direct_condition(direct_condition)
+        set_forward_context_ref_latent(ref_latent)
+        try:
+            return super().predict_noise(*args, **kwargs)
+        finally:
+            set_forward_context_direct_condition(previous_direct)
+            set_forward_context_ref_latent(previous_ref)
+
     def prepare_latents(self, batch_size, *args, **kwargs):
         frames = self._num_frames_per_prompt
         flat = super().prepare_latents(batch_size * frames, *args, **kwargs)
@@ -244,7 +297,7 @@ class MingImageDiffusionPipeline(ZImagePipeline):
             reference = reference.convert("RGBA")
         if not isinstance(reference, torch.Tensor):
             reference = self.image_processor.preprocess(reference, height=height, width=width)
-        if reference.ndim != 4 or reference.shape[1] != 4:
+        if reference.ndim != 4 or reference.shape[:2] != (1, 4):
             raise ValueError("Ming-Image reference must be a batched RGBA tensor or an RGBA-compatible image.")
         reference = reference.to(device=self.device, dtype=self.vae.dtype).unsqueeze(2)
         latent = self.vae.encode(reference).latent_dist.mode()
@@ -280,18 +333,38 @@ class MingImageDiffusionPipeline(ZImagePipeline):
         self._num_frames_per_prompt = 1
 
     @torch.inference_mode()
-    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
-        sampling = req.sampling_params
+    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        # The runner owns the outer context. Restore its values on every exit,
+        # including failures during reference encoding before denoising starts.
+        context = get_forward_context() if is_forward_context_available() else None
+        previous_direct = context.direct_condition if context is not None else None
+        previous_ref = context.ref_latent if context is not None else None
+        try:
+            return self._forward(req)
+        finally:
+            set_forward_context_ref_latent(previous_ref)
+            set_forward_context_direct_condition(previous_direct)
+            self._pending_prompt_embeds = None
+            self._pending_negative_prompt_embeds = None
+            self._num_frames_per_prompt = 1
+
+    def _prepare_state(self, state: StepRequestState) -> StepRequestState:
+        sampling = state.sampling
         if sampling.num_outputs_per_prompt != 1:
-            # TODO(yuanheng-zhao): enable after supporting batching
             raise ValueError(
                 f"Ming-Image currently supports num_outputs_per_prompt=1 only, got {sampling.num_outputs_per_prompt}."
             )
 
-        extra = self._get_prompt_extra(req)
+        prompt = state.prompt
+        extra = dict(prompt.get("extra") or {}) if isinstance(prompt, dict) else {}
         extra_args = sampling.extra_args or {}
+        negative_prompt = extra_args.get("negative_prompt")
+        if isinstance(prompt, dict):
+            negative_prompt = prompt.get("negative_prompt", negative_prompt)
+        if negative_prompt is not None and negative_prompt != "":
+            raise ValueError("Ming-Image uses zero negative conditioning and does not accept negative_prompt.")
 
-        is_dummy_run = req.is_dummy_run()
+        is_dummy_run = OmniDiffusionRequest.is_dummy_run_request_id(state.request_id)
         query_hidden = extra.get("query_hidden_states")
         direct_hidden = extra.get("direct_hidden_states")
         if query_hidden is None or direct_hidden is None:
@@ -306,6 +379,15 @@ class MingImageDiffusionPipeline(ZImagePipeline):
             query_hidden = query_hidden.unsqueeze(0)
         if direct_hidden.ndim == 2:
             direct_hidden = direct_hidden.unsqueeze(0)
+        if query_hidden.ndim != 3 or query_hidden.shape[0] != 1 or query_hidden.shape[1:] != (256, 2048):
+            raise ValueError("Ming-Image query conditions must have shape [1, 256, 2048].")
+        if (
+            direct_hidden.ndim != 3
+            or direct_hidden.shape[0] != 1
+            or direct_hidden.shape[1] < 1
+            or direct_hidden.shape[-1] != 6144
+        ):
+            raise ValueError("Ming-Image direct conditions must have shape [1, prefix_length, 6144].")
         query_hidden = query_hidden.to(device=self.device, dtype=self.od_config.dtype)
         direct_hidden = direct_hidden.to(device=self.device, dtype=self.od_config.dtype)
         cap_feats, direct_condition = self.conditioning(query_hidden, direct_hidden)
@@ -318,62 +400,216 @@ class MingImageDiffusionPipeline(ZImagePipeline):
             is_dummy_run=is_dummy_run,
         )
 
-        height = int(extra_args.get("height") or sampling.height or 1024)
-        width = int(extra_args.get("width") or sampling.width or 1024)
-        steps = int(sampling.num_inference_steps or self.default_num_inference_steps)
-        cfg = float(sampling.guidance_scale if sampling.guidance_scale is not None else self.default_guidance_scale)
+        height_value = extra_args.get("height", sampling.height)
+        width_value = extra_args.get("width", sampling.width)
+        height = int(1024 if height_value is None else height_value)
+        width = int(1024 if width_value is None else width_value)
+        steps = int(
+            self.default_num_inference_steps if sampling.num_inference_steps is None else sampling.num_inference_steps
+        )
+        cfg = float(sampling.guidance_scale if sampling.guidance_scale_provided else self.default_guidance_scale)
         seed = extra_args.get("seed", sampling.seed)
         generator = torch.Generator(device="cpu").manual_seed(int(seed)) if seed is not None else sampling.generator
-
+        if generator is None:
+            generator = torch.Generator(device="cpu")
+            generator.seed()
+        if isinstance(generator, list) and len(generator) != 1:
+            raise ValueError("Ming-Image requires one generator per request.")
+        sampling.generator = generator
+        scale = self.vae_scale_factor * 2
+        if height <= 0 or width <= 0 or height % scale or width % scale:
+            raise ValueError(f"Ming-Image height and width must be positive multiples of {scale}.")
+        if steps <= 0:
+            raise ValueError("Ming-Image requires positive num_inference_steps.")
+        frames = self._num_frames_per_prompt
         ref_latent = self._encode_reference(reference, height, width)
-        positive = [item for item in cap_feats]
-        negative = [torch.zeros_like(item) for item in positive]
-        self._pending_prompt_embeds = positive
-        self._pending_negative_prompt_embeds = negative
-
-        apply_cfg = cfg > 1
-        context_direct = (
-            torch.cat([direct_condition, torch.zeros_like(direct_condition)], dim=0) if apply_cfg else direct_condition
-        )
-        context_ref = ref_latent
-        if apply_cfg and context_ref is not None:
-            context_ref = context_ref.repeat(2, 1, 1, 1, 1)
-
-        inner_sampling = OmniDiffusionSamplingParams(
-            height=height,
-            width=width,
-            num_inference_steps=steps,
-            guidance_scale=cfg,
-            generator=generator,
-            output_type="latent",
-        )
-        inner_req = DiffusionRequestBatch(
-            requests=[
-                OmniDiffusionRequest(
-                    prompt={"prompt": ""},
-                    sampling_params=inner_sampling,
-                    request_id=req.request_id or "ming-image",
+        channels = self.transformer.in_channels
+        shape = (1, channels, frames, height // self.vae_scale_factor, width // self.vae_scale_factor)
+        if sampling.latents is not None:
+            if tuple(sampling.latents.shape) != shape:
+                raise ValueError(
+                    f"Unexpected Ming-Image latents shape {tuple(sampling.latents.shape)}; expected {shape}."
                 )
-            ]
+            state.latents = sampling.latents.to(device=self.device, dtype=torch.float32).clone()
+        else:
+            # Preserve the foundation's frame-major RNG draw within ONE request.
+            state.latents = self.prepare_latents(
+                1,
+                channels,
+                height,
+                width,
+                torch.float32,
+                self.device,
+                generator * frames if isinstance(generator, list) else generator,
+            )
+        if ref_latent is not None and tuple(ref_latent.shape) != (1, channels, 1, shape[-2], shape[-1]):
+            raise ValueError("Ming-Image reference latent must match the request's channels and spatial geometry.")
+        state.scheduler = copy.deepcopy(self.scheduler)
+        mu = calculate_shift(
+            (shape[-2] // 2) * (shape[-1] // 2),
+            state.scheduler.config.get("base_image_seq_len", 256),
+            state.scheduler.config.get("max_image_seq_len", 4096),
+            state.scheduler.config.get("base_shift", 0.5),
+            state.scheduler.config.get("max_shift", 1.15),
+        )
+        state.scheduler.sigma_min = 0.0
+        state.timesteps, _ = retrieve_timesteps(
+            state.scheduler,
+            steps,
+            self.device,
+            timesteps=sampling.timesteps,
+            sigmas=sampling.sigmas,
+            mu=mu,
+        )
+        state.step_index = int(sampling.step_index or 0)
+        if state.total_steps < 1 or not 0 <= state.step_index < state.total_steps:
+            raise ValueError("Ming-Image requires a nonempty schedule and valid initial step_index.")
+        if state.step_index and sampling.latents is None:
+            raise ValueError("Ming-Image resumed step_index requires request-owned latents.")
+        if hasattr(state.scheduler, "set_begin_index"):
+            state.scheduler.set_begin_index(state.step_index)
+        state.prompt_embeds = cap_feats
+        state.negative_prompt_embeds = torch.zeros_like(cap_feats)
+        state.do_true_cfg = cfg > 1
+        state.extra.update(
+            direct_condition=direct_condition,
+            ref_latent=ref_latent,
+            frames=frames,
+            cfg=cfg,
+            cfg_normalize=sampling.cfg_normalize,
+            cfg_truncation=extra_args.get("cfg_truncation", 1.0),
+        )
+        return state
+
+    @torch.inference_mode()
+    def prepare_encode(self, state: StepRequestState, **kwargs: Any) -> StepRequestState:
+        del kwargs
+        # Clone RNG/latents even if callers share sampling objects. No pipeline
+        # condition or scheduler cursor persists between admitted requests.
+        state.sampling = copy.deepcopy(state.sampling)
+        try:
+            return self._prepare_state(state)
+        finally:
+            self._num_frames_per_prompt = 1
+            self._pending_prompt_embeds = self._pending_negative_prompt_embeds = None
+
+    @staticmethod
+    def _effective_cfg(state: StepRequestState) -> bool:
+        truncation = state.extra["cfg_truncation"]
+        t_norm = (1000 - float(state.current_timestep)) / 1000
+        return state.do_true_cfg and not (
+            truncation is not None and float(truncation) <= 1 and t_norm > float(truncation)
         )
 
-        set_forward_context_ref_latent(context_ref)
-        set_forward_context_direct_condition(context_direct)
-        try:
-            latent_output = super().forward(inner_req)
-            if not isinstance(latent_output.output, torch.Tensor):
-                raise TypeError("Ming-Image denoising must return latent tensors.")
-            image = self._decode_latent_frames(latent_output.output)
-            return DiffusionOutput(
-                output=image,
-                stage_durations=latent_output.stage_durations,
+    def _denoise_states(self, states: Sequence[StepRequestState], latents: torch.Tensor) -> torch.Tensor:
+        if not states:
+            raise ValueError("Ming-Image cannot denoise an empty wave.")
+        if len(states) != latents.shape[0] or any(state.latents.shape[0] != 1 for state in states):
+            raise ValueError("Ming-Image denoise rows must match request ownership.")
+        # Unequal progress can change actual CFG control flow in a homogeneous
+        # scheduler batch. Group locally, then scatter predictions to caller order.
+        groups: dict[tuple, list[int]] = {}
+        for index, state in enumerate(states):
+            if state.current_timestep is None:
+                raise ValueError("Ming-Image cannot denoise a completed request.")
+            ref = state.extra["ref_latent"]
+            key = (
+                self._effective_cfg(state),
+                state.extra["cfg"],
+                state.extra["cfg_normalize"],
+                tuple(state.extra["direct_condition"].shape[1:]),
+                None if ref is None else tuple(ref.shape[1:]),
             )
+            groups.setdefault(key, []).append(index)
+        result = torch.empty_like(latents, dtype=torch.float32)
+        context = get_forward_context()
+        previous_direct, previous_ref = context.direct_condition, context.ref_latent
+        try:
+            for (apply_cfg, cfg, normalize, _, ref_shape), indices in groups.items():
+                selected = [states[index] for index in indices]
+                direct = torch.cat([state.extra["direct_condition"] for state in selected], dim=0)
+                ref = torch.cat([state.extra["ref_latent"] for state in selected], dim=0) if ref_shape else None
+                set_forward_context_direct_condition(direct)
+                set_forward_context_ref_latent(ref)
+                x = list(latents[indices].to(self.od_config.dtype).unbind(0))
+                t = torch.stack([state.current_timestep for state in selected]).to(latents.device, torch.float32)
+                t = (1000 - t) / 1000
+                positive = {"x": x, "t": t, "cap_feats": [state.prompt_embeds[0] for state in selected]}
+                negative = (
+                    {"x": x, "t": t, "cap_feats": [state.negative_prompt_embeds[0] for state in selected]}
+                    if apply_cfg
+                    else None
+                )
+                prediction = self.predict_noise_maybe_with_cfg(
+                    apply_cfg,
+                    cfg,
+                    positive,
+                    negative,
+                    cfg_normalize=normalize,
+                )
+                result[indices] = -prediction.float()
         finally:
-            set_forward_context_ref_latent(None)
-            set_forward_context_direct_condition(None)
-            self._pending_prompt_embeds = None
-            self._pending_negative_prompt_embeds = None
-            self._num_frames_per_prompt = 1
+            set_forward_context_direct_condition(previous_direct)
+            set_forward_context_ref_latent(previous_ref)
+        return result
+
+    @torch.inference_mode()
+    def denoise_step(
+        self,
+        input_batch: InputBatch,
+        *,
+        states: Sequence[StepRequestState] | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor | None:
+        del kwargs
+        if self.interrupt:
+            return None
+        # InputBatch.states follows its idx_mapping; an optional runner state
+        # sequence is not a substitute for that gather order.
+        return self._denoise_states(input_batch.states, input_batch.latents)
+
+    @torch.inference_mode()
+    def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
+        del kwargs
+        if noise_pred.shape != state.latents.shape:
+            raise ValueError("Ming-Image scheduler prediction must match the request latent envelope.")
+        state.latents = self.scheduler_step_maybe_with_cfg(
+            noise_pred.float(),
+            state.current_timestep,
+            state.latents,
+            self._effective_cfg(state),
+            per_request_scheduler=state.scheduler,
+        )
+        state.step_index += 1
+
+    @torch.inference_mode()
+    def post_decode(self, state: StepRequestState, **kwargs: Any) -> DiffusionOutput:
+        del kwargs
+        if not state.denoise_completed:
+            raise ValueError("Ming-Image cannot decode unfinished request latents.")
+        return DiffusionOutput(output=self._decode_latent_frames(state.latents))
+
+    def _forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        if not req.requests:
+            raise ValueError("Ming-Image cannot execute an empty request batch.")
+        if len(set(req.request_ids)) != req.num_reqs:
+            raise ValueError("Ming-Image request IDs must be unique within a batch.")
+        self._interrupt = False
+        states = [
+            self.prepare_encode(StepRequestState(r.request_id, r.sampling_params, r.prompt)) for r in req.requests
+        ]
+        while active := [state for state in states if not state.denoise_completed]:
+            # Request-mode callers normally arrive pre-grouped by the scheduler.
+            # Keep independent geometry/frame envelopes even for direct callers.
+            groups: dict[tuple, list[StepRequestState]] = {}
+            for state in active:
+                groups.setdefault(tuple(state.latents.shape[1:]), []).append(state)
+            for selected in groups.values():
+                predictions = self._denoise_states(selected, torch.cat([state.latents for state in selected]))
+                for state, noise in zip(selected, predictions.split(1), strict=True):
+                    self.step_scheduler(state, noise)
+        outputs = [self.post_decode(state) for state in states]
+        return outputs
 
     @staticmethod
     def _flatten_latent_frames(latents: torch.Tensor) -> torch.Tensor:
@@ -408,6 +644,44 @@ class MingImageDiffusionPipeline(ZImagePipeline):
         return loaded
 
 
+def get_ming_image_pre_process_func(od_config: OmniDiffusionConfig):
+    """Resolve real Ming defaults before the shared scheduler builds its key.
+
+    Steps/seeds/timesteps/truncation are private to each request. Shape and
+    projected direct/reference structure must agree in a gathered InputBatch.
+    """
+    layered = bool(getattr(od_config.tf_model_config, "multi_frame_output", False))
+
+    def pre_process(request: OmniDiffusionRequest):
+        sampling = request.sampling_params
+        extra_args = sampling.extra_args or {}
+        extra = request.prompt.get("extra", {}) if isinstance(request.prompt, dict) else {}
+        height_value = extra_args.get("height", sampling.height)
+        width_value = extra_args.get("width", sampling.width)
+        sampling.height = int(1024 if height_value is None else height_value)
+        sampling.width = int(1024 if width_value is None else width_value)
+        if sampling.num_inference_steps is None:
+            sampling.num_inference_steps = 12
+        if not sampling.guidance_scale_provided:
+            sampling.guidance_scale = 2.0 if layered else 1.0
+        sampling.do_classifier_free_guidance = sampling.guidance_scale > 1
+        sampling.num_frames = int(extra_args.get("num_layers", extra.get("num_layers", 1))) + 1 if layered else 1
+        reference = extra.get("reference_image")
+        direct = extra.get("direct_hidden_states")
+        direct_shape = tuple(direct.shape[-2:]) if isinstance(direct, torch.Tensor) else None
+        request.batch_compatibility_key = (
+            "ming_image",
+            layered,
+            sampling.num_frames,
+            direct_shape,
+            reference is not None,
+        )
+        request.use_step_execution = bool(getattr(od_config, "step_execution", False))
+        return request
+
+    return pre_process
+
+
 def get_ming_image_post_process_func(od_config: OmniDiffusionConfig):
     del od_config
     image_processor = VaeImageProcessor(vae_scale_factor=16, do_convert_rgb=False)
@@ -420,4 +694,4 @@ def get_ming_image_post_process_func(od_config: OmniDiffusionConfig):
     return post_process
 
 
-__all__ = ["MingImageDiffusionPipeline", "get_ming_image_post_process_func"]
+__all__ = ["MingImageDiffusionPipeline", "get_ming_image_pre_process_func", "get_ming_image_post_process_func"]
