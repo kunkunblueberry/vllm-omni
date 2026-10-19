@@ -21,7 +21,8 @@
       "model": "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v",
       "serve_args": {
         "flow-shift": 5.0,
-        "enable-diffusion-pipeline-profiler": true
+        "enable-diffusion-pipeline-profiler": true,
+        "vae-use-tiling": true
       }
     },
     "benchmark_params": [
