@@ -22,7 +22,26 @@ from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, DuplexModelSession
 from vllm_omni.errors import OmniClientError
 from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import Action
 from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import SILENT_SYSTEM_PROMPT
-from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.data_plane import JoyAIDataPlane, JoyAISessionState
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.data_plane import (
+    JoyAIDataPlane,
+    JoyAISessionState,
+    Observation,
+    advance_chunk,
+)
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.delegation import (
+    DELEGATION_TOOL_NAME,
+    DelegationResult,
+    accept_result,
+    delegation_system_section,
+    delegation_tool_definition,
+    expire_unanswered,
+    expired_results,
+    reconcile_delegation_runtime,
+    render_result_blocks,
+    result_records,
+    settle_response,
+    unanswered_results,
+)
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.input import JoyAIFrameBuffer
 from vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction import (
     _clean_qwen3_asr_transcript,
@@ -36,6 +55,17 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
     joyai_stage_id = 0
     asr_stage_id: int | None = None
     audio_stage_id = 2
+    #: Accepted delegation results are session state: a client ``session.update``
+    #: must not be able to inject or drop them through ``extra_body``.
+    private_runtime_config_keys = frozenset(
+        {
+            "joyai_delegation_results",
+            "joyai_chunk_id",
+            "_joyai_delegation_displayed",
+            "_joyai_delegation_planned",
+            "_joyai_chunk_id",
+        }
+    )
 
     def __init__(self, encode_audio: Callable[..., str]) -> None:
         self.data_plane = JoyAIDataPlane(encode_audio)
@@ -105,10 +135,27 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
 
     def validate_client_extra_body(self, extra_body: object) -> None:
         super().validate_client_extra_body(extra_body)
-        if isinstance(extra_body, Mapping) and (extra_body.get("auto_response") or extra_body.get("realtime_tools")):
+        if not isinstance(extra_body, Mapping):
+            return
+        if extra_body.get("auto_response"):
+            raise DuplexRuntimeConfigError("JoyAI observations use explicit camera commits, not auto responses")
+        tools = extra_body.get("realtime_tools")
+        if tools is not None and not self.declares_delegation(tools):
             raise DuplexRuntimeConfigError(
-                "JoyAI video observations use explicit commits; tools use the follow-up adapter"
+                "JoyAI sessions only declare the delegate tool; any other tool is unsupported"
             )
+
+    @staticmethod
+    def declares_delegation(tools: object) -> bool:
+        """Whether a ``tools`` declaration asks for exactly the JoyAI delegation function."""
+        if not isinstance(tools, list) or not tools:
+            return False
+        for tool in tools:
+            if not isinstance(tool, Mapping):
+                return False
+            if tool.get("type", "function") != "function" or tool.get("name") != DELEGATION_TOOL_NAME:
+                return False
+        return True
 
     async def prepare_runtime_config(
         self, config: DuplexSessionConfig, *, model_config: ModelConfig | None
@@ -134,7 +181,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         if config.ref_audio:
             raise DuplexRuntimeConfigError("JoyAI's current TTS profile uses CustomVoice speakers")
         extra = config.extra_body or {}
-        return {
+        updated: dict[str, object] = {
             "instructions": config.instructions,
             "initial_user_text": config.initial_user_text,
             "temperature": config.temperature,
@@ -144,6 +191,17 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                 for key, default in (("tts_speaker", "Vivian"), ("tts_language", "Auto"), ("tts_instruct", ""))
             },
         }
+        # Delegation state is per-session bookkeeping, not session configuration:
+        # an update must carry it forward or accepted results would vanish.
+        for key in ("joyai_delegation_results", "joyai_chunk_id"):
+            if key in current:
+                updated[key] = current[key]
+        # The declared tools are session configuration and only the delegate
+        # function is accepted, so the validated declaration passes through.
+        tools = extra.get("realtime_tools")
+        if tools is not None:
+            updated["realtime_tools"] = tools
+        return updated
 
     def configure_sampling_params(
         self, *, runtime_config: dict[str, object], defaults: tuple[object, ...]
@@ -208,17 +266,25 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         self.data_plane.begin_request(request_id)
         request = self.data_plane.requests[request_id]
         request.state = state
+        self.data_plane.session_state = state if isinstance(state, JoyAISessionState) else None
         request.frames = config["joyai_frames"]
         request.conversation_images = config.pop("joyai_conversation_images")
         request.modalities = tuple(config["modalities"])
         request.previous_response = state.last_response_text
+        request.delegation_tools = self.delegation_enabled(runtime_config)
+        # The chunk identity is session state decided here, not inside the
+        # worker, so the follow-up prompt and the published call agree on it.
+        planned = self._advance_chunk(runtime_config, request, has_camera=bool(payload.get("video_frames")))
+        # The planner runs off-loop: hand it the same frozen view of the session
+        # that the rest of the plan sees, never the live plugin state.
+        config["joyai_chunk_id"] = request.chunk_id
         try:
-            return await asyncio.to_thread(
+            plan = await asyncio.to_thread(
                 self.plan_append,
                 request_id=request_id,
                 fence=fence,
                 session_config=config,
-                runtime_config=runtime_config,
+                runtime_config=planned,
                 seq=seq,
                 turn_seq=turn_seq,
                 payload=payload,
@@ -228,11 +294,34 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         except BaseException:
             self.data_plane.close_stream(request_id)
             raise
+        plan.prompt["_joyai_chunk_id"] = request.chunk_id
+        return plan
 
     def commit_append_plan(self, request_id: str) -> None:
         request = self.data_plane.requests[request_id]
         request.state.frames = request.frames
         request.state.conversation_images = request.conversation_images
+
+    def _advance_chunk(
+        self, runtime_config: Mapping[str, object], request: Observation, *, has_camera: bool
+    ) -> dict[str, object]:
+        """Give this observation its chunk identity.
+
+        JoyAI's interaction is chunk based: a spoken reply answers the goal of
+        the current chunk and stays the goal until the chunk closes. The chunk
+        here advances when a reply of the current chunk stored text and the
+        next observation brings a new camera frame -- the point where the
+        retained-answer deduplication also releases the reply.
+        """
+        chunk = runtime_config.get("joyai_chunk_id")
+        request.chunk_id = chunk if isinstance(chunk, str) and chunk else None
+        if request.state is None:
+            return dict(runtime_config)
+        advanced = advance_chunk(request.state, current=chunk, has_camera=has_camera)
+        request.chunk_id = advanced
+        if advanced == chunk:
+            return dict(runtime_config)
+        return {**runtime_config, "joyai_chunk_id": advanced}
 
     def plan_append(
         self,
@@ -251,6 +340,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             raise DuplexRuntimeConfigError("JoyAI requires committed input")
         has_audio = bool(payload.get("audio"))
         self.input_stage_id(payload)
+        delegation = self.delegation_enabled(runtime_config)
         history = []
         query = runtime_config.get("initial_user_text") or ""
         if has_audio and query:
@@ -285,6 +375,8 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                 image.thumbnail((448, 448))
                 images.append(image.convert("RGB").copy())
         system = SILENT_SYSTEM_PROMPT
+        if delegation:
+            system += "\n\n" + delegation_system_section()
         if runtime_config.get("instructions"):
             system += "\n\n" + runtime_config["instructions"]
         stage_sampling_params = session_config.get("stage_sampling_params")
@@ -292,7 +384,17 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             sampling_params = stage_sampling_params[self.joyai_stage_id]
         if not isinstance(sampling_params, SamplingParams):
             raise DuplexRuntimeConfigError("JoyAI requires autoregressive sampling parameters")
-        budget = self.max_model_len - (sampling_params.max_tokens or 256)
+        # The plan runs on a worker thread and must not read live session state,
+        # so the chunk identity is the one the session loop bound to this request.
+        chunk = session_config.get("joyai_chunk_id")
+        results: list[DelegationResult] = []
+        results_block = ""
+        if delegation:
+            results = unanswered_results(runtime_config, chunk=chunk)
+            results_block = render_result_blocks(results)
+        budget = self.max_model_len - (sampling_params.max_tokens or 256) - len(results_block)
+        if budget <= 0:
+            raise DuplexRuntimeConfigError("JoyAI delegated results exceed the context budget")
         # Qwen3-VL expands each image placeholder to this many visual tokens.
         # Infer the grid from image sizes once; budget trimming needs no pixels.
         image_processor = self.processor.image_processor
@@ -317,6 +419,8 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                 joyai_image_token_counts=image_token_counts,
                 deferred_multi_modal_data={"image": images} if images else {},
             )
+            if results_block:
+                prompt_data["additional_information"]["joyai_delegation_context"] = results_block
             if payload.get("realtime_item_id"):
                 prompt_data["additional_information"]["realtime_item_id"] = payload["realtime_item_id"]
             prompt_data["prompt"] = (
@@ -334,10 +438,17 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                     images=images,
                     image_token_counts=image_token_counts,
                     budget=budget,
+                    context_blocks=[results_block] if results_block else (),
                 )
             except OmniClientError as exc:
                 raise DuplexRuntimeConfigError(str(exc)) from exc
             prompt_data["multi_modal_data"] = {"image": images} if images else {}
+        if results:
+            # Private plan-time marks: the session books them only once the
+            # stage accepts this append, and reconciles them with the live
+            # runtime, which may have accepted a newer result meanwhile.
+            prompt_data["_joyai_delegation_displayed"] = [result.call_id for result in results]
+            prompt_data["_joyai_delegation_planned"] = result_records(runtime_config)
         return DuplexAppendPlan(prompt=prompt_data)
 
     def user_transcript(self, *, stage_id: int, output: object, prompt: object, finished: bool) -> str | None:
@@ -363,8 +474,9 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         action = observation.parse(output)
         if (
             "audio" not in observation.modalities
-            or action.action is not Action.RESPONSE
+            or action.action not in {Action.RESPONSE, Action.DELEGATE}
             or not action.text
+            or (action.action is Action.DELEGATE and not observation.delegation_tools)
             or observation.is_repeat(action)
         ):
             return DuplexOutputDecision(action=DuplexOutputAction.DIRECT_RESPONSE)
@@ -372,3 +484,152 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
 
     def project_intermediate_output(self, *, stage_id: int, output: object, context: object) -> bool:
         return stage_id == self.joyai_stage_id and context.segment_finished
+
+    # ---- delegation: the shared tool-call lifecycle, model side ---------- #
+
+    @staticmethod
+    def delegation_enabled(runtime_config: Mapping[str, object]) -> bool:
+        tools = runtime_config.get("realtime_tools")
+        return JoyAIDuplexPlugin.declares_delegation(tools)
+
+    def parse_function_call(self, model_result: Mapping[str, object]) -> dict[str, str] | None:
+        """Publish this observation's delegation as one shared function call."""
+        call = model_result.get("joyai_function_call")
+        if not isinstance(call, Mapping):
+            return None
+        call_id, name, arguments = call.get("call_id"), call.get("name"), call.get("arguments")
+        if not isinstance(call_id, str) or not call_id or name != DELEGATION_TOOL_NAME:
+            return None
+        if not isinstance(arguments, str) or not arguments:
+            return None
+        # A call is terminal for this observation even when it also spoke a
+        # note: the reply that will matter is the one answering its result.
+        state = self.data_plane.requests.get(model_result.get("data_plane_request_id"))
+        if state is not None and state.state is not None:
+            state.state.chunk_spoken = True
+        return {"call_id": call_id, "name": name, "arguments": arguments}
+
+    @staticmethod
+    def has_pending_tool_followup(runtime_config: Mapping[str, object]) -> bool:
+        """Whether an accepted result is still waiting for an observation.
+
+        JoyAI observations are driven by camera commits, so the next commit
+        carries the result; no ``response.create`` is needed.
+        """
+        return bool(unanswered_results(runtime_config))
+
+    @staticmethod
+    def extra_prompt_config(runtime_config: Mapping[str, object]) -> Mapping[str, object]:
+        records = result_records(runtime_config)
+        if not records:
+            return {}
+        return {"joyai_delegation_results": records}
+
+    def runtime_config_for_function_output(
+        self,
+        config: DuplexSessionConfig,
+        current: Mapping[str, object],
+        item: Mapping[str, object],
+        *,
+        history_len: int | None = None,
+    ) -> dict[str, object] | None:
+        """Prepare one accepted result without consuming anything.
+
+        ``name`` and ``arguments`` are the session's immutable call origin, so a
+        client cannot rebind the result to another question. Refusals raise
+        ``DuplexRuntimeConfigError`` and leave the call pending for a retry.
+        """
+        del config
+        output = item.get("output")
+        if not isinstance(output, str):
+            raise DuplexRuntimeConfigError(
+                "function_call_output requires a string output",
+                code="invalid_function_call_output",
+            )
+        if item.get("name") != DELEGATION_TOOL_NAME:
+            raise DuplexRuntimeConfigError(
+                "function_call_output is not for the JoyAI delegate tool",
+                code="invalid_function_call_output",
+            )
+        try:
+            return accept_result(current, item, accepted_at=history_len if isinstance(history_len, int) else 0)
+        except ValueError as exc:
+            raise DuplexRuntimeConfigError(str(exc), code="invalid_function_call_output") from exc
+
+    def runtime_patch_for_submitted_prompt(self, prompt: dict[str, object]) -> Mapping[str, object] | None:
+        """Book the results this accepted prompt displays."""
+        displayed = prompt.pop("_joyai_delegation_displayed", None)
+        planned = prompt.pop("_joyai_delegation_planned", None)
+        chunk = prompt.pop("_joyai_chunk_id", None)
+        patch: dict[str, object] = {}
+        if isinstance(displayed, list) and displayed:
+            patch["_joyai_delegation_displayed"] = [call_id for call_id in displayed if isinstance(call_id, str)]
+        if isinstance(planned, list):
+            patch["_joyai_delegation_planned"] = planned
+        if isinstance(chunk, str):
+            patch["joyai_chunk_id"] = chunk
+        return patch or None
+
+    def reconcile_submitted_runtime(
+        self,
+        current: Mapping[str, object],
+        updated: Mapping[str, object],
+    ) -> Mapping[str, object] | None:
+        """Book this prompt's display marks without dropping newer results."""
+        displayed = updated.get("_joyai_delegation_displayed")
+        if not isinstance(displayed, list) or not displayed:
+            return None
+        call_ids = [call_id for call_id in displayed if isinstance(call_id, str)]
+        planned = updated.get("_joyai_delegation_planned")
+        chunk = updated.get("joyai_chunk_id")
+        live = reconcile_delegation_runtime(
+            current,
+            prompt={"joyai_delegation_results": planned if isinstance(planned, list) else []},
+            displayed=call_ids,
+            chunk=chunk,
+        )
+        if live is None:
+            return None
+        return {"joyai_delegation_results": live}
+
+    def runtime_config_after_response(
+        self,
+        runtime_config: Mapping[str, object],
+        *,
+        committed: bool,
+        awaiting_playback: bool = False,
+        response_id: str | None = None,
+        release_owner: bool = False,
+    ) -> dict[str, object] | None:
+        """Apply one finished response to the results its prompt displayed.
+
+        A stored reply answers them. A reply that stored nothing (a repeat, a
+        silent decision, a failure) leaves them unanswered, and the next frame
+        carries them again. ``awaiting_playback`` keeps the decision open: the
+        reply may still store its text when the playback acknowledgement
+        arrives, and that path calls this hook again.
+        """
+        del response_id, release_owner
+        if awaiting_playback:
+            return None
+        chunk = runtime_config.get("joyai_chunk_id")
+        expired = expired_results(runtime_config, chunk=chunk)
+        updated = settle_response(runtime_config, committed=committed, chunk=chunk, expired=expired)
+        if isinstance(self.data_plane.session_state, JoyAISessionState) and committed:
+            self.data_plane.session_state.chunk_spoken = True
+        return updated
+
+    def retire_pending_function_output(
+        self,
+        config: DuplexSessionConfig,
+        current: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        """The conversation a pending result belonged to was cancelled.
+
+        JoyAI writes each prompt from the session's own context, so there is no
+        queued frame to retire. What does become unreachable is a result the
+        cancelled turn never answered: its question is gone with the turn, and
+        it must not surface in a later observation as if it had been asked.
+        """
+        del config
+        return expire_unanswered(current)
