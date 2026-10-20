@@ -33,7 +33,6 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.delegation impo
     DelegationResult,
     accept_result,
     delegation_system_section,
-    delegation_tool_definition,
     expire_unanswered,
     expired_results,
     reconcile_delegation_runtime,

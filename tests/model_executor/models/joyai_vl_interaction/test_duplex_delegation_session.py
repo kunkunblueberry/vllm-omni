@@ -16,7 +16,7 @@ import json
 import pytest
 
 from tests.engine.duplex.test_session_runner import tts_output
-from tests.model_executor.models.joyai_vl_interaction.test_duplex_plugin import open_joyai, observe
+from tests.model_executor.models.joyai_vl_interaction.test_duplex_plugin import observe, open_joyai
 from vllm_omni.engine.duplex.commands import AckPlayback, CreateItem, UpdateSession
 from vllm_omni.engine.duplex.session.tool_calls import ToolCallState
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.delegation import (
@@ -84,7 +84,9 @@ async def publish_delegation(h) -> str:
     assert len(calls) == 1, realtime_events(h, events)
     if h.session.active_response_id is not None:
         response_id = h.session.active_response_id
-        await h.deliver_and_settle(tts_output(request_id, samples=24000, finished=True), stage_id=2, segment_finished=True)
+        await h.deliver_and_settle(
+            tts_output(request_id, samples=24000, finished=True), stage_id=2, segment_finished=True
+        )
         await h.run(AckPlayback(response_id=response_id, played_ms=1000))
     return calls[0]["call_id"]
 

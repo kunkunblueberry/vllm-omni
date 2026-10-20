@@ -59,11 +59,7 @@ async def declare_delegation_tool(client: DuplexClient) -> None:
 
 
 def function_calls(collector: EventCollector) -> list[dict[str, object]]:
-    return [
-        event
-        for event in collector.events
-        if event.get("type") == "response.function_call_arguments.done"
-    ]
+    return [event for event in collector.events if event.get("type") == "response.function_call_arguments.done"]
 
 
 async def wait_for_function_call(collector: EventCollector, timeout_s: float = 180) -> dict[str, object]:
@@ -120,9 +116,9 @@ async def run_delegation(url, model, output_dir):
                     },
                 }
             )
-            assert not any(
-                error.get("code") == "invalid_function_call_output" for error in collector.errors()
-            ), collector.errors()
+            assert not any(error.get("code") == "invalid_function_call_output" for error in collector.errors()), (
+                collector.errors()
+            )
 
             # 3. The next observation speaks the delegated answer.
             call_id = str(call["call_id"])
@@ -132,9 +128,7 @@ async def run_delegation(url, model, output_dir):
                 transcript = collector.response_text(terminal.response_id)
                 if DELEGATED_ANSWER.split()[-1].lower() in transcript.lower():
                     break
-            (output_dir / "delegation-events.json").write_text(
-                json.dumps(collector.events, indent=2), encoding="utf-8"
-            )
+            (output_dir / "delegation-events.json").write_text(json.dumps(collector.events, indent=2), encoding="utf-8")
             assert DELEGATED_ANSWER.split()[-1].lower() in transcript.lower(), (
                 f"the delegated answer never reached speech: {transcript!r}"
             )
@@ -147,11 +141,7 @@ async def run_delegation(url, model, output_dir):
                 }
             )
             await asyncio.sleep(0.5)
-            duplicates = [
-                error
-                for error in collector.errors()
-                if error.get("code") == "invalid_function_call_output"
-            ]
+            duplicates = [error for error in collector.errors() if error.get("code") == "invalid_function_call_output"]
             assert duplicates, "a duplicate function_call_output must be refused"
 
             await client.close()

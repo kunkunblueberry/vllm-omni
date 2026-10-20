@@ -96,9 +96,7 @@ def test_accepted_result_keeps_the_session_owned_question():
 )
 def test_result_without_a_question_is_refused(arguments):
     with pytest.raises(ValueError):
-        delegation.accept_result(
-            {}, {"call_id": "call_1", "arguments": arguments, "output": "x"}, accepted_at=1
-        )
+        delegation.accept_result({}, {"call_id": "call_1", "arguments": arguments, "output": "x"}, accepted_at=1)
 
 
 def test_result_requires_a_string_output():
@@ -143,7 +141,8 @@ def test_rendered_block_keeps_the_newest_result_whole():
     runtime = accepted()
     runtime = accepted(call_id="call_2", output="Second answer.", runtime=runtime)
     block = delegation.render_result_blocks(
-        delegation.unanswered_results(runtime), window_chars=len("Question: Is the pot overheated?\nAnswer: Second answer.")
+        delegation.unanswered_results(runtime),
+        window_chars=len("Question: Is the pot overheated?\nAnswer: Second answer."),
     )
     assert "Second answer." in block
     assert "It is smoking." not in block
@@ -214,9 +213,12 @@ def test_reconcile_keeps_a_result_accepted_while_the_prompt_was_planned():
 
 
 def test_reconcile_without_live_results_changes_nothing():
-    assert delegation.reconcile_delegation_runtime(
-        {}, prompt={"joyai_delegation_results": []}, displayed=["call_1"], chunk="c0"
-    ) is None
+    assert (
+        delegation.reconcile_delegation_runtime(
+            {}, prompt={"joyai_delegation_results": []}, displayed=["call_1"], chunk="c0"
+        )
+        is None
+    )
 
 
 def test_chunk_advances_after_a_spoken_reply_and_a_new_frame():

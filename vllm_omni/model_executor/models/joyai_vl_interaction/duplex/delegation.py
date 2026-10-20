@@ -155,7 +155,12 @@ def _result_from_record(raw: Mapping[str, object]) -> DelegationResult | None:
     if not isinstance(question, str) or not question or not isinstance(output, str):
         return None
     note = raw.get("note")
-    return DelegationResult(call_id=call_id, question=question, output=output, note=note if isinstance(note, str) else "")
+    return DelegationResult(
+        call_id=call_id,
+        question=question,
+        output=output,
+        note=note if isinstance(note, str) else "",
+    )
 
 
 def unanswered_results(runtime_config: Mapping[str, object], *, chunk: object = None) -> list[DelegationResult]:
@@ -341,8 +346,7 @@ def reconcile_delegation_runtime(
         return None
     planned_records = prompt.get("joyai_delegation_results")
     planned = {
-        record.get("call_id"): record
-        for record in result_records({"joyai_delegation_results": planned_records})
+        record.get("call_id"): record for record in result_records({"joyai_delegation_results": planned_records})
     }
     merged: list[dict[str, object]] = []
     for record in live:
@@ -374,16 +378,6 @@ def expired_results(runtime_config: Mapping[str, object], *, chunk: object) -> l
         if isinstance(answered, int) and answered > 0 and not isinstance(displayed, str):
             expired.append(record["call_id"])
     return expired
-
-
-def prune_expired(runtime_config: Mapping[str, object]) -> dict[str, object] | None:
-    """Forget expired tombstones once the list has grown past a small bound."""
-    records = result_records(runtime_config)
-    expired = [record for record in records if record.get("expired")]
-    if len(expired) <= EXPIRED_RESULT_RETENTION:
-        return None
-    live = [record for record in records if not record.get("expired")]
-    return {"joyai_delegation_results": [*expired[-EXPIRED_RESULT_RETENTION:], *live]}
 
 
 def render_result_blocks(
