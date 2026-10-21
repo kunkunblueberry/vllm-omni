@@ -15,8 +15,7 @@ import pytest
 
 from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import Action, ParsedAction, parse_action
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex import delegation
-from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.data_plane import JoyAISessionState, advance_chunk
-from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.input import JoyAIFrameBuffer
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.data_plane import advance_chunk
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -222,15 +221,29 @@ def test_reconcile_without_live_results_changes_nothing():
 
 
 def test_chunk_advances_after_a_spoken_reply_and_a_new_frame():
-    state = JoyAISessionState(audio_buffer=JoyAIFrameBuffer())
-    assert advance_chunk(state, current=None, has_camera=True) == "chunk-0"
-    state.chunk_spoken = True
-    assert advance_chunk(state, current="chunk-0", has_camera=False) == "chunk-0"
-    assert advance_chunk(state, current="chunk-0", has_camera=True) == "chunk-1"
-    assert state.chunk_spoken is False
+    assert advance_chunk(current=None, spoken=False, has_camera=True) == ("chunk-0", False)
+    assert advance_chunk(current="chunk-0", spoken=True, has_camera=False) == ("chunk-0", True)
+    assert advance_chunk(current="chunk-0", spoken=True, has_camera=True) == ("chunk-1", False)
 
 
 def test_chunk_stays_while_the_scene_is_idle():
-    state = JoyAISessionState(audio_buffer=JoyAIFrameBuffer())
     for _ in range(3):
-        assert advance_chunk(state, current="chunk-0", has_camera=True) == "chunk-0"
+        assert advance_chunk(current="chunk-0", spoken=False, has_camera=True) == ("chunk-0", False)
+
+
+def test_two_sessions_advance_their_chunks_independently():
+    """The chunk lives in each session's runtime, not on a shared plugin slot."""
+    session_a = {"joyai_chunk_id": "chunk-0", "joyai_chunk_spoken": True}
+    session_b = {"joyai_chunk_id": "chunk-0", "joyai_chunk_spoken": False}
+
+    a_chunk, a_spoken = advance_chunk(
+        current=session_a["joyai_chunk_id"], spoken=session_a["joyai_chunk_spoken"], has_camera=True
+    )
+    b_chunk, b_spoken = advance_chunk(
+        current=session_b["joyai_chunk_id"], spoken=session_b["joyai_chunk_spoken"], has_camera=True
+    )
+
+    assert (a_chunk, a_spoken) == ("chunk-1", False)
+    assert (b_chunk, b_spoken) == ("chunk-0", False)
+    # Session B is untouched by A's advance.
+    assert session_b == {"joyai_chunk_id": "chunk-0", "joyai_chunk_spoken": False}

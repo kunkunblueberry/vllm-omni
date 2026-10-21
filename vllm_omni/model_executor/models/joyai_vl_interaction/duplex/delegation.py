@@ -43,6 +43,9 @@ DELEGATION_RESULT_WINDOW_CHARS = 4000
 MAX_DELEGATION_ARGUMENT_BYTES = 64 * 1024
 #: Results already marked expired are pruned once the list grows past this.
 EXPIRED_RESULT_RETENTION = 32
+#: How many stored replies may speak one result: the reply that answers it, plus
+#: one reuse inside that same chunk (JoyAI keeps speaking for the chunk's goal).
+MAX_RESULT_REUSES = 2
 
 _DELEGATION_ACTION = (
     "**Delegate** — when a question is too hard or error-prone to answer reliably yourself, "
@@ -175,7 +178,7 @@ def unanswered_results(runtime_config: Mapping[str, object], *, chunk: object = 
         if record.get("expired"):
             continue
         answered = record.get("answered")
-        if isinstance(answered, int) and answered >= 2:
+        if isinstance(answered, int) and answered >= MAX_RESULT_REUSES:
             continue
         displayed = record.get("displayed_in_chunk")
         if isinstance(displayed, str) and isinstance(chunk, str) and displayed == chunk:

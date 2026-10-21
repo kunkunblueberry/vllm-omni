@@ -26,29 +26,27 @@ class JoyAISessionState(DefaultDuplexModelSessionState):
     frames: list[str] = field(default_factory=list)
     conversation_images: tuple[str, ...] = ()
     last_response_text: str = ""
-    #: Chunk identity of the latest observation (see ``advance_chunk``).
-    chunk_id: str = "chunk-0"
-    #: True once a reply of ``chunk_id`` stored text.
-    chunk_spoken: bool = False
-    chunk_counter: int = 0
 
 
-def advance_chunk(state: JoyAISessionState, *, current: object, has_camera: bool) -> str:
-    """Return the chunk identity the next observation belongs to.
+def advance_chunk(*, current: object, spoken: bool, has_camera: bool) -> tuple[str, bool]:
+    """Return the ``(chunk id, spoken)`` pair the next observation belongs to.
 
     JoyAI answers the goal of the current chunk and keeps that answer as the
     goal until the chunk closes. The chunk closes when a reply of it stored
     text and the next observation arrives with a new camera frame: that is the
     same point at which the retained-answer deduplication lets a reply be
     repeated.
+
+    The pair lives in the session runtime config, not on a plugin-level slot:
+    one plugin instance serves every session of a deployment, so a shared slot
+    would let one session advance another session's chunk.
     """
-    chunk = current if isinstance(current, str) and current else state.chunk_id
-    if state.chunk_spoken and has_camera:
-        state.chunk_counter += 1
-        state.chunk_spoken = False
-        chunk = f"chunk-{state.chunk_counter}"
-    state.chunk_id = chunk
-    return chunk
+    chunk = current if isinstance(current, str) and current else "chunk-0"
+    if not spoken or not has_camera:
+        return chunk, spoken
+    index = chunk.removeprefix("chunk-")
+    next_index = int(index) + 1 if index.isdigit() else 1
+    return f"chunk-{next_index}", False
 
 
 @dataclass
@@ -80,8 +78,6 @@ class JoyAIDataPlane(DuplexDataPlane):
     def __init__(self, encode_audio: Callable[..., str]) -> None:
         self.encode_audio = encode_audio
         self.requests: dict[str, Observation] = {}
-        #: The state of the latest observation request, rebound per append.
-        self.session_state: JoyAISessionState | None = None
 
     def begin_request(self, request_id: str) -> None:
         self.requests.setdefault(request_id, Observation())

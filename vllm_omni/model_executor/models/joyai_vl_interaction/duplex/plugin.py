@@ -60,6 +60,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         {
             "joyai_delegation_results",
             "joyai_chunk_id",
+            "joyai_chunk_spoken",
             "_joyai_delegation_displayed",
             "_joyai_delegation_planned",
             "_joyai_chunk_id",
@@ -190,9 +191,10 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                 for key, default in (("tts_speaker", "Vivian"), ("tts_language", "Auto"), ("tts_instruct", ""))
             },
         }
-        # Delegation state is per-session bookkeeping, not session configuration:
-        # an update must carry it forward or accepted results would vanish.
-        for key in ("joyai_delegation_results", "joyai_chunk_id"):
+        # Delegation and chunk state are per-session bookkeeping, not session
+        # configuration: an update must carry them forward or accepted results
+        # would vanish and the chunk identity would restart.
+        for key in ("joyai_delegation_results", "joyai_chunk_id", "joyai_chunk_spoken"):
             if key in current:
                 updated[key] = current[key]
         # The declared tools are session configuration and only the delegate
@@ -265,7 +267,6 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         self.data_plane.begin_request(request_id)
         request = self.data_plane.requests[request_id]
         request.state = state
-        self.data_plane.session_state = state if isinstance(state, JoyAISessionState) else None
         request.frames = config["joyai_frames"]
         request.conversation_images = config.pop("joyai_conversation_images")
         request.modalities = tuple(config["modalities"])
@@ -307,20 +308,21 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         """Give this observation its chunk identity.
 
         JoyAI's interaction is chunk based: a spoken reply answers the goal of
-        the current chunk and stays the goal until the chunk closes. The chunk
-        here advances when a reply of the current chunk stored text and the
-        next observation brings a new camera frame -- the point where the
-        retained-answer deduplication also releases the reply.
+        the current chunk and stays the goal until the chunk closes. Both the
+        chunk id and the "a reply of it stored text" flag live in the session
+        runtime config, so two sessions of one deployment cannot advance each
+        other's chunk.
         """
-        chunk = runtime_config.get("joyai_chunk_id")
-        request.chunk_id = chunk if isinstance(chunk, str) and chunk else None
-        if request.state is None:
+        current = runtime_config.get("joyai_chunk_id")
+        chunk, spoken = advance_chunk(
+            current=current,
+            spoken=runtime_config.get("joyai_chunk_spoken") is True,
+            has_camera=has_camera,
+        )
+        request.chunk_id = chunk
+        if chunk == current and spoken == (runtime_config.get("joyai_chunk_spoken") is True):
             return dict(runtime_config)
-        advanced = advance_chunk(request.state, current=chunk, has_camera=has_camera)
-        request.chunk_id = advanced
-        if advanced == chunk:
-            return dict(runtime_config)
-        return {**runtime_config, "joyai_chunk_id": advanced}
+        return {**runtime_config, "joyai_chunk_id": chunk, "joyai_chunk_spoken": spoken}
 
     def plan_append(
         self,
@@ -618,9 +620,13 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         chunk = runtime_config.get("joyai_chunk_id")
         expired = expired_results(runtime_config, chunk=chunk)
         updated = settle_response(runtime_config, committed=committed, chunk=chunk, expired=expired)
-        if isinstance(self.data_plane.session_state, JoyAISessionState) and committed:
-            self.data_plane.session_state.chunk_spoken = True
-        return updated
+        if not committed:
+            return updated
+        # A stored reply closes the chunk at its next camera frame. The flag is
+        # session state, so it travels with the runtime rather than a plugin slot.
+        spoken = dict(updated if updated is not None else runtime_config)
+        spoken["joyai_chunk_spoken"] = True
+        return spoken
 
     def retire_pending_function_output(
         self,
