@@ -17,7 +17,7 @@ import pytest
 
 from tests.engine.duplex.test_session_runner import tts_output
 from tests.model_executor.models.joyai_vl_interaction.test_duplex_plugin import observe, open_joyai
-from vllm_omni.engine.duplex.commands import AckPlayback, CreateItem, UpdateSession
+from vllm_omni.engine.duplex.commands import AckPlayback, CancelResponse, CreateItem, UpdateSession
 from vllm_omni.engine.duplex.session.tool_calls import ToolCallState
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.delegation import (
     DELEGATION_TOOL_NAME,
@@ -27,6 +27,8 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.delegation impo
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 DELEGATED = "</response> Checking the pot. </delegation> Is the pot overheated?"
+#: A delegation without a spoken note: the model hands the question over silently.
+DELEGATED_NO_NOTE = "</delegation> Is the pot overheated?"
 DIGEST = "The pot has been simmering for 20 minutes."
 
 
@@ -210,5 +212,63 @@ async def test_delegation_without_declared_tool_fails_fast():
         assert function_calls(h, events) == []
         failures = [event for event in events if event.type == "response.done"]
         assert failures and failures[0].to_realtime()["response"]["status"] == "failed"
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_note_free_delegation_releases_its_observation():
+    """A silent delegation still ends its observation, so the next one can start.
+
+    The call is published, but the shared call handler returns before the response
+    lifecycle runs. Without the empty terminal the observation would keep its
+    active request and the next camera commit could not open a response.
+    """
+    h = await delegating_session()
+    try:
+        request_id = await observe(h)
+        events = await h.deliver_and_settle(
+            tts_output(request_id, text=DELEGATED_NO_NOTE, finished=True), stage_id=0, segment_finished=True
+        )
+        # Exactly one call, and it carries the question with no note.
+        [call] = function_calls(h, events)
+        assert json.loads(call["arguments"]) == {"question": "Is the pot overheated?"}
+        # The observation ended, so no response is left owning the request.
+        assert h.session.active_response_id is None, realtime_events(h, events)
+        # Nothing was spoken, so nothing is stored as an assistant turn.
+        assert not [message for message in h.session.history if message.get("role") == "assistant"]
+        # The session is free to take the next observation.
+        accepted = await h.run(result_item(call["call_id"], DIGEST))
+        assert error_codes(accepted) == []
+        await observe(h)
+        assert h.port.submissions, "the follow-up observation must reach the stage"
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_note_audio_is_not_stored_as_spoken_history():
+    """A note whose audio never completed must not enter history as spoken.
+
+    The note carries ``text_requires_complete_audio``, so cancelling between the
+    projection and the first Code2Wav output leaves its text uncommitted. An
+    empty assistant turn is still recorded as the audio reply's boundary; what
+    must not appear is the note's text, which a later prompt would otherwise
+    treat as something the user already heard.
+    """
+    h = await delegating_session()
+    try:
+        request_id = await observe(h)
+        events = await h.deliver_and_settle(
+            tts_output(request_id, text=DELEGATED, finished=True), stage_id=0, segment_finished=True
+        )
+        [call] = function_calls(h, events)
+        assert call["call_id"]
+        # Cancel before any Code2Wav audio reaches the session.
+        cancelled = await h.run(CancelResponse())
+        assert not [event for event in cancelled if getattr(event, "code", None)], cancelled
+        spoken = [message.get("content") for message in h.session.history if message.get("role") == "assistant"]
+        assert "Checking the pot." not in spoken, h.session.history
+        assert all(not content for content in spoken), h.session.history
     finally:
         await h.manager.shutdown()
