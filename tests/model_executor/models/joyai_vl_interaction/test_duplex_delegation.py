@@ -130,25 +130,28 @@ def test_oldest_result_is_evicted_at_the_capacity():
 
 
 def test_rendered_block_pairs_question_and_answer():
-    block = delegation.render_result_blocks(delegation.unanswered_results(accepted()))
+    block, rendered = delegation.render_result_blocks(delegation.unanswered_results(accepted()))
     assert block.startswith("[Delegated Results]")
     assert "Question: Is the pot overheated?" in block
     assert "Answer: It is smoking." in block
+    assert rendered == ["call_1"]
 
 
 def test_rendered_block_keeps_the_newest_result_whole():
     runtime = accepted()
     runtime = accepted(call_id="call_2", output="Second answer.", runtime=runtime)
-    block = delegation.render_result_blocks(
+    block, rendered = delegation.render_result_blocks(
         delegation.unanswered_results(runtime),
         window_chars=len("Question: Is the pot overheated?\nAnswer: Second answer."),
     )
     assert "Second answer." in block
     assert "It is smoking." not in block
+    # The trimmed result is not in the text, so it must not be booked as shown.
+    assert rendered == ["call_2"]
 
 
 def test_rendered_block_is_empty_without_results():
-    assert delegation.render_result_blocks([]) == ""
+    assert delegation.render_result_blocks([]) == ("", [])
 
 
 def test_displayed_result_is_not_shown_again_in_the_same_chunk():
@@ -201,23 +204,39 @@ def test_cancelled_turn_expires_unanswered_results_only():
 
 def test_reconcile_keeps_a_result_accepted_while_the_prompt_was_planned():
     planned_runtime = accepted()
-    planned = delegation.result_records(planned_runtime)
     live = accepted(call_id="call_2", output="Arrived meanwhile.", runtime=planned_runtime)
-    merged = delegation.reconcile_delegation_runtime(
-        live, prompt={"joyai_delegation_results": planned}, displayed=["call_1"], chunk="c0"
-    )
+    merged = delegation.reconcile_delegation_runtime(live, displayed=["call_1"], chunk="c0")
     assert [record["call_id"] for record in merged] == ["call_1", "call_2"]
     assert merged[0]["displayed_in_chunk"] == "c0"
     assert "displayed_in_chunk" not in merged[1]
 
 
 def test_reconcile_without_live_results_changes_nothing():
-    assert (
-        delegation.reconcile_delegation_runtime(
-            {}, prompt={"joyai_delegation_results": []}, displayed=["call_1"], chunk="c0"
-        )
-        is None
-    )
+    assert delegation.reconcile_delegation_runtime({}, displayed=["call_1"], chunk="c0") is None
+
+
+def test_reconcile_does_not_roll_back_a_settle_that_ran_meanwhile():
+    """The plan must not overwrite a settle that happened during planning."""
+    runtime = accepted()
+    runtime = delegation.mark_displayed(runtime, call_ids=["call_1"], chunk="c0") or runtime
+    # The response settles while the prompt is still being planned.
+    runtime = {**runtime, **delegation.settle_response(runtime, committed=True, chunk="c0")}
+    merged = delegation.reconcile_delegation_runtime(runtime, displayed=[], chunk="c0")
+    [record] = merged
+    assert record["answered"] == 1, "reconciling must not reset the settle"
+
+
+def test_answered_result_is_not_reused_in_a_later_chunk():
+    """The one reuse belongs to the chunk that answered the result."""
+    runtime = accepted()
+    runtime = delegation.mark_displayed(runtime, call_ids=["call_1"], chunk="chunk-0") or runtime
+    runtime = {**runtime, **delegation.settle_response(runtime, committed=True, chunk="chunk-0")}
+    [record] = delegation.result_records(runtime)
+    assert record["answered_in_chunk"] == "chunk-0"
+    # Reusable once inside its own chunk...
+    assert [result.call_id for result in delegation.unanswered_results(runtime, chunk="chunk-0")] == ["call_1"]
+    # ...but never carried into the next scene.
+    assert delegation.unanswered_results(runtime, chunk="chunk-1") == []
 
 
 def test_chunk_advances_after_a_spoken_reply_and_a_new_frame():

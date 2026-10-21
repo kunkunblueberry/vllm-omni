@@ -62,7 +62,6 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             "joyai_chunk_id",
             "joyai_chunk_spoken",
             "_joyai_delegation_displayed",
-            "_joyai_delegation_planned",
             "_joyai_chunk_id",
         }
     )
@@ -389,13 +388,15 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         # so the chunk identity is the one the session loop bound to this request.
         chunk = session_config.get("joyai_chunk_id")
         results: list[DelegationResult] = []
+        rendered_call_ids: list[str] = []
         results_block = ""
         if delegation:
             results = unanswered_results(runtime_config, chunk=chunk)
-            results_block = render_result_blocks(results)
-        budget = self.max_model_len - (sampling_params.max_tokens or 256) - len(results_block)
-        if budget <= 0:
-            raise DuplexRuntimeConfigError("JoyAI delegated results exceed the context budget")
+            results_block, rendered_call_ids = render_result_blocks(results)
+        # The rendered block is part of the prompt, so the prompt renderer below
+        # counts its tokens against the budget; subtracting its characters here
+        # too would reserve the same context twice.
+        budget = self.max_model_len - (sampling_params.max_tokens or 256)
         # Qwen3-VL expands each image placeholder to this many visual tokens.
         # Infer the grid from image sizes once; budget trimming needs no pixels.
         image_processor = self.processor.image_processor
@@ -444,12 +445,13 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             except OmniClientError as exc:
                 raise DuplexRuntimeConfigError(str(exc)) from exc
             prompt_data["multi_modal_data"] = {"image": images} if images else {}
-        if results:
+        if rendered_call_ids:
             # Private plan-time marks: the session books them only once the
             # stage accepts this append, and reconciles them with the live
-            # runtime, which may have accepted a newer result meanwhile.
-            prompt_data["_joyai_delegation_displayed"] = [result.call_id for result in results]
-            prompt_data["_joyai_delegation_planned"] = result_records(runtime_config)
+            # runtime, which may have accepted a newer result meanwhile. Only
+            # the results this prompt actually rendered are booked; a result
+            # trimmed out of the block stays available for a later prompt.
+            prompt_data["_joyai_delegation_displayed"] = rendered_call_ids
         return DuplexAppendPlan(prompt=prompt_data)
 
     def user_transcript(self, *, stage_id: int, output: object, prompt: object, finished: bool) -> str | None:
@@ -494,7 +496,13 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         return JoyAIDuplexPlugin.declares_delegation(tools)
 
     def parse_function_call(self, model_result: Mapping[str, object]) -> dict[str, str] | None:
-        """Publish this observation's delegation as one shared function call."""
+        """Publish this observation's delegation as one shared function call.
+
+        A call is terminal for its observation even when it also spoke a note:
+        the reply that will matter is the one answering its result. The chunk
+        flag is not set here -- it lives in the session runtime, and a call
+        alone must not close the chunk (there is no spoken reply to repeat).
+        """
         call = model_result.get("joyai_function_call")
         if not isinstance(call, Mapping):
             return None
@@ -503,11 +511,6 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             return None
         if not isinstance(arguments, str) or not arguments:
             return None
-        # A call is terminal for this observation even when it also spoke a
-        # note: the reply that will matter is the one answering its result.
-        state = self.data_plane.requests.get(model_result.get("data_plane_request_id"))
-        if state is not None and state.state is not None:
-            state.state.chunk_spoken = True
         return {"call_id": call_id, "name": name, "arguments": arguments}
 
     @staticmethod
@@ -560,13 +563,10 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
     def runtime_patch_for_submitted_prompt(self, prompt: dict[str, object]) -> Mapping[str, object] | None:
         """Book the results this accepted prompt displays."""
         displayed = prompt.pop("_joyai_delegation_displayed", None)
-        planned = prompt.pop("_joyai_delegation_planned", None)
         chunk = prompt.pop("_joyai_chunk_id", None)
         patch: dict[str, object] = {}
         if isinstance(displayed, list) and displayed:
             patch["_joyai_delegation_displayed"] = [call_id for call_id in displayed if isinstance(call_id, str)]
-        if isinstance(planned, list):
-            patch["_joyai_delegation_planned"] = planned
         if isinstance(chunk, str):
             patch["joyai_chunk_id"] = chunk
         return patch or None
@@ -581,14 +581,8 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         if not isinstance(displayed, list) or not displayed:
             return None
         call_ids = [call_id for call_id in displayed if isinstance(call_id, str)]
-        planned = updated.get("_joyai_delegation_planned")
         chunk = updated.get("joyai_chunk_id")
-        live = reconcile_delegation_runtime(
-            current,
-            prompt={"joyai_delegation_results": planned if isinstance(planned, list) else []},
-            displayed=call_ids,
-            chunk=chunk,
-        )
+        live = reconcile_delegation_runtime(current, displayed=call_ids, chunk=chunk)
         if live is None:
             return None
         # The reconciler's return value is installed as the whole runtime, so

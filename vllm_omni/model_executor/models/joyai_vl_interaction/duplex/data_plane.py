@@ -205,8 +205,10 @@ class JoyAIDataPlane(DuplexDataPlane):
         result carries the whole output's ``end_of_turn``: nothing else of this
         output will carry it. The note is the ordinary spoken reply that
         follows, so it carries the text of its own response whenever the audio
-        stage is going to render it. A delegation without a note has nothing to
-        speak and completes the observation through the call alone.
+        stage is going to render it. A delegation without a note still owes the
+        observation a terminal of its own: the call is published, but the shared
+        call handler returns before the response lifecycle runs, so an empty
+        terminal releases the request instead of leaving it open.
         """
         if observation.call_sent or observation.text_sent:
             return
@@ -219,6 +221,10 @@ class JoyAIDataPlane(DuplexDataPlane):
             # The call already ended the turn; only a text-only observation
             # has no audio stage left to produce the terminal.
             end_of_turn=not audio,
+            # Without this the session would commit the note as spoken history
+            # when its audio never completed, e.g. a cancel between projection
+            # and the first Code2Wav output.
+            text_requires_complete_audio=audio,
         )
         arguments = delegation_arguments(action)
         observation.call_sent = True
@@ -228,7 +234,12 @@ class JoyAIDataPlane(DuplexDataPlane):
             # call is exposed.
             observation.text_sent = True
             if not action.text:
-                note_event.update(text="", model_context_text="", end_of_turn=True)
+                note_event.update(
+                    text="",
+                    model_context_text="",
+                    end_of_turn=True,
+                    text_requires_complete_audio=False,
+                )
             yield note_event
             return
         observation.text_sent = True
@@ -241,3 +252,14 @@ class JoyAIDataPlane(DuplexDataPlane):
         yield call_event
         if action.text:
             yield note_event
+            return
+        # A note-free call still ends its observation. The call result above is
+        # published, but nothing else of this output will produce a terminal.
+        terminal_event = dict(event)
+        terminal_event.update(
+            text="",
+            model_context_text="",
+            end_of_turn=True,
+            text_requires_complete_audio=False,
+        )
+        yield terminal_event

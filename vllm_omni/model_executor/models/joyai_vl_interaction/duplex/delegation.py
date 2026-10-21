@@ -171,15 +171,22 @@ def unanswered_results(runtime_config: Mapping[str, object], *, chunk: object = 
 
     A result is shown while it is unanswered, and once more inside the chunk
     that answered it (JoyAI keeps speaking for that chunk's goal). A result
-    answered twice, or expired with the turn that asked it, is never shown.
+    answered in a *different* chunk has left that goal behind and is not shown
+    again; neither is one that was answered twice or expired with its turn.
     """
     results: list[DelegationResult] = []
     for record in result_records(runtime_config):
         if record.get("expired"):
             continue
         answered = record.get("answered")
-        if isinstance(answered, int) and answered >= MAX_RESULT_REUSES:
-            continue
+        if isinstance(answered, int) and answered > 0:
+            # The reuse belongs to the chunk that answered it, not to whatever
+            # chunk is current now.
+            if answered >= MAX_RESULT_REUSES:
+                continue
+            answered_in = record.get("answered_in_chunk")
+            if not (isinstance(answered_in, str) and isinstance(chunk, str) and answered_in == chunk):
+                continue
         displayed = record.get("displayed_in_chunk")
         if isinstance(displayed, str) and isinstance(chunk, str) and displayed == chunk:
             continue
@@ -305,7 +312,10 @@ def settle_response(
         if committed and displayed:
             answered = record.get("answered", 0)
             updated["answered"] = answered + 1 if isinstance(answered, int) else 1
-            # Answered now; an open chunk may still reuse it once.
+            # Remember which chunk answered it: the one reuse this chunk may
+            # still make is scoped to that chunk, not to a later one.
+            if isinstance(chunk, str) and chunk:
+                updated["answered_in_chunk"] = chunk
             updated.pop("displayed_in_chunk", None)
             changed = True
         elif not committed and displayed:
@@ -315,6 +325,7 @@ def settle_response(
         if updated.get("call_id") in expired_ids:
             updated["expired"] = True
             updated.pop("displayed_in_chunk", None)
+            updated.pop("answered_in_chunk", None)
             changed = True
         remaining.append(updated)
     if not changed:
@@ -342,6 +353,7 @@ def expire_unanswered(runtime_config: Mapping[str, object]) -> dict[str, object]
         if not updated.get("answered") and not updated.get("expired"):
             updated["expired"] = True
             updated.pop("displayed_in_chunk", None)
+            updated.pop("answered_in_chunk", None)
             changed = True
         remaining.append(updated)
     if not changed:
@@ -352,7 +364,6 @@ def expire_unanswered(runtime_config: Mapping[str, object]) -> dict[str, object]
 def reconcile_delegation_runtime(
     current: Mapping[str, object],
     *,
-    prompt: Mapping[str, object],
     displayed: list[str],
     chunk: object,
 ) -> list[dict[str, object]] | None:
@@ -361,23 +372,16 @@ def reconcile_delegation_runtime(
     The prompt was planned on a snapshot. While it was planned the session may
     have accepted another result or settled a response. Reconcile by call id:
     keep the live list (so nothing accepted meanwhile is lost) and apply only
-    this plan's own marks.
+    the display mark this plan owns. ``answered`` / ``expired`` belong to the
+    live record; copying a plan-time snapshot back would undo a settle that ran
+    while the prompt was being planned.
     """
     live = result_records(current)
     if not live:
         return None
-    planned_records = prompt.get("joyai_delegation_results")
-    planned = {
-        record.get("call_id"): record for record in result_records({"joyai_delegation_results": planned_records})
-    }
     merged: list[dict[str, object]] = []
     for record in live:
         result = dict(record)
-        planned_record = planned.get(record.get("call_id"))
-        if isinstance(planned_record, Mapping):
-            for key in ("answered", "expired"):
-                if key in planned_record:
-                    result[key] = planned_record[key]
         if record.get("call_id") in displayed and isinstance(chunk, str) and chunk:
             result["displayed_in_chunk"] = chunk
         merged.append(result)
@@ -406,12 +410,15 @@ def render_result_blocks(
     results: list[DelegationResult],
     *,
     window_chars: int = DELEGATION_RESULT_WINDOW_CHARS,
-) -> str:
+) -> tuple[str, list[str]]:
     """Render results as one prompt block, newest kept whole.
 
-    Returns an empty string when there is nothing to add.
+    Returns the block text and the call ids it actually contains. Results that
+    do not fit the window are not in the text, so a caller must not book them as
+    displayed: they stay available for a later prompt.
     """
     blocks: list[str] = []
+    rendered: list[str] = []
     remaining = max(0, window_chars)
     for result in reversed(results):
         block = f"Question: {result.question}\nAnswer: {result.output}"
@@ -420,9 +427,10 @@ def render_result_blocks(
                 break
             block = block[:remaining].rstrip() + " ..."
         blocks.append(block)
+        rendered.append(result.call_id)
         remaining -= len(block)
         if remaining <= 0:
             break
     if not blocks:
-        return ""
-    return "[Delegated Results]\n" + "\n\n".join(reversed(blocks))
+        return "", []
+    return "[Delegated Results]\n" + "\n\n".join(reversed(blocks)), list(reversed(rendered))
