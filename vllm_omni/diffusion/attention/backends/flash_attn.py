@@ -204,6 +204,15 @@ class FlashAttentionBackend(AttentionBackend):
         return True
 
     @classmethod
+    def supports_dense_pair_mask(cls, attention_spec: object | None = None) -> bool:
+        del attention_spec
+        # Ascend's ``forward_fa_npu`` materializes the dense keep-mask and runs
+        # npu_fusion_attention in allMask mode, so a (batch, 1, q, kv) mask is
+        # consumed directly. The varlen masked path used on CUDA/ROCm/MUSA/XPU
+        # only accepts a 2D key-padding mask.
+        return current_omni_platform.is_npu()
+
+    @classmethod
     def supports_cross_kv_mask(cls, attention_spec: object | None = None) -> bool:
         del attention_spec
         if not current_omni_platform.is_cuda():

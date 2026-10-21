@@ -160,6 +160,14 @@ class SDPABackend(AttentionBackend):
     accept_output_buffer: bool = True
 
     @classmethod
+    def supports_dense_pair_mask(cls, attention_spec: object | None = None) -> bool:
+        # torch SDPA evaluates an arbitrary boolean pair mask natively,
+        # including the (batch, 1, q_len, kv_len) block-causal masks diffusion
+        # models build.
+        del attention_spec
+        return True
+
+    @classmethod
     def resolve_capabilities(cls, context: ExecutionContext) -> ExecutionPathResult:
         return ExecutionPathResult.unmigrated(cls.get_name(), context, path="runtime_gqa_dependent")
 

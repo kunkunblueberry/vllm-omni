@@ -38,6 +38,14 @@ class FlashInferAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
 
     @classmethod
+    def supports_dense_pair_mask(cls, attention_spec: object | None = None) -> bool:
+        # ``_pack_mask_for_flashinfer`` collapses the head dim of a 4D mask and
+        # broadcasts it to the (batch, qo_len, kv_len) ``custom_mask`` form, so
+        # a dense pair mask is consumed directly.
+        del attention_spec
+        return True
+
+    @classmethod
     def supports_attention_mask(cls, attention_spec: object | None = None) -> bool:
         # fa2/fa3 batch-prefill accept boolean custom masks. cute-dsl does not:
         # automatic platform selection may fall back to SDPA, but an explicit

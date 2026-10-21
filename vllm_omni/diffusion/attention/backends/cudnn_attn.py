@@ -18,6 +18,13 @@ class CuDNNAttentionBackend(AttentionBackend):
     supports_prefix_kv_slicing: bool = True
     supports_piecewise_spans: bool = True
 
+    @classmethod
+    def supports_dense_pair_mask(cls, attention_spec: object | None = None) -> bool:
+        # The mask is handed to torch SDPA, whose cuDNN FMHA plan accepts a
+        # dense (batch, 1, q_len, kv_len) boolean pair mask.
+        del attention_spec
+        return True
+
     # cuDNN 9.5+ FMHA on Blackwell: head_dim divisible by 8 and at most 256
     # for BF16/FP16. Used by automatic platform selection; explicit CUDNN_ATTN
     # raises when the configured head size is outside this set.

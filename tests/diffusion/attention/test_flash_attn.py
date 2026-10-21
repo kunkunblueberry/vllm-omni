@@ -1248,6 +1248,215 @@ def test_prefix_kv_slice_no_scaling_without_factor(monkeypatch):
     torch.testing.assert_close(out, torch.ones(1, 8, 2, 4))
 
 
+def _block_causal_pair_mask(ids: torch.Tensor, key_valid: torch.Tensor) -> torch.Tensor:
+    """(1, 1, S, S) block-causal mask: ``q >= k`` or same image block, minus padded keys."""
+    seq = ids.numel()
+    qi = torch.arange(seq, device=ids.device).view(-1, 1)
+    ki = torch.arange(seq, device=ids.device).view(1, -1)
+    same = (ids.view(-1, 1) == ids.view(1, -1)) & (ids.view(-1, 1) >= 0)
+    mask = ((qi >= ki) | same) & key_valid.view(1, -1)
+    return mask.view(1, 1, seq, seq).contiguous()
+
+
+def _dense_pair_case(device: torch.device, dtype: torch.dtype, *, padded: bool):
+    """Qwen-Image-2.1 geometry: text prefix, then two image blocks."""
+    num_heads, head_dim = 4, 64
+    text_valid, text_max, block = 3, 40, 8
+    ids = torch.cat(
+        [
+            torch.full((text_max,), -1, dtype=torch.long),
+            torch.zeros(block, dtype=torch.long),
+            torch.ones(block, dtype=torch.long),
+        ]
+    ).to(device)
+    key_valid = torch.ones(ids.numel(), dtype=torch.bool, device=device)
+    if padded:
+        key_valid[text_valid:text_max] = False
+    torch.manual_seed(11)
+    query = torch.randn(1, ids.numel(), num_heads, head_dim, device=device, dtype=dtype)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    return ids, key_valid, query, key, value, num_heads, head_dim
+
+
+@pytest.mark.cpu
+def test_dense_pair_mask_capability_flags():
+    # #9187: the CUDA/ROCm/MUSA/XPU flash path only understands a 2D
+    # key-padding mask, so it must not advertise dense pair-mask support there;
+    # SDPA, cuDNN and FlashInfer consume the 4D mask directly.
+    from vllm_omni.diffusion.attention.backends.cudnn_attn import CuDNNAttentionBackend
+    from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
+    from vllm_omni.diffusion.attention.backends.flashinfer_attn import FlashInferAttentionBackend
+    from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
+
+    assert SDPABackend.supports_dense_pair_mask() is True
+    assert CuDNNAttentionBackend.supports_dense_pair_mask() is True
+    assert FlashInferAttentionBackend.supports_dense_pair_mask() is True
+    if not current_omni_platform.is_npu():
+        assert FlashAttentionBackend.supports_dense_pair_mask() is False
+
+
+@pytest.mark.cpu
+def test_dense_pair_mask_capability_is_platform_aware(monkeypatch):
+    # Ascend forwards the dense mask to npu_fusion_attention's allMask mode, so
+    # the same backend class must report the capability per platform.
+    from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
+
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
+    assert FlashAttentionBackend.supports_dense_pair_mask() is True
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    assert FlashAttentionBackend.supports_dense_pair_mask() is False
+
+
+def _dense_mask_dispatch_layer(*, explicit: bool, selected_forward, sdpa_forward):
+    """Layer stub for dispatch-only assertions (no kernel runs)."""
+    from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
+
+    return SimpleNamespace(
+        attn_backend=FlashAttentionBackend,
+        attn_spec=None,
+        backend_explicit=explicit,
+        allow_fp32_fallback=False,
+        attention=SimpleNamespace(forward=selected_forward),
+        sdpa_fallback=SimpleNamespace(forward=sdpa_forward),
+        _assert_metadata_compatible=lambda metadata: None,
+        _has_custom_attention=False,
+        _scheduler_paged_kv=False,
+        paged_kv_cache_role=None,
+    )
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("explicit", [True, False], ids=["explicit-backend", "automatic-selection"])
+def test_ascend_flash_attn_keeps_dense_mask_dispatch(monkeypatch, explicit):
+    """Dispatch only (mocked platform): Ascend must not be redirected to SDPA.
+
+    The numeric behaviour of ``forward_fa_npu`` is covered by the A3 tests in
+    ``test_flash_attn_npu.py``; this guards the layer-level routing decision.
+    """
+    from vllm_omni.diffusion.attention.layer import Attention
+
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
+
+    sentinel = torch.randn(1, 2, 4, 8)
+    selected_calls = []
+    layer = _dense_mask_dispatch_layer(
+        explicit=explicit,
+        selected_forward=lambda *args: (selected_calls.append(args), sentinel)[1],
+        sdpa_forward=lambda *args: pytest.fail("Ascend dense-mask dispatch was redirected to SDPA"),
+    )
+    seq = 8
+    mask = torch.ones(1, 1, seq, seq, dtype=torch.bool)
+    metadata = AttentionMetadata(attn_mask=mask)
+
+    output = Attention._run_local_attention(layer, sentinel, sentinel, sentinel, metadata)
+
+    assert output is sentinel
+    assert len(selected_calls) == 1
+
+
+@pytest.mark.cpu
+def test_cuda_flash_attn_rejects_dense_mask_for_explicit_backend(monkeypatch):
+    """Explicit FLASH_ATTN on a 2D-only platform raises instead of switching."""
+    from vllm_omni.diffusion.attention.layer import Attention
+
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+
+    layer = _dense_mask_dispatch_layer(
+        explicit=True,
+        selected_forward=lambda *args: pytest.fail("flash backend must not run a 4D mask"),
+        sdpa_forward=lambda *args: pytest.fail("an explicit backend must not silently switch to SDPA"),
+    )
+    seq = 8
+    metadata = AttentionMetadata(attn_mask=torch.ones(1, 1, seq, seq, dtype=torch.bool))
+
+    with pytest.raises(NotImplementedError, match="cannot consume a dense 4D attention mask"):
+        q = torch.randn(1, seq, 4, 8)
+        Attention._run_local_attention(layer, q, q, q, metadata)
+
+
+def _flash_layer(num_heads: int, head_dim: int, softmax_scale: float):
+    """A real Attention layer pinned to FLASH_ATTN regardless of test order."""
+    from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
+    from vllm_omni.diffusion.attention.layer import Attention
+
+    layer = Attention(num_heads=num_heads, head_size=head_dim, causal=False, softmax_scale=softmax_scale)
+    # Backend resolution reads process-wide platform/package state that other
+    # tests may have exercised; pin the backend so this test is order-independent.
+    layer.attn_backend = FlashAttentionBackend
+    layer.attention = FlashAttentionImpl(
+        num_heads=num_heads, head_size=head_dim, softmax_scale=softmax_scale, causal=False
+    )
+    layer.sdpa_fallback = SDPAImpl(num_heads=num_heads, head_size=head_dim, softmax_scale=softmax_scale, causal=False)
+    layer.backend_explicit = False
+    return layer
+
+
+@hardware_test(res={"cuda": ["L4", "H100"]}, num_cards=1)
+@pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="vLLM FlashAttention requires CUDA")
+def test_dense_pair_mask_routes_to_sdpa(monkeypatch):
+    """A 4D block-causal mask must be evaluated by SDPA, not the 2D-only flash path."""
+    device = torch.device("cuda")
+    ids, key_valid, query, key, value, num_heads, head_dim = _dense_pair_case(device, torch.bfloat16, padded=True)
+    mask = _block_causal_pair_mask(ids, key_valid)
+    metadata = AttentionMetadata(attn_mask=mask)
+    softmax_scale = head_dim**-0.5
+
+    # The kernel keeps rejecting the pair mask; routing is the layer's job.
+    with pytest.raises(AssertionError, match="attention_mask must be 2D"):
+        FlashAttentionImpl(num_heads=num_heads, head_size=head_dim, softmax_scale=softmax_scale, causal=False).forward(
+            query, key, value, metadata
+        )
+
+    flash_calls = []
+    original = FlashAttentionImpl.forward
+
+    def counting_forward(self, *args, **kwargs):
+        flash_calls.append(1)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(FlashAttentionImpl, "forward", counting_forward)
+    layer = _flash_layer(num_heads, head_dim, softmax_scale)
+    out = layer(query, key, value, metadata)
+    assert flash_calls == [], "the dense pair mask reached the flash backend"
+
+    reference = SDPAImpl(num_heads=num_heads, head_size=head_dim, softmax_scale=softmax_scale, causal=False).forward(
+        query, key, value, metadata
+    )
+    torch.testing.assert_close(out, reference, rtol=2e-2, atol=2e-2)
+
+
+@hardware_test(res={"cuda": ["L4", "H100"]}, num_cards=1)
+@pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="vLLM FlashAttention requires CUDA")
+def test_piecewise_spans_stay_on_flash(monkeypatch):
+    """Spans carry the structure, so the same 4D mask must keep using flash."""
+    device = torch.device("cuda")
+    ids, key_valid, query, key, value, num_heads, head_dim = _dense_pair_case(device, torch.bfloat16, padded=False)
+    mask = _block_causal_pair_mask(ids, key_valid)
+    text_max = 40
+    block = 8
+    spans = [(text_max, text_max + block), (text_max + block, text_max + 2 * block)]
+    metadata = AttentionMetadata(attn_mask=mask, full_attn_spans=[spans])
+    softmax_scale = head_dim**-0.5
+
+    flash_calls = []
+    original = FlashAttentionImpl.forward
+
+    def counting_forward(self, *args, **kwargs):
+        flash_calls.append(1)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(FlashAttentionImpl, "forward", counting_forward)
+    layer = _flash_layer(num_heads, head_dim, softmax_scale)
+    out = layer(query, key, value, metadata)
+    assert flash_calls, "piecewise spans must stay on the flash backend"
+
+    reference = SDPAImpl(num_heads=num_heads, head_size=head_dim, softmax_scale=softmax_scale, causal=False).forward(
+        query, key, value, AttentionMetadata(attn_mask=mask)
+    )
+    torch.testing.assert_close(out, reference, rtol=2e-2, atol=2e-2)
+
+
 if __name__ == "__main__":
     print("Running FlashAttention Padding Tests...")
     print("=" * 60)

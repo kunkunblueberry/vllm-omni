@@ -86,6 +86,24 @@ class AttentionBackend(ABC):
         return False
 
     @classmethod
+    def supports_dense_pair_mask(cls, attention_spec: object | None = None) -> bool:
+        """Whether this backend can consume a dense ``(batch, 1, q, kv)`` pair mask.
+
+        A pair mask restricts which queries may attend to which keys, so it
+        cannot be expressed as a key-padding mask. Models that build one (for
+        example Qwen-Image-2.1's block-causal mask for a padded or
+        heterogeneous batch) rely on the Attention layer routing the call to a
+        backend that evaluates it instead of failing inside the kernel.
+
+        This is a classmethod, not a constant: the same backend class can
+        support the mask on one platform and not another (FlashAttention
+        forwards it to ``npu_fusion_attention`` on Ascend but only accepts a 2D
+        key-padding mask on CUDA/ROCm/MUSA/XPU).
+        """
+        del attention_spec
+        return False
+
+    @classmethod
     def supports_cross_kv_mask(cls, attention_spec: object | None = None) -> bool:
         """Whether a 2D mask excludes K/V only, including when Q and K have equal lengths."""
         del attention_spec

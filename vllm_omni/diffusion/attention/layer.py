@@ -772,6 +772,36 @@ class Attention(nn.Module):
                 return self.sdpa_fallback.forward(query, key, value, attn_metadata)
         self._assert_metadata_compatible(attn_metadata)
 
+        # A dense (q, k) pair mask has no FlashAttention varlen equivalent on
+        # CUDA/ROCm/MUSA/XPU: that path only accepts a 2D key-padding mask, so a
+        # 4D mask would trip an assertion deep inside the kernel
+        # (Qwen-Image-2.1's block-causal mask for a padded or heterogeneous
+        # batch, #9187). Route the call to SDPA, which evaluates the pair mask
+        # exactly. The capability is platform-aware, so Ascend keeps its native
+        # npu_fusion_attention path, and piecewise metadata is unaffected: there
+        # the spans carry the structure and the dense mask is only a fallback
+        # representation.
+        attn_mask = attn_metadata.attn_mask if attn_metadata is not None else None
+        if (
+            attn_mask is not None
+            and attn_mask.ndim == 4
+            and attn_metadata.full_attn_spans is None
+            and self.sdpa_fallback is not None
+            and getattr(self, "attn_backend", None) is not None
+            and not self.attn_backend.supports_dense_pair_mask(getattr(self, "attn_spec", None))
+        ):
+            backend_name = self.attn_backend.get_name()
+            if self.backend_explicit:
+                raise NotImplementedError(
+                    f"Explicit backend {backend_name} cannot consume a dense 4D attention mask; "
+                    "select TORCH_SDPA for workloads that build a pair mask"
+                )
+            logger.warning_once(
+                "Using SDPA for a dense 4D attention mask because %s only supports a 2D key-padding mask.",
+                backend_name,
+            )
+            return cast(AttentionImpl, self.sdpa_fallback).forward(query, key, value, attn_metadata)
+
         if (
             self.allow_fp32_fallback
             and query.is_cuda
