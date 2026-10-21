@@ -29,9 +29,12 @@ DELEGATED_ANSWER = "the code is ZB-4471"
 DELEGATION_INSTRUCTION = (
     "You are watching a camera feed. Speak only when you have something to report. "
     "If a question needs information the image cannot show, delegate it to the background helper "
-    "instead of guessing."
+    "instead of guessing. When a delegated result arrives, always answer it aloud with that result."
 )
 DELEGATION_PROMPT = "Which internal product code applies to the object in view? Delegate if you cannot read it."
+#: JoyAI answers the goal of the current chunk; asking for the result once the
+#: helper has come back is what the application does after a delegation.
+ANSWER_REQUEST = "Answer now with the result you received."
 
 
 def frame_base64(color: str) -> str:
@@ -62,6 +65,12 @@ def function_calls(collector: EventCollector) -> list[dict[str, object]]:
     return [event for event in collector.events if event.get("type") == "response.function_call_arguments.done"]
 
 
+def error_code(event: dict[str, object]) -> object:
+    """The ``error.code`` of one error event; the code is nested, not top-level."""
+    error = event.get("error")
+    return error.get("code") if isinstance(error, dict) else None
+
+
 async def wait_for_function_call(collector: EventCollector, timeout_s: float = 180) -> dict[str, object]:
     deadline = asyncio.get_running_loop().time() + timeout_s
     while asyncio.get_running_loop().time() < deadline:
@@ -72,15 +81,51 @@ async def wait_for_function_call(collector: EventCollector, timeout_s: float = 1
     raise AssertionError(f"JoyAI published no function call; recent events: {collector.events[-5:]}")
 
 
-async def observe(client: DuplexClient, color: str):
+def main_response_done(collector: EventCollector, seen: set[str]) -> dict[str, object] | None:
+    """The newest terminal belonging to the main observation response.
+
+    A delegating observation produces two terminals: the synthesised
+    function-call response and the spoken one. Only the latter owns the note's
+    audio, so a playback acknowledgement must name it.
+    """
+    for event in reversed(collector.events):
+        if event.get("type") != "response.done":
+            continue
+        response_id = str(event.get("response_id") or "")
+        if response_id.startswith("resp-duplex-") and response_id not in seen:
+            return event
+    return None
+
+
+async def observe(client: DuplexClient, collector: EventCollector, color: str, seen: set[str], timeout_s: float = 180):
     await client.append_audio(b"", video_frames=[frame_base64(color)])
     await client.commit(create_response=True)
-    return await client.wait_for("response.done", timeout_s=180)
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    while asyncio.get_running_loop().time() < deadline:
+        terminal = main_response_done(collector, seen)
+        if terminal is not None:
+            seen.add(str(terminal["response_id"]))
+            return terminal
+        await asyncio.sleep(0.1)
+    raise AssertionError("the observation produced no spoken response")
+
+
+async def acknowledge_note(client: DuplexClient, collector: EventCollector, terminal) -> None:
+    """Pay the playback debt of the note so the next observation is admitted.
+
+    JoyAI is serial: the session only accepts the next camera commit once the
+    audio it already sent has been acknowledged in full.
+    """
+    response_id = str(terminal["response_id"])
+    pcm = collector.audio_bytes(response_id)
+    played_ms = max(1, len(pcm) // 2 * 1000 // collector.output_sample_rate_hz)
+    await client.ack_playback(played_ms, response_id=response_id)
 
 
 async def run_delegation(url, model, output_dir):
     config = delegation_session_config()
     collector = EventCollector()
+    seen: set[str] = set()
     async with DuplexClient(url, model=model, config=config, reconnect=None) as client:
         consumer = asyncio.create_task(collector.consume(client))
         await asyncio.sleep(0)
@@ -99,13 +144,14 @@ async def run_delegation(url, model, output_dir):
 
             # 1. The model delegates: a declared tool must never surface as an
             #    unsupported call, and the call must carry its own question.
-            await observe(client, "red")
+            first = await observe(client, collector, "red", seen)
             call = await wait_for_function_call(collector)
             arguments = json.loads(str(call.get("arguments") or "{}"))
             assert arguments.get("question"), f"the call must carry a delegated question: {arguments}"
             assert "unsupported_tool_call" not in json.dumps(collector.errors()), collector.errors()
 
-            # 2. The application answers the call asynchronously.
+            # 2. The application answers the call while the note is still playing.
+            before_result = len(collector.events)
             await client.send(
                 {
                     "type": "conversation.item.create",
@@ -116,33 +162,65 @@ async def run_delegation(url, model, output_dir):
                     },
                 }
             )
-            assert not any(error.get("code") == "invalid_function_call_output" for error in collector.errors()), (
-                collector.errors()
-            )
+            await asyncio.sleep(2)
+            refused = [
+                event
+                for event in collector.events[before_result:]
+                if event.get("type") == "error" and error_code(event) == "invalid_function_call_output"
+            ]
+            assert not refused, f"the first result for a pending call must be accepted: {refused}"
 
-            # 3. The next observation speaks the delegated answer.
-            call_id = str(call["call_id"])
-            transcript = ""
-            for color in ("red", "blue", "red"):
-                terminal = await observe(client, color)
-                transcript = collector.response_text(terminal.response_id)
-                if DELEGATED_ANSWER.split()[-1].lower() in transcript.lower():
-                    break
-            (output_dir / "delegation-events.json").write_text(json.dumps(collector.events, indent=2), encoding="utf-8")
-            assert DELEGATED_ANSWER.split()[-1].lower() in transcript.lower(), (
-                f"the delegated answer never reached speech: {transcript!r}"
-            )
-
-            # A repeated result for the accepted call is refused by the ledger.
+            # 3. A repeated result for the accepted call is refused by the ledger.
+            #    It is checked here, while the call is still fresh, because the
+            #    refusal is a property of admission rather than of the answer.
             await client.send(
                 {
                     "type": "conversation.item.create",
-                    "item": {"type": "function_call_output", "call_id": call_id, "output": "a second answer"},
+                    "item": {
+                        "id": "duplicate-result",
+                        "type": "function_call_output",
+                        "call_id": call["call_id"],
+                        "output": "a second answer",
+                    },
                 }
             )
-            await asyncio.sleep(0.5)
-            duplicates = [error for error in collector.errors() if error.get("code") == "invalid_function_call_output"]
-            assert duplicates, "a duplicate function_call_output must be refused"
+            deadline = asyncio.get_running_loop().time() + 60
+            duplicates: list[dict[str, object]] = []
+            while asyncio.get_running_loop().time() < deadline:
+                duplicates = [
+                    error for error in collector.errors() if error_code(error) == "invalid_function_call_output"
+                ]
+                if duplicates:
+                    break
+                await asyncio.sleep(0.2)
+            assert duplicates, f"a duplicate function_call_output must be refused: {collector.errors()}"
+
+            # 4. JoyAI is serial: the next observation is only admitted once the
+            #    note's playback is acknowledged. The application also tells the
+            #    model to answer, which is how a delegated goal gets spoken.
+            await acknowledge_note(client, collector, first)
+            await client.send(
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": ANSWER_REQUEST}],
+                    },
+                }
+            )
+
+            # 5. A later observation speaks the delegated answer.
+            needle = DELEGATED_ANSWER.split()[-1].lower()
+            transcript = ""
+            for color in ("blue", "red", "blue", "red"):
+                terminal = await observe(client, collector, color, seen)
+                transcript = collector.response_text(str(terminal["response_id"]))
+                if needle in transcript.lower():
+                    break
+                await acknowledge_note(client, collector, terminal)
+            (output_dir / "delegation-events.json").write_text(json.dumps(collector.events, indent=2), encoding="utf-8")
+            assert needle in transcript.lower(), f"the delegated answer never reached speech: {transcript!r}"
 
             await client.close()
             await consumer
