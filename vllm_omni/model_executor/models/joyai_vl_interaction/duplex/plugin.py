@@ -589,7 +589,11 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         )
         if live is None:
             return None
-        return {"joyai_delegation_results": live}
+        # The reconciler's return value is installed as the whole runtime, so
+        # keep every key this prompt was planned against.
+        reconciled = dict(current)
+        reconciled["joyai_delegation_results"] = live
+        return reconciled
 
     def runtime_config_after_response(
         self,

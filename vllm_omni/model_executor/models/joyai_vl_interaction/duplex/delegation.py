@@ -244,7 +244,7 @@ def mark_displayed(
             changed = True
     if not changed:
         return None
-    return {"joyai_delegation_results": records}
+    return _with_results(runtime_config, records)
 
 
 def prune_expired(runtime_config: Mapping[str, object]) -> dict[str, object] | None:
@@ -254,7 +254,26 @@ def prune_expired(runtime_config: Mapping[str, object]) -> dict[str, object] | N
     if len(expired) <= EXPIRED_RESULT_RETENTION:
         return None
     live = [record for record in records if not record.get("expired")]
-    return {"joyai_delegation_results": [*expired[-EXPIRED_RESULT_RETENTION:], *live]}
+    return _with_results(runtime_config, [*expired[-EXPIRED_RESULT_RETENTION:], *live])
+
+
+def _with_results(
+    runtime_config: Mapping[str, object],
+    records: list[dict[str, object]],
+) -> dict[str, object]:
+    """Return the complete runtime with the result list replaced.
+
+    Every hook's return value is installed as the whole runtime, not merged into
+    it. A hook that returned only ``{"joyai_delegation_results": ...}`` would
+    drop ``tts_speaker`` and the rest of the session configuration, and the next
+    prompt would fail on the first missing key.
+    """
+    updated = dict(runtime_config)
+    if records:
+        updated["joyai_delegation_results"] = records
+    else:
+        updated.pop("joyai_delegation_results", None)
+    return updated
 
 
 def settle_response(
@@ -297,7 +316,7 @@ def settle_response(
         remaining.append(updated)
     if not changed:
         return None
-    return {"joyai_delegation_results": remaining}
+    return _with_results(runtime_config, remaining)
 
 
 def expired_call_ids(runtime_config: Mapping[str, object]) -> set[str]:
@@ -324,7 +343,7 @@ def expire_unanswered(runtime_config: Mapping[str, object]) -> dict[str, object]
         remaining.append(updated)
     if not changed:
         return None
-    return {"joyai_delegation_results": remaining}
+    return _with_results(runtime_config, remaining)
 
 
 def reconcile_delegation_runtime(
