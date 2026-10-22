@@ -210,17 +210,37 @@ async def run_delegation(url, model, output_dir):
                 }
             )
 
-            # 5. A later observation speaks the delegated answer.
+            # 5. A later observation speaks the delegated answer, with audio.
             needle = DELEGATED_ANSWER.split()[-1].lower()
             transcript = ""
+            answer_terminal = None
             for color in ("blue", "red", "blue", "red"):
                 terminal = await observe(client, collector, color, seen)
                 transcript = collector.response_text(str(terminal["response_id"]))
                 if needle in transcript.lower():
+                    answer_terminal = terminal
                     break
                 await acknowledge_note(client, collector, terminal)
             (output_dir / "delegation-events.json").write_text(json.dumps(collector.events, indent=2), encoding="utf-8")
             assert needle in transcript.lower(), f"the delegated answer never reached speech: {transcript!r}"
+
+            # 6. The answer is actually spoken, not just transcribed: it carries
+            #    PCM16 audio, and that playback is acknowledged so the session is
+            #    free again.
+            assert answer_terminal is not None
+            answer_pcm = collector.audio_bytes(str(answer_terminal["response_id"]))
+            assert len(answer_pcm) >= 2400 and len(answer_pcm) % 2 == 0, (
+                f"the delegated answer must produce nonempty PCM16 speech, got {len(answer_pcm)} bytes"
+            )
+            await acknowledge_note(client, collector, answer_terminal)
+
+            # 7. Serial admission depends on that acknowledgement: one further
+            #    camera observation must complete, not hang behind a stuck request.
+            errors_before = len(collector.errors())
+            final = await observe(client, collector, "red", seen)
+            assert final["response"]["status"] == "completed", final["response"]
+            assert len(collector.errors()) == errors_before, collector.errors()[errors_before:]
+            (output_dir / "delegation-events.json").write_text(json.dumps(collector.events, indent=2), encoding="utf-8")
 
             await client.close()
             await consumer
