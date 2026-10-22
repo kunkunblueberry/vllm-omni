@@ -221,16 +221,18 @@ async def run_delegation(url, model, output_dir):
                     answer_terminal = terminal
                     break
                 await acknowledge_note(client, collector, terminal)
-            (output_dir / "delegation-events.json").write_text(json.dumps(collector.events, indent=2), encoding="utf-8")
             assert needle in transcript.lower(), f"the delegated answer never reached speech: {transcript!r}"
 
             # 6. The answer is actually spoken, not just transcribed: it carries
             #    PCM16 audio, and that playback is acknowledged so the session is
-            #    free again.
+            #    free again. The floor is 50 ms at the session's own output rate,
+            #    so the check keeps its meaning if that rate changes.
             assert answer_terminal is not None
             answer_pcm = collector.audio_bytes(str(answer_terminal["response_id"]))
-            assert len(answer_pcm) >= 2400 and len(answer_pcm) % 2 == 0, (
-                f"the delegated answer must produce nonempty PCM16 speech, got {len(answer_pcm)} bytes"
+            min_bytes = collector.output_sample_rate_hz * 2 // 20
+            assert len(answer_pcm) >= min_bytes and len(answer_pcm) % 2 == 0, (
+                f"the delegated answer must produce nonempty PCM16 speech, got {len(answer_pcm)} bytes "
+                f"at {collector.output_sample_rate_hz} Hz"
             )
             await acknowledge_note(client, collector, answer_terminal)
 
@@ -240,13 +242,15 @@ async def run_delegation(url, model, output_dir):
             final = await observe(client, collector, "red", seen)
             assert final["response"]["status"] == "completed", final["response"]
             assert len(collector.errors()) == errors_before, collector.errors()[errors_before:]
-            (output_dir / "delegation-events.json").write_text(json.dumps(collector.events, indent=2), encoding="utf-8")
 
             await client.close()
             await consumer
         finally:
             consumer.cancel()
             await asyncio.gather(consumer, return_exceptions=True)
+            # Written on every path, so a failure in steps 6-7 still leaves the
+            # events that explain it instead of stopping at step 5.
+            (output_dir / "delegation-events.json").write_text(json.dumps(collector.events, indent=2), encoding="utf-8")
 
 
 @hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
