@@ -158,6 +158,10 @@ def test_graph_boundary_and_frame_rank_survive_real_cfg_dispatch(monkeypatch, cf
     assert initial.shape == shape
     with set_forward_context(), torch.inference_mode():
         get_forward_context().cfg_branch = "outer"
+        if rank == 5:
+            # Ming-Image refuses to denoise without projected direct
+            # conditioning; this layout contract only needs a real tensor.
+            get_forward_context().direct_condition = torch.zeros(1, 1)
         result = pipe.diffuse(
             prompt_embeds=[torch.full((2, 2), 2.0)],
             negative_prompt_embeds=[torch.ones(2, 2)],

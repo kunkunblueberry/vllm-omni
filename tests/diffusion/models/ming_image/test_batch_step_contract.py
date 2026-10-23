@@ -361,6 +361,47 @@ def test_preprocessor_compatibility_tracks_frames_prefix_reference_but_not_progr
     assert a.batch_compatibility_key != b.batch_compatibility_key
 
 
+def test_step_scheduler_isolates_distinct_resolutions_before_the_input_batch(monkeypatch):
+    """Regression: different resolutions must not share one step wave.
+
+    Input source: real pre_process plus StepScheduler admission for 16x16 and
+    16x32 requests. Expected source: request-owned latents carry the spatial
+    geometry and InputBatch rejects mixed trailing shapes, so the scheduler key
+    has to keep the two requests apart.
+    """
+    pipeline, _ = _wave_pipeline(monkeypatch)
+    runner = _runner(monkeypatch, pipeline)
+    scheduler = StepScheduler()
+    scheduler.initialize(SimpleNamespace(max_num_seqs=4))
+    preprocess = get_ming_image_pre_process_func(
+        SimpleNamespace(step_execution=True, tf_model_config=SimpleNamespace(multi_frame_output=False))
+    )
+
+    def admit(request_id, height, width):
+        request = _owned_request(request_id, steps=2)
+        request.sampling_params.height = height
+        request.sampling_params.width = width
+        preprocess(request)
+        scheduler.add_request(request)
+        return request
+
+    square = admit("square", 16, 16)
+    wide = admit("wide", 16, 32)
+    assert square.batch_compatibility_key != wide.batch_compatibility_key
+
+    def wave():
+        scheduled = scheduler.schedule()
+        runner._cleanup_finished_step_requests(scheduled)
+        output = runner._execute_stepwise_core(scheduled, record_output_peak_memory=False)
+        scheduler.update_from_output(scheduled, output)
+        return scheduled
+
+    # One resolution per wave: the geometry is part of the compatibility key,
+    # and InputBatch rejects mixed trailing latent shapes.
+    assert [wave().scheduled_request_ids for _ in range(2)] == [["square"], ["square"]]
+    assert [wave().scheduled_request_ids for _ in range(2)] == [["wide"], ["wide"]]
+
+
 def test_singleton_request_wave_obeys_runner_output_list_contract(monkeypatch):
     pipeline, _ = _wave_pipeline(monkeypatch)
     with override_forward_context(ForwardContext()):

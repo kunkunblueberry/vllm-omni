@@ -63,8 +63,7 @@ def test_nonzero_attention_uses_each_rows_position_and_mask(length, packed_view)
 @pytest.mark.parametrize("packed_view", [False, True])
 @pytest.mark.cuda
 def test_cuda_batched_rope_quarter_turns_preserve_rows_and_unrotated_tail(dtype, length, packed_view):
-    from vllm_omni.diffusion.models.z_image.z_image_transformer import ZImageRotaryEmbedding as RotaryEmbedding
-    from vllm_omni.diffusion.models.z_image.z_image_transformer import _apply_batched_rope
+    from vllm_omni.diffusion.models.ming_image.transformer import MingImageRotaryEmbedding as RotaryEmbedding
 
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
@@ -80,22 +79,22 @@ def test_cuda_batched_rope_quarter_turns_preserve_rows_and_unrotated_tail(dtype,
     for expected, source in ((expected_q, q), (expected_k, k)):
         expected[..., :6:2] = source[..., :6:2] * cos[:, :, None] - source[..., 1:6:2] * sin[:, :, None]
         expected[..., 1:6:2] = source[..., :6:2] * sin[:, :, None] + source[..., 1:6:2] * cos[:, :, None]
-    actual_q, actual_k = _apply_batched_rope(RotaryEmbedding(is_neox_style=False), q, k, cos, sin)
+    rope = RotaryEmbedding(is_neox_style=False)
+    actual_q, actual_k = rope(q, cos, sin), rope(k, cos, sin)
     torch.testing.assert_close(actual_q, expected_q, rtol=0, atol=0)
     torch.testing.assert_close(actual_k, expected_k, rtol=0, atol=0)
 
 
 @pytest.mark.cuda
 def test_batched_rope_compile_fullgraph_repeated_and_changed_shape():
-    from vllm_omni.diffusion.models.z_image.z_image_transformer import ZImageRotaryEmbedding as RotaryEmbedding
-    from vllm_omni.diffusion.models.z_image.z_image_transformer import _apply_batched_rope
+    from vllm_omni.diffusion.models.ming_image.transformer import MingImageRotaryEmbedding as RotaryEmbedding
 
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     rope = RotaryEmbedding(is_neox_style=False)
 
     def fn(q, k, cos, sin):
-        return _apply_batched_rope(rope, q, k, cos, sin)
+        return rope(q, cos, sin), rope(k, cos, sin)
 
     compiled = torch.compile(fn, dynamic=True, fullgraph=True)
     for length in (7, 33, 7):
@@ -112,8 +111,7 @@ def test_batched_rope_compile_fullgraph_repeated_and_changed_shape():
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("packed_view", [False, True])
 def test_low_precision_qk_keeps_float_rotary_coefficients_until_final_rounding(dtype, packed_view):
-    from vllm_omni.diffusion.models.z_image.z_image_transformer import ZImageRotaryEmbedding as RotaryEmbedding
-    from vllm_omni.diffusion.models.z_image.z_image_transformer import _apply_batched_rope
+    from vllm_omni.diffusion.models.ming_image.transformer import MingImageRotaryEmbedding as RotaryEmbedding
 
     values = torch.arange(2 * 7 * 2 * 24, dtype=torch.float32).reshape(2, 7, 2, 24) / 11 - 5
     packed = values.to(dtype)
@@ -129,7 +127,6 @@ def test_low_precision_qk_keeps_float_rotary_coefficients_until_final_rounding(d
         frequencies = torch.complex(cos, sin)[:, :, None, :]
         expected.append(torch.view_as_real(pairs * frequencies).flatten(-2).to(dtype))
     rope = RotaryEmbedding(is_neox_style=False)
-    rope._forward_method = rope.forward_native
-    actual = _apply_batched_rope(rope, query, key, cos, sin)
+    actual = (rope(query, cos, sin), rope(key, cos, sin))
     for output, oracle in zip(actual, expected, strict=True):
         torch.testing.assert_close(output, oracle, rtol=0, atol=0)

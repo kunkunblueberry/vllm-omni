@@ -675,7 +675,13 @@ class DiffusionEngine:
     def _busy_loop(self):
         assert self.stop_event is not None
         while not self.stop_event.is_set():
-            self._process_aborts_queue()
+            try:
+                self._process_aborts_queue()
+            except Exception:
+                # Abort retirement already failed the engine and stopped its
+                # workers; leave the loop without an unhandled thread error.
+                logger.error("Diffusion engine busy loop stopped after an abort failure", exc_info=True)
+                break
             self._process_rpc_queue()
             self._expire_streaming_idle()
             if self._scheduling_paused or self._playback_blocked() or not self.scheduler.has_requests():

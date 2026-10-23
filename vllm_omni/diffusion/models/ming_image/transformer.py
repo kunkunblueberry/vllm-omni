@@ -9,8 +9,33 @@ from cache_dit import ForwardPattern
 
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.z_image.z_image_transformer import ZImageTransformer2DModel
 
+
+class MingImageRotaryEmbedding(RotaryEmbedding):
+    """Rotate Q/K with the checkpoint's FP32 coefficients, rounded once.
+
+    ``RotaryEmbedding`` rounds the coefficients to the Q/K dtype first. The
+    Ming-Image reference rotates with FP32 coefficients and rounds only the
+    result, which keeps low-precision rows stable, and the same math applies one
+    cos/sin row per request so a batched wave keeps its own rotation.
+    """
+
+    # The shared attention must hand over the unrounded coefficients, and the
+    # fused QK-norm/RoPE kernel would replace this rotation with its own.
+    owns_rotation_dtype = True
+    supports_fused_qk_norm_rope = False
+
+    def forward(self, x, cos, sin):
+        if not self.half_head_dim:
+            cos = cos[..., ::2]
+            sin = sin[..., ::2]
+        rotary_dim = cos.shape[-1] * 2
+        pairs = torch.view_as_complex(x[..., :rotary_dim].float().reshape(*x.shape[:-1], -1, 2))
+        frequencies = torch.complex(cos.float(), sin.float()).unsqueeze(-2)
+        rotated = torch.view_as_real(pairs * frequencies).flatten(-2)
+        return torch.cat((rotated.to(x.dtype), x[..., rotary_dim:]), dim=-1)
 
 class MingImageTransformer2DModel(ZImageTransformer2DModel):
     """Runtime adapter for vendor DiffusionTransformer checkpoints.
@@ -23,6 +48,12 @@ class MingImageTransformer2DModel(ZImageTransformer2DModel):
         has_separate_cfg=False,
         check_forward_pattern=False,
     )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Ming-Image owns the Q/K rotation policy for every block it reuses.
+        for block in self.layers:
+            block.attention.rope = MingImageRotaryEmbedding(is_neox_style=False)
 
     def forward(
         self,
@@ -71,6 +102,9 @@ class MingImageTransformer2DModel(ZImageTransformer2DModel):
         )
         output = [item[:, :frames] for item, frames in zip(output, generated_frames)]
         return output, metadata
+
+
+__all__ = ["MingImageRotaryEmbedding", "MingImageTransformer2DModel"]
 
 
 __all__ = ["MingImageTransformer2DModel"]

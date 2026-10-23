@@ -18,8 +18,10 @@ from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.forward_context import ForwardContext, override_forward_context
-from vllm_omni.diffusion.layers.rope import RotaryEmbedding
-from vllm_omni.diffusion.models.ming_image.transformer import MingImageTransformer2DModel
+from vllm_omni.diffusion.models.ming_image.transformer import (
+    MingImageRotaryEmbedding,
+    MingImageTransformer2DModel,
+)
 from vllm_omni.diffusion.models.z_image.z_image_transformer import (
     LEARNED_PADDING,
     ZERO_MASKED_PADDING,
@@ -62,15 +64,19 @@ def _attention():
     shared.attn_backend = SDPABackend
     shared.attn_spec = None
     shared.attention = _CPUSDPA(1, 4, 0.5)
+    # Shared Attention state added after this helper was written: the eager
+    # cross-attention contract and the FP16 output upcast are both off here.
+    shared._explicit_cross_contract = False
+    shared.cross_parallel_layout = None
     attention = ZImageAttention.__new__(ZImageAttention)
     nn.Module.__init__(attention)
     attention.to_qkv = _ZeroQK()
     attention.head_dim = 4
     attention.norm_q = attention.norm_k = nn.Identity()
-    attention.rope = RotaryEmbedding(is_neox_style=False)
-    attention.rope._forward_method = attention.rope.forward_native
+    attention.rope = MingImageRotaryEmbedding(is_neox_style=False)
     attention.attn = shared
     attention.to_out = nn.ModuleList([nn.Identity()])
+    attention._upcast_output = False
     return attention
 
 
@@ -113,8 +119,9 @@ class _MeanBlock(nn.Module):
         self.attention = _attention()
         self.calls = []
 
-    def forward(self, x, mask, cos, sin, adaln_input=None):
+    def forward(self, x, mask, cos, sin, adaln_input=None, qk_norm_rope_table=None):
         self.calls.append((x.detach().clone(), mask.clone()))
+        del qk_norm_rope_table
         return self.attention(x, mask, cos, sin)
 
 

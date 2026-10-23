@@ -71,8 +71,11 @@ def _abort_engine(monkeypatch, timing, peers):
     executor._closed = False
     executor.driver_worker = SimpleNamespace(model_runner=runner)
     calls = []
-
     def rpc(method, *, args, **kwargs):
+
+        if method == "release_step_requests":
+            # Abort retirement is a real worker call, not a scheduler wave.
+            return runner.release_step_requests(list(args[0]))
         assert method == "execute_stepwise"
         scheduled = args[0]
         calls.append((list(scheduled.scheduled_request_ids), set(scheduled.finished_req_ids)))
@@ -204,8 +207,9 @@ def test_failed_step_retirement_stops_workers_before_scheduler_close(monkeypatch
     closed = []
 
     def fail_retirement(method, *, args, **kwargs):
-        if "a" in args[0].finished_req_ids:
-            assert set(args[0].scheduled_request_ids) == set(peers) - {"a"}
+        # Abort retirement reaches the worker as the retired request IDs.
+        if method == "release_step_requests" and "a" in args[0]:
+            assert list(args[0]) == ["a"]
             raise RuntimeError("injected retirement failure")
         return rpc(method, args=args, **kwargs)
 
