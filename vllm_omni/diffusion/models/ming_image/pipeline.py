@@ -673,6 +673,10 @@ def get_ming_image_pre_process_func(od_config: OmniDiffusionConfig):
             "ming_image",
             layered,
             sampling.num_frames,
+            # Request-owned latents carry the spatial geometry, so a gathered
+            # InputBatch can only hold one resolution at a time.
+            sampling.height,
+            sampling.width,
             direct_shape,
             reference is not None,
         )
