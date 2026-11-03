@@ -566,6 +566,12 @@ class NoisyKVCache:
         # chunk 0 is deduplicated while inside the recent window. The G/step
         # margins below also cover pipeline overlap and transfers.
         per_req = max(spec.max_history_chunks + 2 + layer_groups, spec.max_history_chunks + step_replicas)
+        if spec.history_versions > spec.max_history_chunks:
+            # Same-Step keeps one version per denoise step, so a live request reads
+            # the last H chunks' per-step versions in addition to the H
+            # session-retained ones (plus the chunk-0 sinks). Sizing the live window
+            # for one of them only exhausts the pool partway through a continuation.
+            per_req = max(per_req, 2 * spec.max_history_chunks + 3 + layer_groups)
         # A session keeps its retained window resident while the next request runs,
         # so those versions coexist with a full live window instead of sharing it.
         # Reserve that quota on top of the live one: without it a continuation
@@ -1049,8 +1055,15 @@ class NoisyKVState:
                 for req, plan in self._plans.items()
             )
         )
-        width = (h + 1 + sink) * pool.chunk_blocks
-        max_seq_len = (h + 1 + sink) * spec.max_chunk_tokens
+        # A diagonal consumer reads one in-request source that already sits inside
+        # the history window, so H + 1 blocks cover history plus the current write.
+        # Same-Step reads a per-step version from the last H chunks *in addition to*
+        # the H session-retained chunks, and each side can carry its own chunk-0
+        # sink, so both windows have to fit at once: (H + 1) + (H + 1) + write.
+        same_step = any(plan.schedule.ordering is Ordering.SAME_STEP for plan in self._plans.values())
+        window_blocks = (2 * h + 3) if same_step else (h + 1 + sink)
+        width = window_blocks * pool.chunk_blocks
+        max_seq_len = window_blocks * spec.max_chunk_tokens
         max_query_len = self.cache.max_batch_size * spec.max_chunk_tokens
         batch: list[list[NoisyLayerContext]] = []
         device = pool.k_pools[0].device

@@ -154,7 +154,7 @@ def test_cell_schedule_rejects_unknown_values():
         pipeline._plan_for(req)
 
 
-@pytest.mark.parametrize(("name", "step_replicas"), [("self_forcing", 1), ("latest_kv", 4)])
+@pytest.mark.parametrize(("name", "step_replicas"), [("self_forcing", 1), ("latest_kv", 4), ("same_step", 3)])
 def test_cell_schedule_accepts_known_values(name, step_replicas):
     from vllm_omni.experimental.ar_diffusion.cell_schedule import Ordering
 
@@ -171,7 +171,7 @@ def test_cell_schedule_accepts_known_values(name, step_replicas):
     assert plan.schedule.ordering.value == name
 
 
-@pytest.mark.parametrize("name", ["serial", "latest", "interleaved", "vertical", "same_step", "same_step_kv"])
+@pytest.mark.parametrize("name", ["serial", "latest", "interleaved", "vertical", "same_step_kv"])
 def test_cell_schedule_rejects_removed_aliases(name):
     pipeline = _bare_pipeline()
     req = OmniDiffusionRequest(
@@ -421,3 +421,54 @@ def test_latent_adapter_g_gt1_packs_hidden_and_advances_on_last_only():
     )
     assert 0 in last.finished["r0"]
     assert last_out2["latent"].shape == shape
+
+
+def test_causvid_accepts_same_step_at_s_eq_d():
+    """Same-Step is the S=D vertical placement: one weight replica per denoise step."""
+    pipeline = _bare_pipeline(step_replicas=3, history=6)
+    req = OmniDiffusionRequest(
+        prompt="x",
+        request_id="same-step-ok",
+        sampling_params=OmniDiffusionSamplingParams(
+            extra_args={"cell_schedule": "same_step", "num_denoise_steps": 3, "num_chunks": 2}
+        ),
+    )
+    plan, _, denoise = pipeline._plan_for(req)
+    assert plan.schedule.ordering is Ordering.SAME_STEP
+    assert plan.schedule.step_replicas == denoise == 3
+
+
+def test_causvid_rejects_same_step_without_s_eq_d():
+    """A consumer reads the version matching its own step, so each step needs a replica."""
+    pipeline = _bare_pipeline(step_replicas=4, history=6)
+    req = OmniDiffusionRequest(
+        prompt="x",
+        request_id="same-step-s4",
+        sampling_params=OmniDiffusionSamplingParams(
+            extra_args={"cell_schedule": "same_step", "num_denoise_steps": 3, "num_chunks": 2}
+        ),
+    )
+    with pytest.raises(ValueError, match="same_step requires step_replicas=D"):
+        pipeline._plan_for(req)
+
+
+def test_same_step_spec_reserves_one_version_per_denoise_step():
+    """Same-Step keeps a version per step plus chunk 0's sink, not one clean version.
+
+    Sizing the pool for the diagonal window would strand the extra per-step
+    versions the strategy actually retains.
+    """
+
+    def spec_for(step_replicas: int):
+        pipeline = CausVidWanPipeline.__new__(CausVidWanPipeline)
+        pipeline.step_replicas = step_replicas
+        pipeline.layer_groups = 1
+        pipeline.max_history_chunks = 2
+        pipeline._default_denoise = 3
+        pipeline.block_size = 16
+        pipeline.max_chunk_tokens = 16
+        pipeline.transformer = SimpleNamespace(local_num_layers=1, num_heads=2, head_dim=4)
+        return pipeline.ar_diffusion_noisy_kv_spec()
+
+    assert spec_for(3).history_versions == 2 * (3 + 1)  # S == D -> Same-Step
+    assert spec_for(4).history_versions == 2  # S == D+1 -> diagonal, one clean version per chunk

@@ -605,3 +605,68 @@ def test_explicit_noisy_session_requires_retention_reservation(mocker):
         runner.execute_model(_request())
 
     assert len(runner._noisy_sessions) == 0
+
+
+def _run_plan(
+    state: NoisyKVState,
+    session: NoisyKVSession,
+    req: str,
+    plan,
+    *,
+    chunk_start: int,
+) -> _SeqRecorder:
+    ctx = ARDiffusionCellContext(
+        spec=CellRunSpec(topology=CellTopology(step_replicas=1, layer_groups=1), rank=0),
+        kv=state,
+        chunk_start=chunk_start,
+        session=session,
+    )
+    assert ctx.admit(req, plan, chunk_tokens=4, slot=0)
+    adapter = _SeqRecorder()
+    run_cell_pipeline(ctx=ctx, adapter=adapter)
+    return adapter
+
+
+def test_same_step_continuation_fits_both_history_windows():
+    """A Same-Step continuation reads the session window *and* its own earlier chunks.
+
+    Each side can carry its own chunk-0 sink, so the KV view of a mid-request cell is
+    wider than either window alone. Sizing the block table for one window only made
+    the second request of a session fail at prepare().
+    """
+    history = 2
+    cache = NoisyKVCache(
+        ARDiffusionNoisyKVSpec(
+            num_layers=1,
+            num_kv_heads=1,
+            head_size=1,
+            block_size=4,
+            max_chunk_tokens=4,
+            max_history_chunks=history,
+            max_history_versions=history * 2,
+        ),
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        layer_groups=1,
+        max_batch_size=1,
+        session_retention_chunks=history * 2,
+    )
+    state = NoisyKVState(cache)
+    session = NoisyKVSession(session_id="s1")
+    plan = build_cell_plan(
+        CellSchedule(
+            chunks=4,
+            num_denoise_steps=1,
+            step_replicas=1,
+            layer_groups=1,
+            ordering=Ordering.SAME_STEP,
+            kv_history_chunks=history,
+        )
+    )
+
+    _run_plan(state, session, "A", plan, chunk_start=0)
+    second = _run_plan(state, session, "B", plan, chunk_start=session.committed_chunks)
+
+    # One window (H + sink) plus the write is (H + 2) chunks; both windows live at
+    # once must exceed that.
+    assert max(second.seq_lens.values()) > (history + 2) * 4

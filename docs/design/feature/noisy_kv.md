@@ -77,9 +77,10 @@ feeds the next group). KV is keyed **per block** `b`: publish / transfer /
 wait when that cell finishes; a remote reader of `b` does not wait for the
 producer's other local blocks.
 
-CausVidWan accepts Self-Forcing / Latest-KV only. Pair schedule with topology: Self-Forcing →
+CausVidWan accepts Self-Forcing / Latest-KV / Same-Step. Pair schedule with topology: Self-Forcing →
 `S=1` layer PP only (`deploy/causvid_wan_self_forcing.yaml`); Latest-KV →
-vertical `S=D+1` (`deploy/causvid_wan_latest_kv.yaml`). Clean is an ordering
+vertical `S=D+1` (`deploy/causvid_wan_latest_kv.yaml`); Same-Step → vertical `S=D`
+(`deploy/causvid_wan_same_step.yaml`). Clean is an ordering
 property, independent of the history window (Self-Forcing and Latest-KV always,
 Same-Step runs it for chunk 0 only).
 
@@ -96,8 +97,9 @@ speedup SLA. DreamZero / LingBot paged-session defaults must not regress.
 `cell_schedule` (request `extra_args`) must match the deployment topology:
 `S=1` → Self-Forcing, vertical `S=D+1` → Latest-KV (CausVidWan derives the
 default from `step_replicas` and rejects a mismatched explicit choice);
-Same-Step (`S=D`) is a generic schedule primitive with a fixed first-chunk clean
-sink; CausVidWan does not expose it. It is not a session property.
+Same-Step (`S=D`) uses one weight replica per denoise step and a fixed
+first-chunk clean sink; CausVidWan exposes it as `cell_schedule: same_step` and
+requires `step_replicas == D`. It is not a session property.
 Optional session only keeps clean KV across generations
 ([Realtime AR-Diffusion sessions](realtime_ar_diffusion.md)).
 
@@ -335,7 +337,7 @@ requires separate validation.
 | `ar_diffusion_stage_config` | `step_replicas` | `S` |
 | | `max_batch_size` | `R` |
 | | `max_history_chunks` | Cap for `H` |
-| Request `extra_args` | `cell_schedule` | CausVidWan: `self_forcing` \| `latest_kv`; Same-Step is schedule-level only |
+| Request `extra_args` | `cell_schedule` | CausVidWan: `self_forcing` \| `latest_kv` \| `same_step` |
 | | `num_chunks`, `num_denoise_steps`, `kv_history_chunks` | `N`, `D`, `H` (clean scheduling follows the ordering and multi-chunk shape) |
 
 Backend: `ARDiffusionEngine` + mp executor from deploy YAML.
@@ -353,7 +355,7 @@ DreamZero / LingBot YAMLs must not silently enter `run_cell_pipeline`.
 | Combination | Status |
 | --- | --- |
 | No session + Self-Forcing / Latest-KV | Supported (opt-in; CausVid) |
-| No session + Same-Step | Generic schedule primitive with a clean sink; not exposed by CausVidWan |
+| No session + Same-Step | Supported (opt-in; CausVid, `step_replicas == D`) |
 | Session + legacy loop | Supported (unchanged) |
 | Session + Cell path | Designed; not required for #102 |
 
@@ -412,6 +414,7 @@ regression beyond 2% in chunk cadence, interaction latency or peak memory.
 | Self-Forcing `S=1` smoke | 2 GPU | finite latents, chunk count and order correct |
 | Latest-KV `S=D+1` smoke | 4 GPU | same, plus a cross-rank history read |
 | Continuation is real | 2 and 4 GPU | two cold runs are bit-identical and the continuation differs from cold |
+| Same-Step `S=D` smoke | 3 GPU | finite latents, chunk count and order correct, chunk-0 sink reused |
 | Baseline parity | GPU | the cold path is unchanged against the recorded baseline md5 |
 
 The CPU rows run in `tests/diffusion/ar_diffusion`; the GPU rows are the
