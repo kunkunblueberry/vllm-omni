@@ -305,11 +305,7 @@ session request, and returns the reservation when the session is reset or
 closed. Both are opt-in: a single-replica deployment without a ledger behaves
 exactly as before.
 
-**Not implemented yet (target contract).** Latent state is recomputed per
-request. The retention window is still a worker-side quota sized at startup; the
-ledger above is the admission-side counterpart and does not yet feed the pool
-size. Batch unification, wiring the router into the engine's stage-pool replica
-selection, and cross-layout history conversion remain open.
+The worker-side retention window remains a fixed startup quota; the admission ledger is its scheduler-side counterpart and does not yet resize the worker pool. Cross-layout history conversion remains out of scope (see [KV layout and cross-layout conversion](#kv-layout-and-cross-layout-conversion)). Latent state is still recomputed per request.
 **Retention reservation is opt-in.** `ar_diffusion_stage_config.enable_session_retention` defaults to `false`, so a deployment that never sends a `session_id` keeps the original live-window startup budget. Enabling it reserves one registry session's history window in addition to the live request window; explicit session requests are rejected when the flag is off rather than silently running without continuation capacity. The CausVid Self-Forcing and Latest-KV recipes enable it.
 
 **Lifecycle RPCs cover the cell path.** Worker reset/close calls release the Noisy registry's session-owned versions before resetting or dropping model-owned state, as well as releasing the optional router/ledger reservation.
@@ -356,6 +352,45 @@ binds, a follow-up must find its owner, and a lost owner is refused or explicitl
 restarted cold with the loss recorded. Two replicas of one stage each own their own
 history, so a follow-up served by a replica that never held the session is a cold
 start by definition and must not be reported as a continuation.
+
+### KV layout and cross-layout conversion
+
+The unified layer covers allocation, read/write views, retention, update and release;
+the physical layout stays with each strategy:
+
+| Path | Logical KV block granularity |
+| --- | --- |
+| Legacy / paged | one chunk completes the step-related KV |
+| Noisy KV | one chunk completes one block, the cell's KV |
+
+A logical KV block is the management unit; the bytes are laid out per strategy. The
+execution plan locates the KV it needs, the session owns history, and the storage
+implementation provides the read/write view. The common layer therefore does not
+require tokens, layers or fixed cell coordinates as common fields, and it performs no
+paged<->Noisy conversion: a strategy change is an explicit reset or close, not an
+implicit migration. Compatible layouts keep their existing KV; a cross-rank hand-over
+moves it through the planned transfer path.
+
+### Latency acceptance
+
+Two separate gates replace the ambiguous single budget:
+
+| Gate | Compares | Requirement |
+| --- | --- | --- |
+| Cold-path parity | baseline cold vs current cold, same hardware/config/seed | identical output md5; no cadence or peak-memory regression beyond the recorded budget (2%) |
+| Continuation cost | continuation vs cold, same config | recorded and reported, not capped: a continuation reads `H` history chunks and moves remote bytes, so it costs more than a cold run by design |
+
+Continuation wall-clock, per-chunk timing, history depth and transferred bytes are
+recorded so a future SLA can be agreed against measurements rather than assumed.
+
+### Landing order with related work
+
+`#9368` owns the transport completion contract (send/receive retirement, who waits on
+what) and `#9154` touches the CausVid pipeline and `test_noisy_kv.py`. This work stays
+in the layers above them: session lifecycle, the `ARDiffusionBatch` envelope, placement
+and capacity accounting. It introduces no second completion/event contract and takes
+over no model-specific pipeline ownership, so `#9368` lands first for transport, `#9154`
+settles the CausVid pipeline surface, and this change keeps the runner/session seam.
 
 ## Configuration
 
@@ -421,8 +456,9 @@ GPU (record config): `S=1` Self-Forcing; `S=D` Same-Step; `S=D+1` Latest-KV
 
 Every case records model, checkpoint, `S`/`G`/`D`/`H`, latent shape, dtype, seed,
 revision and command. Structure and lifecycle cases run on CPU; output quality is
-compared frame-wise against the recorded baseline, and a case fails on a
-regression beyond 2% in chunk cadence, interaction latency or peak memory.
+compared frame-wise against the recorded baseline. The 2% budget applies to the
+cold-path parity gate only; continuation cost is recorded and reported, not capped
+(see [Latency acceptance](#latency-acceptance)).
 
 | Case | Level | Passes when |
 | --- | --- | --- |
@@ -443,6 +479,9 @@ regression beyond 2% in chunk cadence, interaction latency or peak memory.
 | Latest-KV `S=D+1` smoke | 4 GPU | same, plus a cross-rank history read |
 | Continuation is real | 2 and 4 GPU | two cold runs are bit-identical and the continuation differs from cold |
 | Same-Step `S=D` smoke | 3 GPU | finite latents, chunk count and order correct, chunk-0 sink reused |
+| Two-replica session affinity | 4 GPU | the follow-up continues on the replica that holds it; a lost owner is not reported as a continuation |
+| Capacity overcommit | CPU | a worker report above the grant invalidates the session |
+| Batch cardinality | CPU | a Noisy envelope holds exactly one record; a paged envelope may hold several |
 | Baseline parity | GPU | the cold path is unchanged against the recorded baseline md5 |
 
 The CPU rows run in `tests/diffusion/ar_diffusion`; the GPU rows are the
