@@ -33,7 +33,12 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCa
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import NoisyKVCache, NoisyKVState
 from vllm_omni.experimental.ar_diffusion.kv_cache.session import NoisyKVSessionRegistry
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
-from vllm_omni.experimental.ar_diffusion.reservation import CapacityDemand, SessionCapacityLedger
+from vllm_omni.experimental.ar_diffusion.reservation import (
+    CapacityDemand,
+    CapacityUsage,
+    ReservationOvercommitError,
+    SessionCapacityLedger,
+)
 from vllm_omni.experimental.ar_diffusion.session_affinity import SessionRouter
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 from vllm_omni.platforms import current_omni_platform
@@ -303,6 +308,32 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         )
         ledger.reserve(session_id, demand)
 
+    def _report_session_capacity(self, session_id: str) -> None:
+        """Report what the session actually holds so the ledger can reconcile.
+
+        This is the worker half of the reservation loop: admission reserved the
+        increment, and after the batch the worker states the truth. Holding more
+        than the grant is an overcommit -- it cannot be paid for out of another
+        session's budget -- so the session fails closed instead of continuing on
+        borrowed capacity.
+        """
+        ledger = getattr(self, "_capacity_ledger", None)
+        if ledger is None or self.noisy_kv_cache is None:
+            return
+        versions, nbytes = self.noisy_kv_cache.session_usage(session_id)
+        try:
+            ledger.reconcile(session_id, CapacityUsage(versions=versions, bytes=nbytes))
+        except ReservationOvercommitError:
+            self._noisy_sessions.inactivate(session_id, "capacity overcommit")
+            logger.warning(
+                "AR-Diffusion session=%s exceeded its capacity grant (%d bytes, %d versions); "
+                "the session is invalid until an explicit reset",
+                session_id,
+                nbytes,
+                versions,
+            )
+            raise
+
     def _release_session_reservation(self, session_id: str) -> None:
         ledger = getattr(self, "_capacity_ledger", None)
         if ledger is not None:
@@ -450,6 +481,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         """Release KV and notify the pipeline to reset model-owned state."""
         if self.noisy_kv_cache is not None and self._ar_diffusion_cell_capability is not None:
             self._noisy_sessions.reset(session_id)
+            self._report_session_capacity(session_id)
             self._release_session_reservation(session_id)
             return
         self._release_session(session_id, reset_model=True, reason="reset")
@@ -458,6 +490,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         """Release KV and notify the pipeline to drop model-owned state."""
         if self.noisy_kv_cache is not None and self._ar_diffusion_cell_capability is not None:
             self._noisy_sessions.close(session_id)
+            self._report_session_capacity(session_id)
             self._release_session_reservation(session_id)
             return
         self._release_session(session_id, reset_model=False, reason="close")
@@ -642,8 +675,13 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                     session_id if explicit_session else "<none>",
                 )
                 raise
+            if explicit_session:
+                # Worker half of the reservation loop; raises on overcommit and
+                # leaves the session invalid, so the failure is not silent.
+                self._report_session_capacity(session_id)
             if close_session and explicit_session:
                 self._noisy_sessions.close(session_id)
+                self._report_session_capacity(session_id)
                 self._release_session_reservation(session_id)
             self._perf_e2e_times.append(time.perf_counter() - started)
             return output

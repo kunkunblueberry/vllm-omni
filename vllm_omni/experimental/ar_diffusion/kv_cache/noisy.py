@@ -636,6 +636,19 @@ class NoisyKVCache:
         session.discard_history()
         return len(keys)
 
+    def session_usage(self, session_id: str) -> tuple[int, int]:
+        """(versions, bytes) this session currently holds, for capacity feedback.
+
+        ``versions`` is the logical retained-version count and the second value the
+        all-layer footprint of those versions. Both are what the scheduler's ledger
+        needs to reconcile a grant against reality; the physical layout stays
+        private to this pool.
+        """
+        owner = _session_owner(session_id)
+        versions = sum(1 for key in self.pool.keys if key[0] == owner)
+        bytes_per_version = self.bytes_per_version * max(1, self.spec.num_layers)
+        return versions, versions * bytes_per_version
+
 
 class NoisyKVState:
     """Per-request bridge used by the chunk executor."""

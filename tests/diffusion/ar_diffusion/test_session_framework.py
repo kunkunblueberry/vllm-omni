@@ -18,10 +18,16 @@ import pytest
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
-from vllm_omni.experimental.ar_diffusion.kv_cache.session import NoisyKVSessionRegistry
+from vllm_omni.experimental.ar_diffusion.kv_cache.session import (
+    NoisyKVSessionRegistry,
+    NoisySessionError,
+    NoisySessionState,
+)
 from vllm_omni.experimental.ar_diffusion.reservation import (
     CapacityDemand,
+    CapacityUsage,
     ReservationDeniedError,
+    ReservationOvercommitError,
     SessionCapacityLedger,
 )
 from vllm_omni.experimental.ar_diffusion.runner import ARDiffusionModelRunner
@@ -157,7 +163,9 @@ def _request(**extra: object) -> OmniDiffusionRequest:
 
 def _runner(mocker) -> ARDiffusionModelRunner:
     runner = object.__new__(ARDiffusionModelRunner)
-    runner.noisy_kv_cache = object()
+    # The runner reports what the Noisy pool holds after each batch; the stub
+    # reports an empty session so capacity feedback stays exercised here.
+    runner.noisy_kv_cache = SimpleNamespace(session_usage=lambda _session_id: (0, 0))
     runner._ar_diffusion_cell_capability = _Capability()
     runner._noisy_sessions = NoisyKVSessionRegistry(capacity=1)
     runner._noisy_session_retention_enabled = True
@@ -216,3 +224,67 @@ def test_closing_a_session_returns_its_reservation(mocker):
 
     assert ledger.held_bytes("s1") == 0
     assert runner._noisy_sessions.get("s1") is None
+
+
+def test_ledger_reconcile_accepts_usage_within_the_grant() -> None:
+    ledger = SessionCapacityLedger(budget_bytes=1000)
+    ledger.reserve("s1", CapacityDemand(versions=6, bytes=400))
+
+    reported = ledger.reconcile("s1", CapacityUsage(versions=4, bytes=300))
+
+    assert reported == CapacityUsage(versions=4, bytes=300)
+    assert ledger.usage("s1") == CapacityUsage(versions=4, bytes=300)
+    assert ledger.overcommit("s1") is None
+    assert ledger.held_bytes("s1") == 400
+
+
+def test_ledger_reconcile_fails_closed_on_overcommit() -> None:
+    ledger = SessionCapacityLedger(budget_bytes=1000)
+    ledger.reserve("s1", CapacityDemand(versions=6, bytes=400))
+
+    with pytest.raises(ReservationOvercommitError):
+        ledger.reconcile("s1", CapacityUsage(versions=7, bytes=500))
+
+    assert ledger.overcommit("s1") == CapacityUsage(versions=7, bytes=500)
+    assert ledger.usage("s1") is None
+
+
+def test_ledger_release_forgets_usage_and_overcommit() -> None:
+    ledger = SessionCapacityLedger(budget_bytes=1000)
+    ledger.reserve("s1", CapacityDemand(versions=6, bytes=400))
+    with pytest.raises(ReservationOvercommitError):
+        ledger.reconcile("s1", CapacityUsage(versions=7, bytes=500))
+
+    ledger.release("s1")
+
+    assert ledger.usage("s1") is None
+    assert ledger.overcommit("s1") is None
+    assert ledger.free_bytes() == 1000
+
+
+def _capacity_runner(mocker, *, usage: tuple[int, int]):
+    runner = _runner(mocker)
+    runner._capacity_ledger = SessionCapacityLedger(budget_bytes=1000)
+    runner.bind_capacity_ledger(runner._capacity_ledger, versions=6, reserved_bytes=400)
+    mocker.patch.object(runner, "noisy_kv_cache", SimpleNamespace(session_usage=lambda _sid: usage))
+    return runner
+
+
+def test_the_runner_reports_worker_usage_after_a_batch(mocker):
+    runner = _capacity_runner(mocker, usage=(3, 200))
+    runner.execute_model(_request())
+
+    assert runner._capacity_ledger.usage("s1") == CapacityUsage(versions=3, bytes=200)
+    assert runner._capacity_ledger.overcommit("s1") is None
+
+
+def test_a_worker_overcommit_invalidates_the_session(mocker):
+    runner = _capacity_runner(mocker, usage=(9, 900))
+
+    with pytest.raises(ReservationOvercommitError):
+        runner.execute_model(_request())
+
+    session = runner._noisy_sessions.get("s1")
+    assert session is not None and session.state is NoisySessionState.INVALID
+    with pytest.raises(NoisySessionError):
+        runner.execute_model(_request())

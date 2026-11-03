@@ -335,6 +335,28 @@ history chunks, deduplicating chunk 0 while it is in the window. `H=0` keeps
 the sink. This mode currently admits one request at a time; checkpoint quality
 requires separate validation.
 
+### Capacity feedback and placement
+
+Admission and the worker are two halves of one loop. The scheduler reserves a
+session's increment (`SessionCapacityLedger.reserve`); after each batch the worker
+reports what the session actually holds as `CapacityUsage` (logical versions plus
+worker bytes), and the ledger reconciles it against the grant. Holding more than the
+grant is an overcommit: it cannot be paid for out of another session's budget, so the
+session is invalidated and the request fails closed instead of continuing on borrowed
+capacity. Reset and close report zero before the holding is released, so the ledger
+does not drift from the worker.
+
+The worker-side retention window stays a fixed startup quota; the ledger is its
+admission-side counterpart and does not resize the pool at runtime. Reporting both
+directions is what keeps the numbers aligned, not a dynamic resize.
+
+Session placement is the other half. `SessionRouter` (worker side) and `StagePool`
+(engine side) both bind a session to the replica that holds it: the first request
+binds, a follow-up must find its owner, and a lost owner is refused or explicitly
+restarted cold with the loss recorded. Two replicas of one stage each own their own
+history, so a follow-up served by a replica that never held the session is a cold
+start by definition and must not be reported as a continuation.
+
 ## Configuration
 
 | Layer | Key | Meaning |

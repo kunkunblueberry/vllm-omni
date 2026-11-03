@@ -10,6 +10,12 @@ follow-up request reserves the *increment* rather than the whole window.
 A worker never grows a session past its grant: when the demand does not fit, the
 caller gets ``ReservationDeniedError`` and the request goes back to admission instead
 of taking capacity from another session.
+
+Admission is only half of the loop. After a batch the worker reports what the
+session actually holds (``CapacityUsage``: logical versions plus worker bytes) and
+the ledger reconciles it against the grant. A worker that holds more than it was
+granted is an overcommit: the session fails closed instead of silently borrowing
+capacity from another session.
 """
 
 from __future__ import annotations
@@ -47,6 +53,28 @@ class CapacityGrant:
     incremental: bool
 
 
+@dataclass(frozen=True)
+class CapacityUsage:
+    """What a worker reports a session actually holds after a batch.
+
+    ``versions`` is the logical retained-version count and ``bytes`` the
+    worker-side footprint. Both are strategy-neutral: the paged layout and the
+    Noisy ``VersionPool`` report the same pair even though their storage and
+    logical block granularity differ.
+    """
+
+    versions: int
+    bytes: int
+
+    def __post_init__(self) -> None:
+        if self.versions < 0 or self.bytes < 0:
+            raise ValueError(f"capacity usage must be non-negative, got {self}")
+
+
+class ReservationOvercommitError(ReservationDeniedError):
+    """The worker holds more than the scheduler granted this session."""
+
+
 @dataclass
 class SessionCapacityLedger:
     """Per-session capacity reservations against one device budget."""
@@ -54,6 +82,8 @@ class SessionCapacityLedger:
     budget_bytes: int
     _held: dict[str, int] = field(default_factory=dict)
     _grants: dict[str, CapacityGrant] = field(default_factory=dict)
+    _usage: dict[str, CapacityUsage] = field(default_factory=dict)
+    _overcommit: dict[str, CapacityUsage] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.budget_bytes < 0:
@@ -96,8 +126,36 @@ class SessionCapacityLedger:
     def grant(self, session_id: str) -> CapacityGrant | None:
         return self._grants.get(session_id)
 
+    def reconcile(self, session_id: str, usage: CapacityUsage) -> CapacityUsage:
+        """Accept a worker's reported usage, or fail closed on an overcommit.
+
+        The grant is the contract; a worker that reports more than it was granted
+        cannot be absorbed by another session's budget, so the ledger records the
+        overcommit and raises. The caller decides the session's fate (this module
+        keeps accounting only).
+        """
+        held = self._held.get(session_id, 0)
+        if usage.bytes > held:
+            self._overcommit[session_id] = usage
+            raise ReservationOvercommitError(
+                f"session {session_id!r} reports {usage.bytes} bytes but only {held} were granted"
+            )
+        self._usage[session_id] = usage
+        self._overcommit.pop(session_id, None)
+        return usage
+
+    def usage(self, session_id: str) -> CapacityUsage | None:
+        """Last usage the worker reported for ``session_id``."""
+        return self._usage.get(session_id)
+
+    def overcommit(self, session_id: str) -> CapacityUsage | None:
+        """The overcommitted usage that failed this session, if any."""
+        return self._overcommit.get(session_id)
+
     def release(self, session_id: str) -> int:
         """Give a session's holding back (reset, close, or a dead replica)."""
         released = self._held.pop(session_id, 0)
         self._grants.pop(session_id, None)
+        self._usage.pop(session_id, None)
+        self._overcommit.pop(session_id, None)
         return released
