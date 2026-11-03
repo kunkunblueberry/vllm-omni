@@ -19,6 +19,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, KVPrefetchJob
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
+from vllm_omni.experimental.ar_diffusion.batch import ARDiffusionBatch
 from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVCacheSpec,
     SupportsARDiffusionCellPipeline,
@@ -547,7 +548,12 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         """
         self.release_step_requests(getattr(scheduler_output, "finished_req_ids", None) or ())
 
-    def _make_chunk_context(self, session: Any | None = None):
+    def _make_chunk_context(
+        self,
+        session: Any | None = None,
+        *,
+        batch: ARDiffusionBatch | None = None,
+    ):
         from vllm_omni.experimental.ar_diffusion.cell_executor import (
             ARDiffusionCellContext,
             CellRunSpec,
@@ -562,6 +568,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         pp_world = int(getattr(getattr(self.od_config, "parallel_config", None), "pipeline_parallel_size", 1) or 1)
         topology = CellTopology(step_replicas=step_replicas, layer_groups=max(1, pp_world // max(1, step_replicas)))
         rank, pp_group = resolve_pp_rank_and_group()
+        chunk_start = session.committed_chunks if session is not None else 0
         return ARDiffusionCellContext(
             spec=CellRunSpec(
                 topology=topology,
@@ -570,8 +577,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 pp_group=pp_group,
             ),
             kv=NoisyKVState(self.noisy_kv_cache),
-            chunk_start=session.committed_chunks if session is not None else 0,
+            chunk_start=chunk_start,
             session=session,
+            batch=batch,
         )
 
     @staticmethod
@@ -612,7 +620,13 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 self._reserve_session_capacity(session_id)
                 session, _generation = self._noisy_sessions.admit(session_id)
             started = time.perf_counter()
-            ctx = self._make_chunk_context(session=session)
+            batch = ARDiffusionBatch.for_noisy(
+                req.request_id,
+                session_id=session_id if explicit_session else None,
+                chunk_start=session.committed_chunks if session is not None else 0,
+                model_state=session.model_state if session is not None else None,
+            )
+            ctx = self._make_chunk_context(session=session, batch=batch)
             try:
                 with self._ar_diffusion_cell_capability.bind_ar_diffusion_cell_context(ctx):
                     output = super().execute_model(
@@ -645,11 +659,15 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         close_session = tick.close_session if tick is not None else bool(extra_args.get("close_session", False))
         if reset:
             self.reset_session(session_id)
+        # One envelope per call is the single source of truth for what this call
+        # owns and produced, for both strategies.
+        batch = ARDiffusionBatch.for_paged([req.request_id], session_ids=[session_id])
         started = time.perf_counter()
         with self._bound_ar_session(session_id, description="forward"):
             output = super().execute_model(
                 req, kv_prefetch_job=kv_prefetch_job, diffusion_kv_metadata=diffusion_kv_metadata
             )
+        batch.set_output(req.request_id, output)
         self._perf_e2e_times.append(time.perf_counter() - started)
         if close_session:
             self.close_session(session_id)
@@ -660,16 +678,17 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         scheduler_output: DiffusionSchedulerOutput,
         od_config: OmniDiffusionConfig,
     ) -> BatchRunnerOutput:
-        """Noisy KV chunk path may micro-batch requests; paged timeline KV stays single-seq."""
+        """Refuse outer request batching for the cell path.
+
+        A Noisy request runs its whole ``CellPlan`` continuously, so it cannot be
+        split into independently schedulable batch members. ``max_batch_size`` is
+        internal cell geometry, not outer request-batch cardinality.
+        """
         if self.noisy_kv_cache is not None and self._ar_diffusion_cell_capability is not None:
-            ctx = self._make_chunk_context()
-            try:
-                with self._ar_diffusion_cell_capability.bind_ar_diffusion_cell_context(ctx):
-                    return super().execute_model_batch(scheduler_output, od_config)
-            except Exception:
-                self._release_cell_requests(ctx)
-                logger.warning("AR-Diffusion chunk batch failed; the request's NoisyKV versions were released")
-                raise
+            raise RuntimeError(
+                "Noisy AR-Diffusion requires strict outer batch=1; "
+                "use execute_model(request) instead of execute_model_batch()."
+            )
         raise RuntimeError(
             "ARDiffusionModelRunner does not support request-batch execution; use request mode with max_num_seqs=1."
         )

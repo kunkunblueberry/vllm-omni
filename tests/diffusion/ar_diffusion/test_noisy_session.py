@@ -670,3 +670,11 @@ def test_same_step_continuation_fits_both_history_windows():
     # One window (H + sink) plus the write is (H + 2) chunks; both windows live at
     # once must exceed that.
     assert max(second.seq_lens.values()) > (history + 2) * 4
+
+
+def test_noisy_runner_rejects_outer_request_batch(mocker):
+    """A cell request is continuous, so it cannot be a member of a request batch."""
+    runner = _runner(mocker)
+
+    with pytest.raises(RuntimeError, match="strict outer batch=1"):
+        runner.execute_model_batch(None, None)

@@ -96,7 +96,7 @@ def _as_request_list(req: OmniDiffusionRequest | DiffusionRequestBatch) -> list[
 class CausVidWanPipeline(nn.Module):
     """CausVid Wan on Cell Self-Forcing/Latest-KV (AR-Diffusion + noisy KV)."""
 
-    supports_request_batch = True
+    supports_request_batch = False
     # Skip engine dummy: num_inference_steps=2 breaks vertical S=D+1.
     dummy_run_num_frames: ClassVar[int] = 0
 
@@ -593,6 +593,11 @@ class CausVidWanPipeline(nn.Module):
                 raise ValueError(
                     f"latent_shape token count {chunk_tokens} does not match preallocated NoisyKV "
                     f"max_chunk_tokens={spec.max_chunk_tokens}"
+                )
+            if getattr(ctx, "batch", None) is not None:
+                ctx.batch.set_strategy_payload(
+                    req_id,
+                    {"cell_plan": plan, "chunk_tokens": chunk_tokens, "num_denoise_steps": denoise},
                 )
             ctx.enqueue(req_id, plan, chunk_tokens=chunk_tokens)
 

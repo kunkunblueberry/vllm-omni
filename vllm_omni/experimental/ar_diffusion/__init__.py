@@ -6,6 +6,11 @@ cache management for autoregressive / chunked diffusion models. Selected via
 ``OmniDiffusionConfig.engine_backend = "ar_diffusion"``.
 """
 
+from vllm_omni.experimental.ar_diffusion.batch import (
+    ARDiffusionBatch,
+    ARDiffusionExecutionMode,
+    ARDiffusionRequestRecord,
+)
 from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionCrossAttentionKVSpec,
     ARDiffusionKVBranchSpec,
@@ -28,6 +33,9 @@ from vllm_omni.experimental.ar_diffusion.tick_protocol import (
 )
 
 __all__ = [
+    "ARDiffusionBatch",
+    "ARDiffusionExecutionMode",
+    "ARDiffusionRequestRecord",
     "ARDiffusionKVBranchSpec",
     "ARDiffusionCrossAttentionKVSpec",
     "ARDiffusionEngine",

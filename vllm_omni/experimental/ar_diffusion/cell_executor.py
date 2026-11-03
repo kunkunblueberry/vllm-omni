@@ -13,6 +13,7 @@ import torch
 import torch.distributed as dist
 from vllm.logger import init_logger
 
+from vllm_omni.experimental.ar_diffusion.batch import ARDiffusionBatch
 from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     Cell,
     CellPlan,
@@ -220,8 +221,15 @@ class ARDiffusionCellContext:
     # Session binding for this execution context; 0/None keeps request mode.
     chunk_start: int = 0
     session: Any | None = None
+    batch: ARDiffusionBatch | None = None
+
+    def __post_init__(self) -> None:
+        if self.batch is not None and self.batch.record.chunk_start != self.chunk_start:
+            raise ValueError("ARDiffusionBatch chunk_start must match the cell context")
 
     def enqueue(self, req: str, plan: CellPlan, *, chunk_tokens: int) -> None:
+        if self.batch is not None and req not in self.batch.request_ids:
+            raise ValueError(f"request {req!r} is not part of the AR-Diffusion batch")
         self.pending.append(PendingAdmit(req=req, plan=plan, chunk_tokens=chunk_tokens))
 
     def admit(self, req: str, plan: CellPlan, *, chunk_tokens: int, slot: int) -> bool:

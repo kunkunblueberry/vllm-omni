@@ -314,6 +314,12 @@ selection, and cross-layout history conversion remain open.
 
 **Lifecycle RPCs cover the cell path.** Worker reset/close calls release the Noisy registry's session-owned versions before resetting or dropping model-owned state, as well as releasing the optional router/ledger reservation.
 
+**Execution envelope.** The data-layer boundary is split into `Session` and `ARDiffusionBatch`. A session owns cross-request state such as retained KV, conditioning, and the streaming decoder; an `ARDiffusionBatch` owns one execution envelope, request identity, session/chunk metadata, strategy payload, transient ownership, cleanup, and output attribution.
+
+`ARDiffusionBatch` is not a promise that every strategy supports the same tensor batching. Paged execution may carry multiple request records for continuous batching. Noisy cell execution is intrinsically continuous at request granularity and therefore requires exactly one record per batch; its `CellPlan`, `chunk_tokens`, and cell-task grouping remain internal to the Noisy strategy. `DiffusionRequestBatch` is not the Noisy contract, and paged<->Noisy KV conversion is not required.
+
+For Noisy, `max_batch_size` is internal Cell execution geometry, not outer request-batch cardinality. The outer Noisy request cardinality is always one.
+
 ### Same-Step with a first-chunk clean sink
 
 `Ordering.SAME_STEP` uses a first-chunk clean sink for multi-chunk requests.
