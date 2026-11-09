@@ -4,7 +4,8 @@
 
 Wires Wan codec + ``StageWanTransformer`` onto ``ARDiffusionEngine``, with
 CausVid defaults (shift=8, D=3, S=D+1) and optional student ``model.pt`` overlay.
-CausVidWan accepts ``self_forcing`` / ``latest_kv`` only (not ``same_step``).
+CausVidWan accepts ``self_forcing`` / ``latest_kv`` / ``same_step``; Same-Step needs
+``step_replicas == D``.
 
 * Codec base: Diffusers ``Wan-AI/Wan2.1-T2V-1.3B-Diffusers``
 * Student DiT: ``tianweiy/CausVid`` → ``autoregressive_checkpoint/model.pt``
@@ -250,6 +251,13 @@ class CausVidWanPipeline(nn.Module):
 
     def ar_diffusion_noisy_kv_spec(self) -> ARDiffusionNoisyKVSpec:
         local_layers = max(1, self.transformer.local_num_layers)
+        # The diagonal orderings retain one version per chunk (the clean KV), so the
+        # window size is also the version count. Same-Step keeps one version per
+        # denoise step plus chunk 0's clean sink, so the retained set is wider and
+        # the shared pool has to be sized for it at load time.
+        versions_per_chunk = 1
+        if self.step_replicas > 1 and self.step_replicas == self._default_denoise:
+            versions_per_chunk = self._default_denoise + 1
         return ARDiffusionNoisyKVSpec(
             num_layers=local_layers,
             num_kv_heads=self.transformer.num_heads,
@@ -257,6 +265,7 @@ class CausVidWanPipeline(nn.Module):
             block_size=self.block_size,
             max_chunk_tokens=self.max_chunk_tokens,
             max_history_chunks=max(1, self.max_history_chunks),
+            max_history_versions=max(1, max(1, self.max_history_chunks) * versions_per_chunk),
         )
 
     @contextmanager
@@ -392,8 +401,12 @@ class CausVidWanPipeline(nn.Module):
             ordering = Ordering.SELF_FORCING
         elif schedule_name == "latest_kv":
             ordering = Ordering.LATEST_KV
+        elif schedule_name == "same_step":
+            ordering = Ordering.SAME_STEP
         else:
-            raise ValueError(f"CausVidWan cell_schedule must be 'self_forcing' or 'latest_kv', got {schedule_name!r}")
+            raise ValueError(
+                f"CausVidWan cell_schedule must be 'self_forcing', 'latest_kv' or 'same_step', got {schedule_name!r}"
+            )
         step_replicas = self.step_replicas
         if ordering is Ordering.SELF_FORCING and step_replicas > 1:
             # Self-Forcing is single-replica (paper semantics, layer PP);
@@ -409,8 +422,15 @@ class CausVidWanPipeline(nn.Module):
                 f"latest_kv requires step_replicas=D+1 ({denoise + 1}) for clean history, "
                 "got 1; step_replicas=1 layer PP uses cell_schedule: self_forcing"
             )
-        # CausVid rejects same_step; vertical is S=D+1 only (S=D stays schedule-level).
-        if step_replicas not in (1, denoise + 1):
+        # Same-Step is the S=D vertical placement (one replica per denoise step);
+        # Latest-KV is S=D+1 (one extra clean replica).
+        if ordering is Ordering.SAME_STEP:
+            if step_replicas != denoise:
+                raise ValueError(
+                    f"same_step requires step_replicas=D ({denoise}) so every denoise step owns a "
+                    f"replica, got {step_replicas}"
+                )
+        elif step_replicas not in (1, denoise + 1):
             if explicit_denoise is not None:
                 raise ValueError(f"step_replicas must be 1 or D+1 ({denoise + 1}), got {step_replicas}")
             # S>=2 here (S=1 is always in the set above); infer D = S-1 → S = D+1.
