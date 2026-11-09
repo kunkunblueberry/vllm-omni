@@ -31,6 +31,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVCon
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import NoisyKVCache, NoisyKVState
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
+from vllm_omni.experimental.ar_diffusion.noisy_lifecycle import noisy_request_lifecycle
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 from vllm_omni.platforms import current_omni_platform
 
@@ -499,21 +500,17 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
     def _noisy_kv_id(req: OmniDiffusionRequest) -> tuple[str, bool, bool, bool]:
         """Return ``(kv_id, persist, reset, close)`` from request fields only.
 
-        Shared by ``execute_model`` and ``execute_model_batch``. An explicit
-        ``session_id`` is the pool key and may retain history across requests;
-        otherwise the request id is ephemeral and versions are released after
-        the forward.
+        Shared by ``execute_model`` and ``execute_model_batch``, and derived by the
+        same helper the pipeline uses, so the two cannot disagree about the key.
         """
-        session_id, extra_args, tick = ARDiffusionModelRunner._request_session(req)
-        if tick is not None:
-            return tick.session_id, not bool(tick.close_session), bool(tick.reset), bool(tick.close_session)
-        raw = extra_args.get("session_id")
-        explicit = raw is not None and str(raw) != ""
-        kv_id = str(raw) if explicit else str(getattr(req, "request_id", None) or session_id)
-        reset = bool(extra_args.get("reset", False))
-        close_session = bool(extra_args.get("close_session", False))
-        persist = explicit and not close_session
-        return kv_id, persist, reset, close_session
+        session_id, _extra_args, tick = ARDiffusionModelRunner._request_session(req)
+        lifecycle = noisy_request_lifecycle(
+            str(getattr(req, "request_id", None) or ""),
+            req.sampling_params,
+            tick=tick,
+            fallback=session_id,
+        )
+        return lifecycle.kv_id, lifecycle.persist, lifecycle.reset, lifecycle.close_session
 
     def release_noisy_kv(self, kv_id: str) -> None:
         """Drop retained Noisy PP versions for ``kv_id`` (outer session reset/close)."""

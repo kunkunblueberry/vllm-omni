@@ -63,6 +63,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
     NoisyKVState,
     clean_history_cells,
 )
+from vllm_omni.experimental.ar_diffusion.noisy_lifecycle import noisy_request_lifecycle
 from vllm_omni.experimental.ar_diffusion.streaming_decode import WanStreamingDecoder
 
 logger = init_logger(__name__)
@@ -569,17 +570,16 @@ class CausVidWanPipeline(nn.Module):
     def _noisy_request_lifecycle(
         req: OmniDiffusionRequest,
     ) -> tuple[str, bool, bool, bool]:
-        """Return ``(kv_id, persist, reset, close_session)`` — shared by batch and single paths."""
-        req_id = str(getattr(req, "request_id", None) or "")
-        sp = req.sampling_params
-        extra = dict(sp.extra_args or {}) if sp is not None else {}
-        raw_session = extra.get("session_id")
-        explicit_session = raw_session is not None and str(raw_session) != ""
-        reset = bool(extra.get("reset", False))
-        close_session = bool(extra.get("close_session", False))
-        persist = explicit_session and not close_session
-        kv_id = str(raw_session) if explicit_session else req_id
-        return kv_id, persist, reset, close_session
+        """Return ``(kv_id, persist, reset, close_session)`` from the shared helper.
+
+        The runner mints the same key through the same function; deriving it here
+        as well used to let a streaming tick and an ``extra_args`` read disagree.
+        """
+        lifecycle = noisy_request_lifecycle(
+            str(getattr(req, "request_id", None) or ""),
+            req.sampling_params,
+        )
+        return lifecycle.kv_id, lifecycle.persist, lifecycle.reset, lifecycle.close_session
 
     def admit_cell_request(self, req: OmniDiffusionRequest) -> tuple[Any, str, bool, Any | None]:
         """Admit CellPlan and build WanCell under the bound context.
