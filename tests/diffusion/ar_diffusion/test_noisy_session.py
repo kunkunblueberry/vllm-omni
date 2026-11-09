@@ -167,12 +167,17 @@ def test_retain_window_structural_key_and_same_step_sink():
     cache = _cache(history=1)
     state = NoisyKVState(cache)
     same = _schedule(num_denoise_steps=2, step_replicas=2, ordering=Ordering.SAME_STEP, chunk_base=3)
-    assert clean_history_cells(same, num_blocks=1) == {(0, 2, 0), (3, 2, 0)}
+    # A Same-Step consumer reads the version matching its own denoise step, so the
+    # whole per-step window survives next to chunk 0's sink. A non-zero chunk never
+    # produces its clean step, so there is no ``(3, 2, 0)`` to keep.
+    assert clean_history_cells(same, num_blocks=1) == {(0, 2, 0), (3, 0, 0), (3, 1, 0)}
     cache.pool.alloc(("world", 0, 2, 0))
-    cache.pool.alloc(("world", 3, 2, 0))
+    cache.pool.alloc(("world", 3, 0, 0))
+    cache.pool.alloc(("world", 3, 1, 0))
     cache.pool.alloc(("world", 2, 2, 0))
     state.end_request("world", retain=clean_history_cells(same, num_blocks=1))
-    assert cache.pool.has(("world", 0, 2, 0)) and cache.pool.has(("world", 3, 2, 0))
+    assert cache.pool.has(("world", 0, 2, 0))
+    assert cache.pool.has(("world", 3, 0, 0)) and cache.pool.has(("world", 3, 1, 0))
     assert not cache.pool.has(("world", 2, 2, 0))
 
     first = _schedule()

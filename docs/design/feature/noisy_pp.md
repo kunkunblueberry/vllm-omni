@@ -101,8 +101,12 @@ speedup SLA. DreamZero / LingBot paged-session defaults must not regress.
 `S=1` → Self-Forcing, vertical `S=D+1` → Latest-KV (CausVidWan derives the
 default from `step_replicas` and rejects a mismatched explicit choice);
 Same-Step (`S=D`) is a generic schedule primitive with a fixed first-chunk clean
-sink; CausVidWan does not expose it. It is not a session property.
-Optional session only keeps clean KV across generations
+sink; CausVidWan exposes it as `cell_schedule: same_step` when
+`step_replicas == D` (`deploy/causvid_wan_same_step.yaml`). It is not a session
+property.
+Optional session keeps the clean KV of each retained chunk across generations, and
+under Same-Step it keeps every denoise step of the trailing window plus chunk 0's
+clean sink, because a Same-Step consumer reads the version matching its own step
 ([Realtime AR-Diffusion sessions](realtime_ar_diffusion.md)).
 
 ## Architecture
@@ -233,7 +237,7 @@ requires separate validation.
 | `ar_diffusion_stage_config` | `step_replicas` | `S` |
 | | `max_batch_size` | `R` |
 | | `max_history_chunks` | Cap for `H` |
-| Request `extra_args` | `cell_schedule` | CausVidWan: `self_forcing` \| `latest_kv`; Same-Step is schedule-level only |
+| Request `extra_args` | `cell_schedule` | CausVidWan: `self_forcing` \| `latest_kv` \| `same_step` |
 | | `num_chunks`, `num_denoise_steps`, `kv_history_chunks` | `N`, `D`, `H` (clean scheduling follows the ordering and CellPlan shape) |
 
 Backend: `ARDiffusionEngine` + mp executor from deploy YAML.
@@ -251,7 +255,7 @@ DreamZero / LingBot YAMLs must not silently enter `run_cell_pipeline`.
 | Combination | Status |
 | --- | --- |
 | No session + Self-Forcing / Latest-KV | Supported (opt-in; CausVid) |
-| No session + Same-Step | Generic schedule primitive with a clean sink; not exposed by CausVidWan |
+| No session + Same-Step | Supported (opt-in; CausVid, `step_replicas == D`) |
 | Session + legacy loop | Supported (unchanged) |
 | Session + Cell path | Supported (single active session; see [#9758](https://github.com/vllm-project/vllm-omni/pull/9758)) |
 
@@ -260,6 +264,15 @@ DreamZero / LingBot YAMLs must not silently enter `run_cell_pipeline`.
 window (and its KV reuse) versus the previous unset→`H=0` behavior; set
 `kv_history_chunks: 0` to run without history. The clean step is unaffected:
 `self_forcing` always runs it (ordering property).
+
+**Retention follows the read pattern:** the diagonal orderings read the clean KV of
+each retained chunk, so a session keeps one version per chunk. A Same-Step consumer
+reads the version matching its own denoise step, so under Same-Step the session
+keeps every denoise step of the trailing window plus chunk 0's clean sink, and the
+pool is sized for that wider set (`max_history_versions`). Non-zero chunks never
+produce their clean step, so `expected_prior_cells` demands the per-step window
+instead of the diagonal one — demanding the diagonal window would fail every
+continuation closed.
 
 **S=1 without the clean step is intentionally gone:** `self_forcing` always
 runs the clean step regardless of `H`. Same-Step (`S=D`, including `S=1`
