@@ -32,6 +32,13 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCa
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import NoisyKVCache, NoisyKVState
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 from vllm_omni.experimental.ar_diffusion.noisy_lifecycle import noisy_request_lifecycle
+from vllm_omni.experimental.ar_diffusion.reservation import (
+    CapacityDemand,
+    CapacityUsage,
+    ReservationDeniedError,
+    ReservationOvercommitError,
+    SessionCapacityLedger,
+)
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 from vllm_omni.platforms import current_omni_platform
 
@@ -122,6 +129,10 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         self.ar_diffusion_kv_config = resolve_ar_diffusion_kv_config(od_config)
         self.kv_cache: ARDiffusionKVCache | None = None
         self.noisy_kv_cache: NoisyKVCache | None = None
+        # Capacity ledger guarding this runner's pool. Installed when the pool is
+        # built, because that is where the budget and the per-session window are
+        # known; a worker that never built a Noisy pool leaves it unset.
+        self._capacity_ledger: SessionCapacityLedger | None = None
         self._ar_diffusion_capability: SupportsARDiffusionPipeline | None = None
         self._ar_diffusion_noisy_kv_capability: SupportsARDiffusionNoisyKV | None = None
         self._ar_diffusion_kv_cache_spec: ARDiffusionKVCacheSpec | None = None
@@ -240,6 +251,13 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             step_replicas,
             blocks_per_rank,
         )
+
+        # The pool is the only party that knows the budget and how wide a window
+        # one session may occupy, so the ledger is installed here rather than
+        # handed in from outside: grants are expressed in the units
+        # ``session_usage`` reports, and a ledger owned by the replica cannot
+        # outlive it.
+        self.bind_capacity_ledger(SessionCapacityLedger(budget_bytes=self.noisy_kv_cache.reserved_bytes))
 
     def _preallocate_kv_cache(self, *, available_bytes: int | None = None) -> None:
         """Build pools solely from the pipeline capability and runner config."""
@@ -512,11 +530,117 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         )
         return lifecycle.kv_id, lifecycle.persist, lifecycle.reset, lifecycle.close_session
 
+    def bind_capacity_ledger(self, ledger: SessionCapacityLedger | None) -> None:
+        """Install the capacity ledger that guards this runner's pool."""
+        self._capacity_ledger = ledger
+
+    def _reserve_session_capacity(self, entries: Sequence[tuple[str, bool, bool, bool]]) -> None:
+        """Admit every key of this call against the allowance the pool sized for it.
+
+        A key that keeps its history needs the window one session may occupy, and
+        the grant is charged once: a continuation re-admits the same absolute
+        holding, which costs nothing because the session already holds it. A key
+        that closes or does not persist never keeps history past this call, so it
+        is never granted and never leaves a ledger entry behind.
+
+        Refusing is the pool's own boundary reached earlier: grants can never sum
+        past the slots the pool reserved, so a session denied here would have
+        exhausted ``VersionPool`` mid-forward instead -- after writing versions that
+        then had to be thrown away. A refusal unwinds the grants this call already
+        made, so one denied key never leaves another holding a window it cannot use.
+        """
+        ledger = getattr(self, "_capacity_ledger", None)
+        if ledger is None or self.noisy_kv_cache is None:
+            return
+        cache = self.noisy_kv_cache
+        granted: list[str] = []
+        try:
+            for kv_id, persist, _reset, close_session in entries:
+                if not kv_id or not persist or close_session:
+                    continue
+                if ledger.grant(kv_id) is not None:
+                    continue
+                ledger.reserve(
+                    kv_id,
+                    CapacityDemand(versions=cache.session_grant_versions, bytes=cache.session_grant_bytes),
+                )
+                granted.append(kv_id)
+        except ReservationDeniedError:
+            for kv_id in granted:
+                ledger.release(kv_id)
+            raise
+
+    def _report_session_capacity(self, kv_id: str, *, fail_closed: bool = True) -> None:
+        """Report what a session pool key actually holds so the ledger can reconcile.
+
+        Admission granted a window; after the forward the worker states the truth.
+        Holding more than the grant is an overcommit -- it cannot be paid for out of
+        another session's budget -- so the request fails closed instead of continuing
+        on borrowed capacity. Teardown reports with ``fail_closed=False``: releasing a
+        key must not turn into a second failure.
+        """
+        # getattr, not attribute access: tests build the runner with ``object.__new__``
+        # and a worker that never installed a ledger must simply report nothing.
+        ledger = getattr(self, "_capacity_ledger", None)
+        if ledger is None or self.noisy_kv_cache is None:
+            return
+        versions, nbytes = self.noisy_kv_cache.session_usage(kv_id)
+        if not versions and ledger.grant(kv_id) is None and ledger.usage(kv_id) is None:
+            # Nothing reserved and nothing held (an ephemeral request id): there is
+            # no ledger entry to keep in step, so do not create one per request.
+            return
+        try:
+            ledger.reconcile(kv_id, CapacityUsage(versions=versions, bytes=nbytes))
+        except ReservationOvercommitError:
+            logger.warning(
+                "AR-Diffusion session=%s exceeded its capacity grant (%d bytes, %d versions)",
+                kv_id,
+                nbytes,
+                versions,
+            )
+            if fail_closed:
+                # Fail closed means the retained history goes too, or the next
+                # continuation would keep running on the unreserved capacity. The
+                # ledger keeps the record of what the session claimed, so the
+                # failure is visible after the history is gone.
+                NoisyKVState(self.noisy_kv_cache).release_session(kv_id)
+                raise
+
+    def _report_noisy_kv_capacity(self, entries: Sequence[tuple[str, bool, bool, bool]]) -> None:
+        """Report every key of this call after a successful forward.
+
+        A key that keeps its history fails the request closed on overcommit; a
+        closing or ephemeral key reports without raising, because teardown must not
+        turn one failure into two, and then reports its empty holding on release.
+        """
+        overcommit: ReservationOvercommitError | None = None
+        for kv_id, persist, _reset, close_session in entries:
+            if not kv_id:
+                continue
+            try:
+                self._report_session_capacity(kv_id, fail_closed=bool(persist and not close_session))
+            except ReservationOvercommitError as exc:
+                # Report every key of the call first; the call then fails as a whole.
+                overcommit = overcommit or exc
+        if overcommit is not None:
+            raise overcommit
+
     def release_noisy_kv(self, kv_id: str) -> None:
-        """Drop retained Noisy PP versions for ``kv_id`` (outer session reset/close)."""
+        """Drop retained Noisy PP versions for ``kv_id`` (outer session reset/close).
+
+        This is where a session's capacity comes back: the history is reported as
+        empty first, so the ledger records the truth before it is forgotten, and
+        the grant is then returned. A reset, a close, and a failed forward therefore
+        all leave the budget where they found it.
+        """
         if self.noisy_kv_cache is None:
             return
         NoisyKVState(self.noisy_kv_cache).release_session(kv_id)
+        # Report the empty holding so the ledger never drifts from the worker.
+        self._report_session_capacity(kv_id, fail_closed=False)
+        ledger = getattr(self, "_capacity_ledger", None)
+        if ledger is not None:
+            ledger.release(kv_id)
         logger.debug("AR-Diffusion released noisy KV id=%s", kv_id)
 
     def _bound_noisy_kv(self) -> AbstractContextManager[None]:
@@ -566,10 +690,16 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             )
 
     def _prepare_noisy_kv_lifecycles(self, entries: Sequence[tuple[str, bool, bool, bool]]) -> None:
-        """Apply ``reset=True`` before bind — shared by single and batch entries."""
+        """Apply ``reset=True`` and admit capacity before bind.
+
+        Shared by single and batch entries. Reset runs first: it returns the old
+        session's grant, so the re-admission that follows is charged once against a
+        budget that already has the old holding back.
+        """
         for kv_id, _persist, reset, _close in entries:
             if kv_id and reset:
                 self.release_noisy_kv(kv_id)
+        self._reserve_session_capacity(entries)
 
     def _finalize_noisy_kv_lifecycles(
         self,
@@ -609,6 +739,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                     entries[0][0],
                 )
                 raise
+            # Worker half of the reservation loop, before the drop below reports
+            # the empty holding.
+            self._report_noisy_kv_capacity(entries)
             # Ephemeral requests and explicit close drop the pool key; a
             # persistent session_id leaves retained history for the outer owner.
             self._finalize_noisy_kv_lifecycles(entries, fail_closed=False)
@@ -666,6 +799,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                     list(dict.fromkeys(kv_id for kv_id, *_ in entries if kv_id)),
                 )
                 raise
+            self._report_noisy_kv_capacity(entries)
             self._finalize_noisy_kv_lifecycles(entries, fail_closed=False)
             return output
         raise RuntimeError(

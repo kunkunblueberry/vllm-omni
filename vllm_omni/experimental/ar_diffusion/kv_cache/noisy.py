@@ -528,6 +528,13 @@ class NoisyKVCache:
         self.resident_peak = 0
         self.bytes_per_version = bytes_per_version
         self.reserved_bytes = self.capacity * bytes_all_layers
+        # One session may hold at most the window this pool was sized for:
+        # ``per_req`` versions on each of ``num_layers`` layers. A pool key counts
+        # one block's layer, so the allowance is stated in the same units
+        # :meth:`session_usage` reports -- admission can then charge a session
+        # exactly what the physical pool would let it occupy, and no more.
+        self.session_grant_versions = per_req * max(1, spec.num_layers)
+        self.session_grant_bytes = per_req * bytes_all_layers
         # First-request schedule fingerprint per outer session_id / pool key.
         self._session_structural_keys: dict[str, tuple[object, ...]] = {}
 
@@ -546,6 +553,19 @@ class NoisyKVCache:
 
     def clear_session_structure(self, kv_id: str) -> None:
         self._session_structural_keys.pop(kv_id, None)
+
+    def session_usage(self, kv_id: str) -> tuple[int, int]:
+        """(versions, bytes) the pool key ``kv_id`` currently holds.
+
+        ``versions`` is the logical retained-version count and the second value the
+        footprint of those versions. A pool key holds one block's layer, so each
+        version costs ``bytes_per_version``. Both are what the capacity ledger needs
+        to reconcile a session's grant against reality -- and what it charges at
+        admission, since a session is granted exactly the window the pool sized for
+        it. The physical layout stays private to this pool.
+        """
+        versions = sum(1 for key in self.pool.keys if key[0] == kv_id)
+        return versions, versions * self.bytes_per_version
 
 
 def clean_history_cells(schedule: CellSchedule, *, num_blocks: int) -> set[Cell]:
