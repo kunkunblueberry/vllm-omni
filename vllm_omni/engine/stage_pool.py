@@ -45,6 +45,10 @@ from vllm_omni.engine.stage_client import (
     StagePoolLLMClient,
 )
 from vllm_omni.errors import OmniClientError
+from vllm_omni.experimental.ar_diffusion.session_affinity import (
+    SessionAffinityError,
+    SessionRouter,
+)
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniInteractionPrompt, OmniSamplingParams
 from vllm_omni.metrics import (
     count_audio_frames,
@@ -67,6 +71,33 @@ if TYPE_CHECKING:
     from vllm_omni.engine.orchestrator import OrchestratorRequestState
 
 logger = init_logger(__name__)
+
+#: Upper bound on remembered session -> replica bindings, evicting the least
+#: recently routed one. Evicting a binding only costs the session its stickiness:
+#: the next request is served cold on some replica, never failed.
+MAX_SESSION_BINDINGS = 4096
+
+
+def session_reset_requested(params: object) -> bool:
+    """Whether the request asks to restart its session instead of continuing it."""
+    extra = getattr(params, "extra_args", None)
+    if not isinstance(extra, dict):
+        return False
+    return bool(extra.get("reset", False))
+
+
+def session_id_of(params: object) -> str | None:
+    """Session identity a request carries, if any.
+
+    A session's KV lives on one replica, so its follow-up requests have to reach
+    that replica. The identity travels in the sampling params' ``extra_args``
+    because that is what the model-facing layers already read.
+    """
+    extra = getattr(params, "extra_args", None)
+    if not isinstance(extra, dict):
+        return None
+    value = extra.get("session_id")
+    return str(value) if value else None
 
 
 class StageUnavailableError(RuntimeError):
@@ -215,6 +246,11 @@ class StagePool:
         self._watermark_lock = asyncio.Lock()
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
+        # Session -> replica. Round-robin would scatter a session's follow-up
+        # requests across replicas that do not hold its state. The router owns the
+        # cold-restart decision; the dict is the bounded routing mirror.
+        self._session_bindings: dict[str, int] = {}
+        self._session_router = SessionRouter()
         # The orchestrator records caller-selected replicas before admission,
         # but they are not active affinities until submission. Keeping the
         # intent separate prevents membership cleanup from reporting a
@@ -438,6 +474,7 @@ class StagePool:
         task: Task | None = None,
         *,
         affinity_request_id: str | None = None,
+        session_id: str | None = None,
     ) -> int:
         """Return a replica id for ``request_id``.
 
@@ -450,7 +487,13 @@ class StagePool:
         :meth:`select_replica_id`.
         """
         if self._hub is None or self._lb is None:
-            return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
+            return self.select_replica_id(request_id, affinity_request_id=affinity_request_id, session_id=session_id)
+
+        # 0. Sticky by session: its history lives on exactly one replica.
+        if session_id is not None:
+            holder = self._session_holder(session_id)
+            if holder is not None:
+                return self._sync_session_route(request_id, holder)
 
         # 1. Sticky: previously bound and still serviceable?
         bound_addr = self._affinity.get(request_id)
@@ -480,6 +523,8 @@ class StagePool:
                 lb_idx = self._lb.select(task, [rep for rep, _ in candidates])
                 replica_info, replica_id = candidates[lb_idx]
                 self._affinity[request_id] = replica_info.input_addr
+                if session_id is not None:
+                    self._bind_session(session_id, replica_id)
                 return replica_id
 
             now = _time.monotonic()
@@ -495,6 +540,7 @@ class StagePool:
         task: Task | None = None,
         *,
         affinity_request_id: str | None = None,
+        session_id: str | None = None,
     ) -> int | None:
         """Synchronously pick and bind a replica before request preprocessing.
 
@@ -509,10 +555,27 @@ class StagePool:
         requested_replica_id = self._requested_replica_ids.get(request_id)
         if requested_replica_id is not None:
             self._validate_requested_replica(requested_replica_id)
+            if session_id is not None:
+                # A caller pin and a session binding are two statements about where
+                # the state lives. Reconcile them instead of keeping two ledgers: a
+                # pin that contradicts the holder is refused, otherwise the pin
+                # becomes the session's replica.
+                holder = self.session_replica_id(session_id, allow_cold=False)
+                if holder is not None and holder != requested_replica_id:
+                    raise StageUnavailableError(
+                        f"stage {self.stage_id} request {request_id!r} pinned replica {requested_replica_id}, "
+                        f"but session {session_id!r} is held by replica {holder}"
+                    )
+                self._bind_session(session_id, requested_replica_id)
             return requested_replica_id
 
+        if session_id is not None:
+            holder = self._session_holder(session_id)
+            if holder is not None:
+                return self._sync_session_route(request_id, holder)
+
         if self._hub is None or self._lb is None:
-            return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
+            return self.select_replica_id(request_id, affinity_request_id=affinity_request_id, session_id=session_id)
 
         bound_addr = self._affinity.get(request_id)
         if bound_addr is not None:
@@ -529,7 +592,7 @@ class StagePool:
                     self._affinity[request_id] = parent_addr
                     return replica_id
 
-        task = task or Task(request_id=request_id)
+        task: Task = task if task is not None else Task(request_id=request_id)
         candidates = self._collect_serviceable_replicas()
         if not candidates:
             return None
@@ -809,6 +872,13 @@ class StagePool:
         released_request_ids = list(dict.fromkeys(released_request_ids))
         for request_id in released_request_ids:
             self.release_binding(request_id)
+        # Sessions that lived here lost their history with the replica. The router
+        # records that, so a follow-up can be told apart from a fresh start instead
+        # of silently continuing cold.
+        self._session_router.release_replica(replica_id)
+        for session_id, bound_replica_id in list(self._session_bindings.items()):
+            if bound_replica_id == replica_id:
+                self._session_bindings.pop(session_id, None)
         return released_request_ids
 
     def mark_replica_unavailable(self, replica_id: int) -> list[str]:
@@ -824,13 +894,121 @@ class StagePool:
     def available_replica_ids(self) -> list[int]:
         return [replica_id for replica_id in range(self.num_replicas) if self.is_replica_available(replica_id)]
 
+    # ---- Session affinity ----
+
+    def _bind_session(self, session_id: str, replica_id: int) -> None:
+        """Record a session -> replica binding, evicting the oldest when full.
+
+        The router decides whether a session may move; this dict only mirrors the
+        routing answer, so both are updated (and evicted) together.
+        """
+        try:
+            self._session_router.bind(session_id, replica_id)
+        except SessionAffinityError:
+            # An explicit move (a caller pinning the request elsewhere, or a cold
+            # restart after eviction): the old holder no longer serves this session.
+            logger.warning(
+                "stage %s session %s moves to replica %d despite a previous binding",
+                self.stage_id,
+                session_id,
+                replica_id,
+            )
+            self._session_router.release(session_id)
+            self._session_router.bind(session_id, replica_id)
+        self._session_bindings.pop(session_id, None)
+        self._session_bindings[session_id] = replica_id
+        while len(self._session_bindings) > MAX_SESSION_BINDINGS:
+            evicted = next(iter(self._session_bindings))
+            self._session_bindings.pop(evicted, None)
+            self._session_router.release(evicted)
+
+    def session_replica_id(self, session_id: str, *, allow_cold: bool = True) -> int | None:
+        """Replica that holds *session_id*, if it is still serviceable.
+
+        A holder that is gone cannot serve the session, so the router records the
+        loss and this returns ``None`` for the caller to select a replica again --
+        which means the continuation starts cold. Pass ``allow_cold=False`` to
+        refuse it instead of silently losing the session's history.
+        """
+        replica_id = self._session_bindings.get(session_id)
+        if replica_id is None:
+            return None
+        if self.is_replica_available(replica_id):
+            return replica_id
+        if not allow_cold:
+            raise StageUnavailableError(
+                f"stage {self.stage_id} session {session_id!r} is bound to replica {replica_id}, "
+                "which is not live; the continuation cannot be served from its history"
+            )
+        # Cold restart: the binding is void and the history it held is unreachable.
+        self._session_bindings.pop(session_id, None)
+        self._session_router.release_replica(replica_id)
+        return None
+
+    def _session_holder(self, session_id: str) -> int | None:
+        """Routing lookup: the holder, refreshed so an active session is evicted last."""
+        replica_id = self.session_replica_id(session_id)
+        if replica_id is not None:
+            self._bind_session(session_id, replica_id)
+        return replica_id
+
+    def _sync_session_route(self, request_id: str, replica_id: int) -> int:
+        """Record the route to a session holder for *request_id*.
+
+        Abort routing and mid-request interactions look a request up through
+        ``get_bound_replica_id`` (then ``_affinity`` for a later pick), so a session
+        hit that recorded neither would leave abort with no binding and let an
+        interaction or retry load-balance onto another replica.
+        """
+        self._request_bindings[request_id] = replica_id
+        input_addr = self._input_addr_for_replica(replica_id)
+        if input_addr is not None:
+            self._affinity[request_id] = input_addr
+        else:
+            self._affinity.pop(request_id, None)
+        return replica_id
+
+    def _input_addr_for_replica(self, replica_id: int) -> str | None:
+        """Registered input address of ``replica_id`` once a head-side client is attached."""
+        for input_addr, known_replica_id in self._addr_to_replica_id.items():
+            if known_replica_id == replica_id:
+                return input_addr
+        return None
+
+    def bind_session_replica(self, session_id: str, replica_id: int) -> int:
+        """Record the replica that now holds *session_id*."""
+        if not self.is_replica_available(replica_id):
+            raise StageUnavailableError(
+                f"stage {self.stage_id} replica {replica_id} cannot hold session {session_id!r}"
+            )
+        self._bind_session(session_id, replica_id)
+        return replica_id
+
+    def release_session(self, session_id: str) -> int | None:
+        """Forget a session binding (the session closed, reset, or moved)."""
+        self._session_router.release(session_id)
+        return self._session_bindings.pop(session_id, None)
+
+    def is_session_stale(self, session_id: str) -> bool:
+        """Whether *session_id* lost a replica, so a continuation restarts cold."""
+        return self._session_router.is_stale(session_id)
+
+    def session_binding_count(self) -> int:
+        return len(self._session_bindings)
+
     def select_replica_id(
         self,
         request_id: str,
         *,
         affinity_request_id: str | None = None,
+        session_id: str | None = None,
     ) -> int:
         """Pick a replica id for *request_id* and cache the choice (legacy path)."""
+        if session_id is not None:
+            # A session's history lives on one replica; the follow-up must reach it.
+            holder = self._session_holder(session_id)
+            if holder is not None:
+                return self._sync_session_route(request_id, holder)
         cached = self.get_bound_replica_id(request_id)
         if cached is not None and self.clients[cached] is not None and self.is_replica_available(cached):
             return cached
@@ -858,6 +1036,8 @@ class StagePool:
                 self._next_replica_id = (self._next_replica_id + 1) % len(live)
 
         self._request_bindings[request_id] = chosen
+        if session_id is not None:
+            self._bind_session(session_id, chosen)
         return chosen
 
     def _llm_client(self, replica_id: int) -> StagePoolLLMClient:
@@ -1307,6 +1487,12 @@ class StagePool:
             payload_sender_info = getattr(request, "payload_sender_info", None)
             if payload_sender_info is not None:
                 submit_kwargs.setdefault("payload_sender_info", payload_sender_info)
+            # A Noisy PP session keeps its KV on one replica's workers, so the
+            # request's session decides where it may run. A reset restarts the
+            # session, so the old holder is dropped before routing.
+            session_id = session_id_of(params)
+            if session_id is not None and session_reset_requested(params):
+                self.release_session(session_id)
             if requested_replica_id is not None:
                 replica_id = self.bind_requested_replica(request_id, requested_replica_id)
             elif pinned_replica_id is not None:
@@ -1315,7 +1501,12 @@ class StagePool:
                 replica_id = await self._pick_or_select(
                     request_id,
                     affinity_request_id=affinity_request_id,
+                    session_id=session_id,
                 )
+            if session_id is not None:
+                # One ledger: whatever replica this request runs on becomes the
+                # session's holder (an explicit pin included).
+                self._bind_session(session_id, replica_id)
             if req_state.trace is not None:
                 req_state.trace.start_stage(self.stage_id, replica_id, self.stage_type)
             client = self._diffusion_client(replica_id)
@@ -1504,11 +1695,12 @@ class StagePool:
         request_id: str,
         *,
         affinity_request_id: str | None = None,
+        session_id: str | None = None,
     ) -> int:
         """Bridge to ``pick`` in distributed mode or ``select_replica_id`` legacy."""
         if self.is_distributed:
-            return await self.pick(request_id, affinity_request_id=affinity_request_id)
-        return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
+            return await self.pick(request_id, affinity_request_id=affinity_request_id, session_id=session_id)
+        return self.select_replica_id(request_id, affinity_request_id=affinity_request_id, session_id=session_id)
 
     # ---- Stage-local polling ----
 
