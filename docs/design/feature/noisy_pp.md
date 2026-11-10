@@ -199,10 +199,18 @@ calls `AsyncStreamDecodeJob.cancel()` when a side job is present.
 
 ## NoisyKV
 
-Implemented in `vllm_omni/experimental/ar_diffusion/kv_cache/noisy.py`
-(`NoisyKVCache` / `NoisyKVState`). Stays experimental; not graduated with
-the plan/executor. Mainline only sees `SupportsNoisyPPKV` on the cell
-context.
+Implemented under `vllm_omni/experimental/ar_diffusion/kv_cache/`.
+`noisy.py` preserves existing imports, while `noisy_spec`, `noisy_pool`,
+`noisy_context`, `noisy_transport`, `noisy_manager`, `noisy_retention` and
+`noisy_state` separate configuration, storage, views, transport, cache ownership,
+history policy and per-invocation execution state. This follows the paged path's
+configuration / storage / manager / state layering rather than a second runtime.
+
+The backends share pool allocation, paged attention and the allocation-retention
+operation in `lifecycle.py`; layouts, publication and synchronization remain
+strategy-specific. See [KV management layers](ar_diffusion_kv_management.md) for
+the common contract and its limits. KV stays experimental, not graduated with
+the plan/executor. Mainline only sees `SupportsNoisyPPKV` on the cell context.
 
 | | |
 | --- | --- |

@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from vllm_omni.experimental.ar_diffusion.kv_cache.lifecycle import release_unretained
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import compute_slot_mapping
 
 if TYPE_CHECKING:
@@ -253,10 +254,7 @@ class ARDiffusionSegmentedKVState:
         self._publish_retention(self._validate_retention(handles))
 
     def _publish_retention(self, retained: tuple[SegmentHandle, ...]) -> None:
-        keep = set(retained)
-        for handle in tuple(self._allocations):
-            if handle not in keep:
-                self._release(handle)
+        release_unretained(self._allocations, retained, self._release)
         if retained != self._retained:
             self._retained = retained
             self._revision += 1
