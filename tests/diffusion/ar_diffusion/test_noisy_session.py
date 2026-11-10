@@ -111,6 +111,65 @@ def _bare_noisy_runner() -> ARDiffusionModelRunner:
     return runner
 
 
+def test_retention_retires_transfers_before_reusing_slots(monkeypatch):
+    """end_request must fence all excluded versions before returning any slot."""
+    cache = _cache()
+    state = NoisyKVState(cache)
+    kept = ("owner", 0, 1, 0)
+    dropped = (("owner", 1, 1, 0), ("owner", 2, 1, 0))
+    foreign = ("other", 0, 1, 0)
+    for key in (kept, *dropped, foreign):
+        cache.pool.alloc(key)
+    events = []
+    original_discard = cache.transport.discard
+    original_release = cache.pool.release
+
+    def discard(key):
+        events.append(("discard", key))
+        assert cache.pool.has(key), "slot freed before its pending transfer retired"
+        original_discard(key)
+
+    def release(key):
+        events.append(("release", key))
+        original_release(key)
+
+    monkeypatch.setattr(cache.transport, "discard", discard)
+    monkeypatch.setattr(cache.pool, "release", release)
+    state.end_request("owner", retain={(0, 1, 0)})
+
+    assert events == [
+        ("discard", dropped[0]),
+        ("discard", dropped[1]),
+        ("release", dropped[0]),
+        ("release", dropped[1]),
+    ]
+    assert set(cache.pool.keys) == {kept, foreign}
+    state.end_request("owner", retain=())
+    assert set(cache.pool.keys) == {foreign}
+
+
+def test_failed_receive_retirement_keeps_version_storage_allocated():
+    """A failed transport wait must not return the version slot to another request."""
+    cache = _cache()
+    state = NoisyKVState(cache)
+    key = ("owner", 1, 1, 0)
+    cache.pool.alloc(key)
+    slot = cache.pool.slot_of(key)
+
+    class PendingReceive:
+        def wait(self):
+            assert cache.pool.has(key), "storage was returned before communication finished"
+            raise RuntimeError("receive did not complete")
+
+    cache.transport._pending_recv[key] = ([PendingReceive()], None, cache.bytes_per_version)
+
+    with pytest.raises(RuntimeError, match="receive did not complete"):
+        state.end_request("owner", retain=())
+
+    assert cache.pool.slot_of(key) == slot
+    assert slot not in cache.pool.free[0]
+
+
 def test_prior_plan_sources_and_cross_rank_handoff():
     local = _schedule(chunk_base=1)
     prior = expected_prior_cells(local)
