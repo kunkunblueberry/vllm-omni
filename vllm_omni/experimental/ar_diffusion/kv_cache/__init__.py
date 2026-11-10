@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """AR-Diffusion engine-level KV cache helpers.
 
 Thin glue over vLLM's paged KV stack (``KVCacheManager`` / ``BlockPool`` /
@@ -8,6 +9,10 @@ AR-diffusion models.
 Layout: ``config`` (public knob) · ``paged`` (engine-generic paging mechanics +
 chunk-window eviction spec) · ``manager`` (the ARDiffusionKVCache orchestrator + its
 request adapter / pool builders) · ``state`` (the model-facing ARDiffusionKVState bridge).
+The Noisy backend mirrors these roles in ``noisy_spec``, ``noisy_pool``,
+``noisy_manager`` and ``noisy_state``, with policy/views/transport in their own
+modules. ``lifecycle`` contains allocation-retention operations shared by both
+backends. ``noisy`` remains the compatibility import surface.
 """
 
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig

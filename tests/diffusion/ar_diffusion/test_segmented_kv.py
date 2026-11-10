@@ -198,6 +198,32 @@ def test_retention_handles_are_ordered_and_session_local():
     assert state.handles == handles[::-1]
 
 
+def test_committed_retention_releases_only_excluded_owned_segments():
+    """Publication retires excluded pages, preserving retained data and other sessions."""
+    cache = make_cache()
+    owner = make_state(cache, "owner")
+    state = owner.segmented("main")
+    first, second = append(state, (3, 5), offset=4)
+    other_owner = make_state(cache, "other")
+    other = other_owner.segmented("main")
+    foreign = append(other, (2, 2), offset=20)
+    free = cache.manager.block_pool.get_num_free_blocks()
+
+    state.retain((second,))
+
+    assert state.handles == (second,)
+    assert first not in state._allocations
+    assert second in state._allocations
+    assert other.handles == foreign
+    assert cache.manager.block_pool.get_num_free_blocks() == free + 1
+    state.prepare_layer_views(1, 0)
+    key, value = state.assemble(0, rows(0), rows(0), rows(1), rows(1))
+    torch.testing.assert_close(key[:5], rows(8, 4)[3:])
+    torch.testing.assert_close(value[:5], -rows(8, 4)[3:])
+    owner.close()
+    other_owner.close()
+
+
 def test_shared_staging_invalidates_when_switching_sessions():
     cache = make_cache()
     a = make_state(cache, "a").segmented("main")
