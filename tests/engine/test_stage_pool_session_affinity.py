@@ -14,7 +14,7 @@ import asyncio
 
 import pytest
 
-from vllm_omni.engine.stage_pool import StagePool, session_id_of
+from vllm_omni.engine.stage_pool import StagePool, session_id_of, session_reset_requested
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -181,6 +181,29 @@ def test_the_session_identity_is_read_from_the_request_params():
     assert session_id_of(_NoExtra()) is None
 
 
+def test_the_serialized_tick_is_the_stage_pool_session_identity():
+    from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
+
+    class _TickOnly:
+        extra_args = ARDiffusionTickRequest(
+            session_id="tick-session", request_id="req-1", chunk_index=0, reset=True
+        ).to_extra_args()
+
+    class _ConflictingLegacy:
+        extra_args = {
+            "session_id": "legacy-session",
+            "reset": False,
+            **ARDiffusionTickRequest(
+                session_id="tick-session", request_id="req-1", chunk_index=0, reset=True
+            ).to_extra_args(),
+        }
+
+    assert session_id_of(_TickOnly()) == "tick-session"
+    assert session_reset_requested(_TickOnly()) is True
+    assert session_id_of(_ConflictingLegacy()) == "tick-session"
+    assert session_reset_requested(_ConflictingLegacy()) is True
+
+
 # ---- Distributed mode: a session hit must also record the request's route ----
 
 
@@ -283,15 +306,30 @@ def test_submit_initial_routes_a_diffusion_follow_up_to_its_holder(mocker):
     assert pool.session_replica_id("s1") == first
 
 
-def test_submit_initial_reset_moves_the_session(mocker):
-    """A reset is an explicit restart, so the old holder must not win the route."""
+def _submit_tick(pool, mocker, request_id: str, *, session_id: str, reset: bool = False) -> int:
+    from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    tick = ARDiffusionTickRequest(session_id=session_id, request_id=request_id, chunk_index=0, reset=reset)
+    params = OmniDiffusionSamplingParams(extra_args=tick.to_extra_args())
+    req_state = mocker.Mock(sampling_params_list=[params], trace=None)
+    return asyncio.run(pool.submit_initial(request_id, req_state, request=mocker.Mock(payload_sender_info=None)))
+
+
+def test_submit_initial_reset_stays_on_the_holder_while_worker_releases_its_state(mocker):
+    """A namespaced tick reset reaches the worker that owns its KV and grant."""
     pool = _diffusion_pool(mocker)
-    first = _submit(pool, mocker, "r1", extra={"session_id": "s1"})
+    first = _submit_tick(pool, mocker, "r1", session_id="s1")
+    old_holder = pool.clients[first]
+    other = pool.clients[1 - first]
+    old_holder.add_request_async.reset_mock()
 
-    second = _submit(pool, mocker, "r2", extra={"session_id": "s1", "reset": True})
+    second = _submit_tick(pool, mocker, "r2", session_id="s1", reset=True)
 
-    assert second != first, "a reset session stayed on the previous replica"
-    assert pool.session_replica_id("s1") == second
+    assert second == first, "reset moved before the old worker could release its state"
+    old_holder.add_request_async.assert_awaited_once()
+    other.add_request_async.assert_not_awaited()
+    assert pool.session_replica_id("s1") == first
 
 
 def test_submit_initial_without_a_session_is_unaffected(mocker):
@@ -301,3 +339,35 @@ def test_submit_initial_without_a_session_is_unaffected(mocker):
     _submit(pool, mocker, "r2")
 
     assert pool.session_binding_count() == 0
+
+
+@pytest.mark.parametrize("pin_kind", ["requested", "pinned"])
+def test_submit_initial_rejects_explicit_replica_conflicting_with_session_holder(mocker, pin_kind):
+    """The submit path must enforce affinity even when preselection was bypassed."""
+    from vllm_omni.engine.stage_pool import StageUnavailableError
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    pool = _diffusion_pool(mocker)
+    holder = _submit(pool, mocker, "r1", extra={"session_id": "s1"})
+    other = 1 - holder
+    params = OmniDiffusionSamplingParams(extra_args={"session_id": "s1"})
+    req_state = mocker.Mock(sampling_params_list=[params], trace=None)
+    kwargs = {"requested_replica_id": other} if pin_kind == "requested" else {"pinned_replica_id": other}
+
+    with pytest.raises(StageUnavailableError, match="held by replica"):
+        asyncio.run(pool.submit_initial("r2", req_state, request=mocker.Mock(payload_sender_info=None), **kwargs))
+
+    assert pool.session_replica_id("s1") == holder, "the rejected pin changed the session owner"
+
+
+def test_submit_initial_reset_can_start_cold_after_holder_loss(mocker):
+    """An explicit reset discards stale history instead of refusing recovery."""
+    pool = _diffusion_pool(mocker)
+    holder = pool.bind_session_replica("s1", 0)
+    pool.mark_replica_unavailable(holder)
+
+    replica = _submit(pool, mocker, "r2", extra={"session_id": "s1", "reset": True})
+
+    assert replica != holder
+    assert pool.session_replica_id("s1") == replica
+    assert pool.is_session_stale("s1") is True
