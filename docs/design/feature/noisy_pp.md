@@ -202,15 +202,26 @@ calls `AsyncStreamDecodeJob.cancel()` when a side job is present.
 Implemented under `vllm_omni/experimental/ar_diffusion/kv_cache/`.
 `noisy.py` preserves existing imports, while `noisy_spec`, `noisy_pool`,
 `noisy_context`, `noisy_transport`, `noisy_manager`, `noisy_retention` and
-`noisy_state` separate configuration, storage, views, transport, cache ownership,
-history policy and per-invocation execution state. This follows the paged path's
-configuration / storage / manager / state layering rather than a second runtime.
+`noisy_state` split Noisy-specific spec, storage, views, transport, manager,
+history policy and per-invocation state. This is a module refactor, not a shared
+manager or session-state implementation with the paged backend.
 
-The backends share pool allocation, paged attention and the allocation-retention
-operation in `lifecycle.py`; layouts, publication and synchronization remain
-strategy-specific. See [KV management layers](ar_diffusion_kv_management.md) for
-the common contract and its limits. KV stays experimental, not graduated with
-the plan/executor. Mainline only sees `SupportsNoisyPPKV` on the cell context.
+The paged/segmented and Noisy backends use separate managers, state objects,
+logical allocation units, retention policies and transports. The only new
+cross-backend operation is `release_unretained()` in `kv_cache/lifecycle.py`:
+`ARDiffusionSegmentedKVState._publish_retention` and `NoisyKVState.end_request`
+both call it to compute allocations absent from a retained set and invoke the
+backend release callback. Noisy supplies `transport.discard` as `before_release`
+so pending receives are retired before its VersionPool slots are reused. The
+operation does not unify publication, transaction/rollback, last-use tracking,
+session ownership, worker cleanup or transport.
+
+The Noisy capacity ledger is worker-local: the runner admits against its pool's
+own byte budget, reconciles worker-reported versions/bytes, and returns grants
+on reset, close or failed forward. CPU service-level budget handoff and
+distributed per-worker grants remain unimplemented. KV stays experimental,
+separate from the plan/executor. Mainline only sees `SupportsNoisyPPKV` on the
+cell context.
 
 | | |
 | --- | --- |
@@ -229,8 +240,9 @@ The topology stays `S=D`. Chunk 0 runs one extra clean forward on the last
 replica, then its clean KV is distributed once to the readers before later
 chunks start. When the clean successor is on the same rank, the executor carries
 the final latent directly into that pass, without adapter-local latent storage.
-Subsequent chunks use the normal Same-Step schedule. A single-chunk
-request skips the unused clean forward and sink distribution.
+Subsequent chunks use the normal Same-Step schedule. A one-shot single-chunk
+request skips the unused sink. A persistent one-chunk session produces and keeps
+the chunk-0 sink so a later request can continue from its prior state.
 
 Each chunk reads the fixed clean sink plus its most recent `H` Same-Step
 history chunks, deduplicating chunk 0 while it is in the window. `H=0` keeps
