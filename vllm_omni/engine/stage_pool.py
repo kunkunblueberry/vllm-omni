@@ -49,6 +49,7 @@ from vllm_omni.experimental.ar_diffusion.session_affinity import (
     SessionAffinityError,
     SessionRouter,
 )
+from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniInteractionPrompt, OmniSamplingParams
 from vllm_omni.metrics import (
     count_audio_frames,
@@ -78,12 +79,21 @@ logger = init_logger(__name__)
 MAX_SESSION_BINDINGS = 4096
 
 
-def session_reset_requested(params: object) -> bool:
-    """Whether the request asks to restart its session instead of continuing it."""
+def _session_fields(params: object) -> tuple[str | None, bool]:
+    """Return session identity and reset from typed ticks or legacy fields."""
     extra = getattr(params, "extra_args", None)
     if not isinstance(extra, dict):
-        return False
-    return bool(extra.get("reset", False))
+        return None, False
+    tick = ARDiffusionTickRequest.from_extra_args(extra)
+    if tick is not None:
+        return tick.session_id, tick.reset
+    value = extra.get("session_id")
+    return (str(value) if value else None), bool(extra.get("reset", False))
+
+
+def session_reset_requested(params: object) -> bool:
+    """Whether the request asks to restart the session encoded in its params."""
+    return _session_fields(params)[1]
 
 
 def session_id_of(params: object) -> str | None:
@@ -93,11 +103,7 @@ def session_id_of(params: object) -> str | None:
     that replica. The identity travels in the sampling params' ``extra_args``
     because that is what the model-facing layers already read.
     """
-    extra = getattr(params, "extra_args", None)
-    if not isinstance(extra, dict):
-        return None
-    value = extra.get("session_id")
-    return str(value) if value else None
+    return _session_fields(params)[0]
 
 
 class StageUnavailableError(RuntimeError):
@@ -1487,22 +1493,29 @@ class StagePool:
             payload_sender_info = getattr(request, "payload_sender_info", None)
             if payload_sender_info is not None:
                 submit_kwargs.setdefault("payload_sender_info", payload_sender_info)
-            # A Noisy PP session keeps its KV on one replica's workers, so the
-            # request's session decides where it may run. A reset restarts the
-            # session, so the old holder is dropped before routing.
+            # A reset is executed on the current holder so its worker releases KV and grants.
             session_id = session_id_of(params)
-            if session_id is not None and session_reset_requested(params):
-                self.release_session(session_id)
+            resetting = session_id is not None and session_reset_requested(params)
+            holder = self.session_replica_id(session_id, allow_cold=resetting) if session_id is not None else None
+            explicit_replica_id = requested_replica_id if requested_replica_id is not None else pinned_replica_id
+            if holder is not None and explicit_replica_id is not None and holder != explicit_replica_id:
+                raise StageUnavailableError(
+                    f"stage {self.stage_id} request {request_id!r} pinned replica {explicit_replica_id}, "
+                    f"but session {session_id!r} is held by replica {holder}"
+                )
             if requested_replica_id is not None:
                 replica_id = self.bind_requested_replica(request_id, requested_replica_id)
             elif pinned_replica_id is not None:
                 replica_id = self.bind_request_to_replica(request_id, pinned_replica_id)
+            elif resetting and holder is not None:
+                replica_id = self.select_replica_id(request_id, session_id=session_id)
             else:
                 replica_id = await self._pick_or_select(
                     request_id,
                     affinity_request_id=affinity_request_id,
                     session_id=session_id,
                 )
+
             if session_id is not None:
                 # One ledger: whatever replica this request runs on becomes the
                 # session's holder (an explicit pin included).
