@@ -16,8 +16,6 @@ from vllm_omni.diffusion.models.causvid_wan.async_stream_decode import (
     _start_local,
 )
 from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import CausVidWanPipeline
-from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -105,34 +103,22 @@ def test_local_cancel_stops_consumer_without_join(monkeypatch):
 
 
 def test_pipeline_forward_cancels_stream_job_when_cell_compute_fails(monkeypatch):
-    """Creating a stream job then failing in the cell loop must cancel the job."""
-    pipeline = CausVidWanPipeline.__new__(CausVidWanPipeline)
-    pipeline._chunk_ctx = SimpleNamespace()
+    """Use real admission and KV ownership before injecting a compute failure."""
+    from tests.diffusion.models.causvid_wan.test_cell_batch import _pipeline, _request
+
+    pipeline, ctx, module = _pipeline(monkeypatch)
     cancelled: list[bool] = []
-    job = SimpleNamespace(cancel=lambda: cancelled.append(True))
+    job = SimpleNamespace(cancel=lambda: cancelled.append(True), on_finished=None)
+    monkeypatch.setattr(module, "start_async_stream_decode", lambda **_kwargs: job)
 
-    monkeypatch.setattr(
-        pipeline,
-        "admit_cell_request",
-        lambda _req: (SimpleNamespace(), "kv-1", False, job),
-    )
-
-    def _boom_cell(**_kwargs):
+    def boom(**_kwargs):
         raise RuntimeError("compute boom")
 
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan.run_cell_pipeline",
-        _boom_cell,
-    )
-
-    req = OmniDiffusionRequest(
-        prompt="x",
-        request_id="stream-fail",
-        sampling_params=OmniDiffusionSamplingParams(extra_args={"stream_decode": True}),
-    )
+    monkeypatch.setattr(module, "run_cell_pipeline", boom)
     with pytest.raises(RuntimeError, match="compute boom"):
-        pipeline.forward(req)
+        pipeline.forward(_request("stream-fail", stream_decode=True))
     assert cancelled == [True]
+    assert not ctx.pending and not ctx.inflight and not ctx.kv.cache.pool.keys
 
 
 def test_stream_decode_cancelled_if_wancell_fails(monkeypatch):

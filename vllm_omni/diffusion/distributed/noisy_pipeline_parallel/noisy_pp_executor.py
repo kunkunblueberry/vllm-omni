@@ -12,6 +12,7 @@ import torch
 import torch.distributed as dist
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.distributed.member_batch import BatchMember, ExecutionBatch, execute_member_batch
 from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import (
     Cell,
     CellPlan,
@@ -239,6 +240,8 @@ class SupportsNoisyPPKV(Protocol):
 
     def set_inflight(self, inflight: Sequence[Inflight]) -> None: ...
 
+    def finish_request(self, owner: str) -> None: ...
+
     def end_request(self, req: str, *, retain: Collection[Cell] | None = None) -> None: ...
 
     def chunk_tokens(self, req: str) -> int: ...
@@ -459,8 +462,19 @@ def run_cell_pipeline(
                 # Consume-time wait: covers prefetch that landed many ticks earlier.
                 kv.await_task_sources(tasks)
                 contexts = kv.prepare(tasks)
-                output = adapter.forward(tasks, contexts, hidden=pending_hidden)
-                kv.publish(tasks)
+                if len(contexts) != len(tasks):
+                    raise ValueError("Each Cell batch member requires its own KV view")
+                batch = ExecutionBatch(
+                    tuple(
+                        BatchMember(req, cell, pending_hidden, view)
+                        for (req, cell), view in zip(tasks, contexts, strict=True)
+                    )
+                )
+                output = execute_member_batch(
+                    batch,
+                    lambda members: adapter.forward(tasks, list(members.kv_views), hidden=pending_hidden),
+                    lambda members, result: kv.publish(tasks),
+                )
                 # A local clean successor consumes the chunk-0 final latent here.
                 # The executor owns this handoff; adapters need no latent cache.
                 keep_clean_input = (
@@ -519,7 +533,7 @@ def run_cell_pipeline(
                 if local + 1 < item.plan.num_slots:
                     still.append(item)
                 else:
-                    kv.end_request(item.req)
+                    kv.finish_request(item.req)
             ctx.inflight = still
             kv.set_inflight(tuple(ctx.inflight))
             # End-of-slot wait for remotes first consumed at slot+1 (plan wait_ready).

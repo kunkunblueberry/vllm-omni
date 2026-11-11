@@ -164,16 +164,18 @@ def test_prior_handoff_runs_before_first_prepare():
 
 
 def test_retain_window_structural_key_and_same_step_sink():
-    cache = _cache(history=1)
+    cache = _cache(history=4)
     state = NoisyKVState(cache)
     same = _schedule(num_denoise_steps=2, step_replicas=2, ordering=Ordering.SAME_STEP, chunk_base=3)
-    assert clean_history_cells(same, num_blocks=1) == {(0, 2, 0), (3, 2, 0)}
-    cache.pool.alloc(("world", 0, 2, 0))
-    cache.pool.alloc(("world", 3, 2, 0))
-    cache.pool.alloc(("world", 2, 2, 0))
+    keep = {(0, 2, 0), (3, 0, 0), (3, 1, 0)}
+    assert clean_history_cells(same, num_blocks=1) == keep
+    for cell in keep | {(2, 0, 0), (2, 1, 0), (3, 2, 0)}:
+        cache.pool.alloc(("world", *cell))
     state.end_request("world", retain=clean_history_cells(same, num_blocks=1))
-    assert cache.pool.has(("world", 0, 2, 0)) and cache.pool.has(("world", 3, 2, 0))
-    assert not cache.pool.has(("world", 2, 2, 0))
+    assert all(cache.pool.has(("world", *cell)) for cell in keep)
+    assert not cache.pool.has(("world", 2, 0, 0))
+    assert not cache.pool.has(("world", 2, 1, 0))
+    assert not cache.pool.has(("world", 3, 2, 0))
 
     first = _schedule()
     cache.bind_session_structure("world", first.structural_key())

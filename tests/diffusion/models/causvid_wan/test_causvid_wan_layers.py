@@ -175,7 +175,23 @@ def test_cell_schedule_accepts_known_values(name, step_replicas):
     assert plan.schedule.ordering.value == name
 
 
-@pytest.mark.parametrize("name", ["serial", "latest", "interleaved", "vertical", "same_step", "same_step_kv"])
+@pytest.mark.parametrize("persistent", [False, True])
+def test_same_step_pipeline_single_chunk_sink_matches_session_policy(persistent):
+    pipeline = _bare_pipeline(step_replicas=3, history=2)
+    request = OmniDiffusionRequest(
+        prompt="x",
+        request_id="same-step",
+        sampling_params=OmniDiffusionSamplingParams(
+            extra_args={"cell_schedule": "same_step", "num_denoise_steps": 3, "num_chunks": 1}
+        ),
+    )
+    plan, _, _ = pipeline._plan_for(request, same_step_session=persistent)
+    produced = {plan.task(slot, rank) for slot in range(plan.num_slots) for rank in range(plan.world)}
+    assert ((0, 3, 0) in produced) is persistent
+    assert (0, 0, 0) in produced
+
+
+@pytest.mark.parametrize("name", ["serial", "latest", "interleaved", "vertical", "same_step_kv"])
 def test_cell_schedule_rejects_removed_aliases(name):
     pipeline = _bare_pipeline()
     req = OmniDiffusionRequest(
