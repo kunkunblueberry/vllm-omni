@@ -214,14 +214,17 @@ both call it to compute allocations absent from a retained set and invoke the
 backend release callback. Noisy supplies `transport.discard` as `before_release`
 so pending receives are retired before its VersionPool slots are reused. The
 operation does not unify publication, transaction/rollback, last-use tracking,
-session ownership, worker cleanup or transport.
+session ownership, worker cleanup or transport. See
+[KV management layers](ar_diffusion_kv_management.md) for the common contract
+and its limits.
 
 The Noisy capacity ledger is worker-local: the runner admits against its pool's
 own byte budget, reconciles worker-reported versions/bytes, and returns grants
-on reset, close or failed forward. CPU service-level budget handoff and
-distributed per-worker grants remain unimplemented. KV stays experimental,
-separate from the plan/executor. Mainline only sees `SupportsNoisyPPKV` on the
-cell context.
+on reset, close, a failed forward, or an overcommit that fails the call closed.
+The overcommit keeps its diagnosis in the ledger without holding budget against
+the pool. CPU service-level budget handoff and distributed per-worker grants
+remain unimplemented. KV stays experimental, separate from the plan/executor.
+Mainline only sees `SupportsNoisyPPKV` on the cell context.
 
 | | |
 | --- | --- |
@@ -314,11 +317,44 @@ plus CausVid / Physis model resolve tests.
 GPU (record config): `S=1` Self-Forcing; `S=D` Same-Step; `S=D+1` Latest-KV
 (`benchmarks/` / recipe smoke).
 
+### Session lifecycle across replicas
+
+A session's KV lives on the workers of one replica, so the engine must place its
+follow-ups there and the worker must refuse a continuation it cannot serve.
+
+| Side | Rule |
+| --- | --- |
+| Engine (`StagePool`) | The first request binds the session to a replica; a follow-up routes to the holder. `session_replica_id(allow_cold=False)` refuses a continuation whose holder is gone. A holder that disappears is recorded (`is_session_stale`) so a cold restart is never reported as a continuation. The binding table is bounded (`MAX_SESSION_BINDINGS`); eviction only costs stickiness. A caller pin that contradicts the holder is refused, so a pin and a session binding cannot become two ledgers. |
+| Worker (`CausVidWan` + `NoisyKVState`) | A continuation whose prior cells are not resident fails closed (`missing owned prior cells`), so a request served by the wrong replica cannot read another session's state. |
+
+Capacity is the other half of the same contract. The pool states both halves of
+its own geometry -- `session_usage` (what one key holds) and the `session_grant_*`
+pair (the widest window one session may occupy) -- and the runner installs a
+ledger over the bytes the pool reserved when it builds the pool. A request that
+keeps history is admitted before bind (one window, charged once; a reset returns
+the old window first), after the forward the worker reports every key
+(`CapacityUsage`: versions and bytes) and an overcommit fails the request closed,
+and `release_noisy_kv` returns the grant, so reset, close, and a failed forward
+all leave the budget where they found it. Because the ledger lives in the worker
+that holds the storage, a replica that dies takes its grants with it.
+
+| Case | Level | Passes when | Status |
+| --- | --- | --- | --- |
+| Session follow-up placement | CPU | a follow-up reaches the holder; a dead holder is recorded, not silently rebound | measured |
+| Capacity admission | CPU | a session the pool cannot hold is refused before a version is written; reset, close, and a failed forward return the grant | measured |
+| Continuation refused on a lost holder | CPU | `allow_cold=False` refuses it | measured |
+| Pin vs session binding | CPU | a contradicting pin is refused; a matching pin keeps both in step | measured |
+| Capacity overcommit | CPU | a report above the grant fails the request closed | measured |
+| Two-replica session affinity | 2 GPU | the follow-up continues on the replica that holds it; a lost owner is not reported as a continuation | measured |
+| Cold-path parity vs baseline | GPU | the cold path keeps the recorded baseline md5 (2% cadence/memory budget) | **target** |
+
 ## Open issues
 
 - Paged session vs NoisyKV still separate prealloc; no TP × Noisy PP yet.
-- Multi-session NoisyKV pool admission / bounded eviction (single-session is the
-  current contract).
+- Multi-session NoisyKV admission is bounded by the pool's own budget, but there is
+  no eviction policy: a full pool refuses a new session instead of reclaiming an
+  idle one. How the CPU-side service reservation hands a budget down to a replica
+  is still open.
 - Micro-batch packing (`R`): varlen vs pad.
 - Plan with `K>1` multiplies ticks; activation inbox is keyed by
   `(chunk, step)` (R=1 friendly).

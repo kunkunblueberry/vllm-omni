@@ -14,7 +14,6 @@ from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan impor
     Cell,
     CellPlan,
     Inflight,
-    Ordering,
     RequestKVTransfer,
     union_transfers,
     union_wait_ready,
@@ -210,12 +209,7 @@ class NoisyKVState:
         spec = self.cache.spec
         pool = self.cache.pool
         h = spec.max_history_chunks
-        sink = int(
-            any(
-                plan.schedule.ordering is Ordering.SAME_STEP and plan.schedule.chunks > 1
-                for plan in self._plans.values()
-            )
-        )
+        sink = int(any(plan.schedule.same_step_has_sink for plan in self._plans.values()))
         width = (h + 1 + sink) * pool.chunk_blocks
         max_seq_len = (h + 1 + sink) * spec.max_chunk_tokens
         max_query_len = self.cache.max_batch_size * spec.max_chunk_tokens

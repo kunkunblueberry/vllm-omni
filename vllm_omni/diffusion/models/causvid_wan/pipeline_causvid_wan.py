@@ -373,7 +373,7 @@ class CausVidWanPipeline(nn.Module):
         length = int(mask.gt(0).sum().item())
         return torch.cat([hidden[:, :length], hidden.new_zeros(1, max_length - length, hidden.shape[2])], dim=1)
 
-    def _plan_for(self, req: OmniDiffusionRequest, *, chunk_base: int = 0):
+    def _plan_for(self, req: OmniDiffusionRequest, *, chunk_base: int = 0, same_step_session: bool = False):
         sp = req.sampling_params
         extra = dict(sp.extra_args or {}) if sp is not None else {}
         if "shift" not in extra:
@@ -460,6 +460,7 @@ class CausVidWanPipeline(nn.Module):
             blocks=num_blocks if num_blocks > 0 else None,
             blocks_per_rank=local_blocks if local_blocks > 0 else None,
             chunk_base=chunk_base,
+            same_step_session=same_step_session,
         )
         # Logical prior (not local residency) drives plan sources + cross-rank handoffs.
         prior = expected_prior_cells(schedule)
@@ -601,7 +602,7 @@ class CausVidWanPipeline(nn.Module):
         chunk_base = int(extra_peek.get("chunk_base", 0) or 0)
         if chunk_base < 0:
             raise ValueError(f"chunk_base must be non-negative, got {chunk_base}")
-        plan, extra, denoise = self._plan_for(req, chunk_base=chunk_base)
+        plan, extra, denoise = self._plan_for(req, chunk_base=chunk_base, same_step_session=persist)
         schedule = plan.schedule
         if persist:
             ctx.kv.cache.bind_session_structure(kv_id, schedule.structural_key())

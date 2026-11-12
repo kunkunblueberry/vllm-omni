@@ -287,7 +287,8 @@ def test_the_runner_reports_worker_usage_after_a_batch() -> None:
     assert ledger.overcommit("s1") is None
 
 
-def test_a_worker_overcommit_fails_the_request_and_drops_its_history() -> None:
+def test_a_worker_overcommit_raises_and_leaves_teardown_to_the_caller() -> None:
+    """The report fails the call; dropping history and the grant is teardown's job."""
     runner = _runner(SessionCapacityLedger(budget_bytes=10**9))
     cache = runner.noisy_kv_cache
     cache.pool.alloc(("s1", 0, 1, 0))
@@ -299,7 +300,29 @@ def test_a_worker_overcommit_fails_the_request_and_drops_its_history() -> None:
         runner._report_session_capacity("s1")
 
     assert runner._capacity_ledger.overcommit("s1") == CapacityUsage(versions=2, bytes=2 * cache.bytes_per_version)
+    assert cache.session_usage("s1") != (0, 0), "the report path must not release storage"
+
+
+def test_overcommit_teardown_returns_the_grant_and_keeps_the_diagnosis() -> None:
+    """One teardown contract settles history, grant and diagnosis together."""
+    ledger = SessionCapacityLedger(budget_bytes=10**9)
+    runner = _runner(ledger)
+    cache = runner.noisy_kv_cache
+    cache.pool.alloc(("s1", 0, 1, 0))
+    cache.pool.alloc(("s1", 1, 1, 0))
+    cache.pool.alloc(("s2", 0, 1, 0))
+    ledger.reserve("s1", CapacityDemand(versions=1, bytes=cache.bytes_per_version))
+    with pytest.raises(ReservationOvercommitError):
+        runner._report_session_capacity("s1")
+    overcommit = ledger.overcommit("s1")
+    assert overcommit is not None
+
+    runner.release_noisy_kv("s1", keep_diagnostics=True)
+
     assert cache.session_usage("s1") == (0, 0), "an overcommitted session kept its history"
+    assert ledger.grant("s1") is None, "the grant was not returned"
+    assert ledger.used_bytes() == 0, "the budget stayed charged to a released session"
+    assert ledger.overcommit("s1") == overcommit, "the overcommit diagnosis was lost"
     assert cache.pool.has(("s2", 0, 1, 0)), "another session's history was dropped"
 
 
@@ -339,7 +362,7 @@ def test_releasing_a_reserved_key_reports_the_truth_then_returns_the_grant() -> 
     assert ledger.free_bytes() == 10**9, "a released key stranded the budget it held"
 
 
-def test_a_batch_wave_reports_each_retained_session(monkeypatch) -> None:
+def test_a_batch_wave_fails_closed_and_returns_every_grant(monkeypatch) -> None:
     from vllm_omni.diffusion.worker import diffusion_model_runner as dmr
 
     ledger = SessionCapacityLedger(budget_bytes=10**9)
@@ -368,10 +391,13 @@ def test_a_batch_wave_reports_each_retained_session(monkeypatch) -> None:
     with pytest.raises(ReservationOvercommitError):
         runner.execute_model_batch(wave, od_config=SimpleNamespace())
 
-    # s1 fit its grant and was reconciled; s2 held two versions on a one-version grant.
-    assert ledger.usage("s1") == CapacityUsage(versions=1, bytes=cache.bytes_per_version)
-    assert ledger.overcommit("s2") is not None
-    assert cache.pool.has(("s1", 0, 1, 0))
+    # The wave fails closed as a whole: every key of this call is torn down and
+    # every grant returns, so one session's overcommit cannot strand capacity.
+    assert ledger.usage("s1") is None, "a failed wave kept a half-settled session"
+    assert ledger.grant("s1") is None and ledger.grant("s2") is None
+    assert ledger.used_bytes() == 0, "a failed wave stranded its grants"
+    assert ledger.overcommit("s2") is not None, "the overcommit diagnosis was lost"
+    assert cache.session_usage("s1") == (0, 0)
     assert cache.session_usage("s2") == (0, 0)
 
 

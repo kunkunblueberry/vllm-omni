@@ -599,11 +599,10 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 versions,
             )
             if fail_closed:
-                # Fail closed means the retained history goes too, or the next
-                # continuation would keep running on the unreserved capacity. The
-                # ledger keeps the record of what the session claimed, so the
-                # failure is visible after the history is gone.
-                NoisyKVState(self.noisy_kv_cache).release_session(kv_id)
+                # Fail closed: the caller's teardown (``release_noisy_kv``) drops the
+                # retained history *and* returns the grant. Releasing storage here
+                # would split one lifecycle across two paths and leave the grant
+                # charged to a session whose history is already gone.
                 raise
 
     def _report_noisy_kv_capacity(self, entries: Sequence[tuple[str, bool, bool, bool]]) -> None:
@@ -625,22 +624,27 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         if overcommit is not None:
             raise overcommit
 
-    def release_noisy_kv(self, kv_id: str) -> None:
+    def release_noisy_kv(self, kv_id: str, *, keep_diagnostics: bool = False) -> None:
         """Drop retained Noisy PP versions for ``kv_id`` (outer session reset/close).
 
         This is where a session's capacity comes back: the history is reported as
         empty first, so the ledger records the truth before it is forgotten, and
-        the grant is then returned. A reset, a close, and a failed forward therefore
-        all leave the budget where they found it.
+        the grant is then returned. A reset, a close, a failed forward and an
+        overcommit therefore all leave the budget where they found it.
         """
         if self.noisy_kv_cache is None:
             return
+        ledger = getattr(self, "_capacity_ledger", None)
+        # Capture the overcommit evidence before the empty report clears it: the
+        # grant goes back, the record of what the session claimed does not.
+        overcommit = ledger.overcommit(kv_id) if ledger is not None else None
         NoisyKVState(self.noisy_kv_cache).release_session(kv_id)
         # Report the empty holding so the ledger never drifts from the worker.
         self._report_session_capacity(kv_id, fail_closed=False)
-        ledger = getattr(self, "_capacity_ledger", None)
         if ledger is not None:
             ledger.release(kv_id)
+            if keep_diagnostics and overcommit is not None:
+                ledger.record_overcommit(kv_id, overcommit)
         logger.debug("AR-Diffusion released noisy KV id=%s", kv_id)
 
     def _bound_noisy_kv(self) -> AbstractContextManager[None]:
@@ -710,7 +714,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         """Release pool keys after success or on failure (same rules as ``execute_model``)."""
         if fail_closed:
             for kv_id in dict.fromkeys(kv_id for kv_id, *_ in entries if kv_id):
-                self.release_noisy_kv(kv_id)
+                self.release_noisy_kv(kv_id, keep_diagnostics=True)
             return
         for kv_id, persist, _reset, close_session in entries:
             if kv_id and (close_session or not persist):
@@ -732,6 +736,10 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                     output = super().execute_model(
                         req, kv_prefetch_job=kv_prefetch_job, diffusion_kv_metadata=diffusion_kv_metadata
                     )
+                # Worker half of the reservation loop, inside the protected region:
+                # an overcommit raise must take the same teardown path as a forward
+                # failure, or the grant stays charged to a session with no history.
+                self._report_noisy_kv_capacity(entries)
             except Exception:
                 self._finalize_noisy_kv_lifecycles(entries, fail_closed=True)
                 logger.warning(
@@ -741,7 +749,6 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 raise
             # Worker half of the reservation loop, before the drop below reports
             # the empty holding.
-            self._report_noisy_kv_capacity(entries)
             # Ephemeral requests and explicit close drop the pool key; a
             # persistent session_id leaves retained history for the outer owner.
             self._finalize_noisy_kv_lifecycles(entries, fail_closed=False)
@@ -792,6 +799,10 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             try:
                 with self._bound_noisy_kv():
                     output = super().execute_model_batch(scheduler_output, od_config)
+                # Worker half of the reservation loop, inside the protected region:
+                # an overcommit raise must take the same teardown path as a forward
+                # failure, or the grant stays charged to a session with no history.
+                self._report_noisy_kv_capacity(entries)
             except Exception:
                 self._finalize_noisy_kv_lifecycles(entries, fail_closed=True)
                 logger.warning(
@@ -799,7 +810,6 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                     list(dict.fromkeys(kv_id for kv_id, *_ in entries if kv_id)),
                 )
                 raise
-            self._report_noisy_kv_capacity(entries)
             self._finalize_noisy_kv_lifecycles(entries, fail_closed=False)
             return output
         raise RuntimeError(

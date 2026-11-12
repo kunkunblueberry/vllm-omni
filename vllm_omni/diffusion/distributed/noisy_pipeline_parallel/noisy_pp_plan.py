@@ -87,6 +87,17 @@ class CellSchedule:
     blocks_per_rank: int | None = None
     #: Absolute chunk index of the first scheduled chunk (session continuation).
     chunk_base: int = 0
+    #: Whether a one-chunk Same-Step request must publish chunk 0's clean sink
+    #: for a persistent session. A single-chunk one-shot request keeps the
+    #: original no-sink schedule.
+    same_step_session: bool = False
+
+    @property
+    def same_step_has_sink(self) -> bool:
+        """Whether this plan reads or produces the Same-Step clean sink."""
+        return self.ordering is Ordering.SAME_STEP and (
+            self.chunk_base > 0 or self.chunks > 1 or self.same_step_session
+        )
 
     def __post_init__(self) -> None:
         if self.chunks < 1:
@@ -161,7 +172,7 @@ class CellSchedule:
     @property
     def num_schedule_steps(self) -> int:
         """Step-ID bound; with a Same-Step sink, only chunk 0 uses step ``D``."""
-        return self.num_denoise_steps + int(self.ordering is not Ordering.SAME_STEP or self.chunks > 1)
+        return self.num_denoise_steps + int(self.ordering is not Ordering.SAME_STEP or self.same_step_has_sink)
 
 
 @dataclass(frozen=True)
@@ -407,7 +418,8 @@ def expected_prior_cells(schedule: CellSchedule) -> frozenset[Cell]:
                 for step in range(schedule.num_denoise_steps)
                 for block in range(num_blocks)
             }
-        cells |= {(0, t_clean, block) for block in range(num_blocks)}
+        if schedule.same_step_has_sink:
+            cells |= {(0, t_clean, block) for block in range(num_blocks)}
         return frozenset(cells)
     if h >= 1:
         cells |= {(chunk, t_clean, block) for chunk in range(start, schedule.chunk_base) for block in range(num_blocks)}
@@ -609,7 +621,7 @@ def _cell_slots(schedule: CellSchedule) -> tuple[tuple[Cell | None, ...], ...]:
             # Continuation: only noisy steps; clean sink lives in prior history at chunk 0.
             return _offset_chunk_ids(_base_cell_slots(schedule), schedule.chunk_base)
         head = _base_cell_slots(replace(schedule, chunks=1))
-        if schedule.chunks == 1:
+        if schedule.chunks == 1 and not schedule.same_step_session:
             return head
         # One clean pass, on the final noisy replica; never allocate a clean
         # replica or run clean forwards for subsequent chunks.
@@ -618,6 +630,8 @@ def _cell_slots(schedule: CellSchedule) -> tuple[tuple[Cell | None, ...], ...]:
             row: list[Cell | None] = [None] * (schedule.step_replicas * schedule.layer_groups)
             row[rank_of_block(schedule.num_denoise_steps, block, schedule)] = (0, schedule.num_denoise_steps, block)
             clean.append(tuple(row))
+        if schedule.chunks == 1:
+            return (*head, *clean)
         tail = _base_cell_slots(replace(schedule, chunks=schedule.chunks - 1))
         shifted = tuple(
             tuple(None if cell is None else (cell[0] + 1, cell[1], cell[2]) for cell in row) for row in tail

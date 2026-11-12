@@ -177,6 +177,15 @@ class SessionCapacityLedger:
         """The overcommitted usage that failed this session, if any."""
         return self._overcommit.get(session_id)
 
+    def record_overcommit(self, session_id: str, usage: CapacityUsage) -> None:
+        """Keep the evidence of an overcommit after its grant has been returned.
+
+        ``release`` clears the accounting so the capacity can be reused; this
+        re-instates only the diagnosis, so the failed session stays observable
+        without holding budget against the pool.
+        """
+        self._overcommit[session_id] = usage
+
     def release(self, session_id: str) -> int:
         """Give a session's holding back (reset, close, or a dead replica)."""
         released = self._held.pop(session_id, 0)
