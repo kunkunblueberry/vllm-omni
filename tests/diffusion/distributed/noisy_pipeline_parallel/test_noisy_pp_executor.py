@@ -553,6 +553,7 @@ def test_activation_edges_only_send_boundary_members():
             t0=0,
             plan=SimpleNamespace(
                 schedule=schedule,
+                num_slots=1,
                 task=lambda _slot, rank: cell if rank == 0 else None,
             ),
         )
