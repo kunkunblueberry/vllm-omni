@@ -926,7 +926,7 @@ class StagePool:
         while len(self._session_bindings) > MAX_SESSION_BINDINGS:
             evicted = next(iter(self._session_bindings))
             self._session_bindings.pop(evicted, None)
-            self._session_router.release(evicted)
+            self._session_router.evict(evicted)
 
     def session_replica_id(self, session_id: str, *, allow_cold: bool = True) -> int | None:
         """Replica that holds *session_id*, if it is still serviceable.
@@ -938,6 +938,16 @@ class StagePool:
         """
         replica_id = self._session_bindings.get(session_id)
         if replica_id is None:
+            if not self._session_router.is_stale(session_id):
+                return None
+            # The binding was dropped for capacity or its replica died, so the
+            # history is unreachable. Treat the continuation as a cold restart
+            # instead of mistaking it for a session that was never bound.
+            if not allow_cold:
+                raise StageUnavailableError(
+                    f"stage {self.stage_id} session {session_id!r} lost the replica holding its "
+                    "history; pass allow_cold to restart it cold"
+                )
             return None
         if self.is_replica_available(replica_id):
             return replica_id

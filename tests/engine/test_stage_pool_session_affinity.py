@@ -166,6 +166,26 @@ def test_an_active_session_outlives_newer_idle_ones(mocker, monkeypatch):
     assert pool.session_binding_count() == 2
 
 
+def test_an_evicted_session_is_not_silently_rebound(mocker, monkeypatch):
+    """Capacity eviction must not turn a refused continuation into a cold restart."""
+    from vllm_omni.engine import stage_pool
+    from vllm_omni.engine.stage_pool import StageUnavailableError
+
+    monkeypatch.setattr(stage_pool, "MAX_SESSION_BINDINGS", 1)
+    pool = _pool(mocker)
+    pool.bind_session_replica("s1", 1)
+
+    pool.bind_session_replica("s2", 0)
+
+    assert pool.session_binding_count() == 1
+    assert pool.is_session_stale("s1") is True, "eviction forgot the session lost its history"
+    # The KV still sits on replica 1, so a continuation must not be allowed to
+    # start cold just because the routing entry was evicted for capacity.
+    with pytest.raises(StageUnavailableError, match="lost the replica holding its history"):
+        pool.session_replica_id("s1", allow_cold=False)
+    assert pool.session_replica_id("s1") is None, "an evicted session still claims a replica"
+
+
 def test_the_session_identity_is_read_from_the_request_params():
     class _Params:
         extra_args = {"session_id": "s1"}
