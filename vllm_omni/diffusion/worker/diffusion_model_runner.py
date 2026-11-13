@@ -55,6 +55,7 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionMetadata,
     DiffusionPagedAttentionRow,
 )
+from vllm_omni.diffusion.distributed.member_batch import BatchMember, ExecutionBatch
 from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_rank
 from vllm_omni.diffusion.forward_context import bind_attention_schedule, set_forward_context
 from vllm_omni.diffusion.graph import warn_if_denoise_graph_unsupported
@@ -1549,6 +1550,23 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 self.remove_diffusion_kv_requests(installed_request_ids)
             raise
 
+    def _step_execution_batch(self, states: Sequence[StepRequestState]) -> ExecutionBatch:
+        """Describe independent step members before packing model-specific tensors."""
+        members = []
+        for state in states:
+            if state.latents is None:
+                raise RuntimeError(f"Stepwise request {state.request_id} has no latent state.")
+            members.append(
+                BatchMember(
+                    request_id=state.request_id,
+                    position=(state.chunk_index, state.step_in_chunk, state.step_index),
+                    inputs=state,
+                    kv_view=None,
+                    rows=int(state.latents.shape[0]),
+                )
+            )
+        return ExecutionBatch(tuple(members))
+
     def _execute_stepwise_core(
         self,
         scheduler_output: DiffusionSchedulerOutput,
@@ -1593,6 +1611,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
             ):
                 clear_pipeline_stage_durations(pipeline)
+                execution_batch = self._step_execution_batch(states)
+                input_batch.execution_batch = execution_batch
                 with _attention_schedule_scope(attention_schedule, sigma_schedule):
                     driver = getattr(pipeline, "mixfusion_driver", None)
                     if getattr(input_batch, "use_mixfusion", False) and driver is None:
@@ -1629,11 +1649,14 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                         )
 
                 else:
-                    offset = 0
+                    member_outputs = (
+                        execution_batch.split_rows(noise_pred)
+                        if noise_pred is not None and not isinstance(noise_pred, list)
+                        else None
+                    )
                     for req_idx, req in enumerate(states):
                         if req.latents is None:
                             raise RuntimeError(f"Stepwise request {req.request_id} has no latent state.")
-                        row_num = req.latents.shape[0]
                         try:
                             if sample_results is not None:
                                 error = sample_results[req.request_id]
@@ -1644,7 +1667,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                     req_noise_pred = noise_pred[req_idx] if noise_pred is not None else None
                                 else:
                                     req_noise_pred = (
-                                        noise_pred[offset : offset + row_num] if noise_pred is not None else None
+                                        member_outputs[req.request_id] if member_outputs is not None else None
                                     )
                                 pipeline.step_scheduler(req, req_noise_pred)
                             if self.od_config.streaming_output:
@@ -1696,9 +1719,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                     streaming_next_media_duration=streaming_next_media_duration,
                                 )
                             )
-                            offset = offset + row_num
                         except Exception as per_req_exc:
-                            offset = offset + row_num
                             self.state_cache.pop(req.request_id, None)
                             logger.error(
                                 "Stepwise per-request error for %s: %s",
@@ -1721,12 +1742,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                             raise ValueError(
                                 f"Stepwise noise_pred list has {len(noise_pred)} entries, expected {expected}."
                             )
-                    elif noise_pred is not None and offset != noise_pred.shape[0]:
-                        raise ValueError(
-                            f"Stepwise noise_pred consumed {offset} rows, "
-                            f"but batched noise_pred has {noise_pred.shape[0]} rows."
-                        )
-
+                    # Tensor rows are validated by ``split_rows`` above.
                 if is_primary and record_output_peak_memory:
                     batch_peak_memory_mb = self._sample_peak_memory_mb()
                     states_by_id = {state.request_id: state for state in states}
