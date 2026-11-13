@@ -90,6 +90,18 @@ class SessionRouter:
         self._owners.pop(session_id, None)
         self._stale.pop(session_id, None)
 
+    def evict(self, session_id: str) -> int | None:
+        """Drop a binding for capacity, remembering that the session lost its holder.
+
+        Eviction is not a release: the session may be continued later, and
+        forgetting that it ever had a holder would silently restart it cold on
+        another replica. ``_stale`` keeps that fact so callers decide explicitly.
+        """
+        owner = self._owners.pop(session_id, None)
+        if owner is not None:
+            self._stale[session_id] = owner
+        return owner
+
     def release_replica(self, replica_id: int) -> list[str]:
         """Forget every session bound to a replica that went away."""
         dropped = [sid for sid, owner in self._owners.items() if owner == replica_id]
