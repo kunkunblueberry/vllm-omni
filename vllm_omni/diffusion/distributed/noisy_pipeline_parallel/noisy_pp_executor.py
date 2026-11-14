@@ -292,6 +292,8 @@ class SupportsNoisyPPKV(Protocol):
 
     def set_inflight(self, inflight: Sequence[Inflight]) -> None: ...
 
+    def finish_request(self, owner: str) -> None: ...
+
     def end_request(self, req: str, *, retain: Collection[Cell] | None = None) -> None: ...
 
     def chunk_tokens(self, req: str) -> int: ...
@@ -737,7 +739,7 @@ def run_cell_pipeline(
                 if local + 1 < item.plan.num_slots:
                     still.append(item)
                 else:
-                    kv.end_request(item.req)
+                    kv.finish_request(item.req)
                     pending_hidden.pop(item.req, None)
             ctx.inflight = still
             kv.set_inflight(tuple(ctx.inflight))
