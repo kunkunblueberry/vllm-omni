@@ -87,6 +87,11 @@ class _FakeTransformer:
         return 2
 
 
+def _failing_forward(*_args, **_kwargs):
+    """Transformer forward stand-in that fails the shared tick."""
+    raise RuntimeError("fused forward failure")
+
+
 def _member(
     tf,
     *,
@@ -296,3 +301,27 @@ def test_wan_cell_mid_group_uses_per_member_hidden_inputs():
     assert tf.last_latent is not None and tf.last_latent.shape[0] == 2
     assert torch.allclose(tf.last_latent[0], torch.full((4, 1, 2, 2), 1.0))
     assert torch.allclose(tf.last_latent[1], torch.full((4, 1, 2, 2), 2.0))
+
+
+@pytest.mark.parametrize("fail_attr", ["block", "unembed"])
+def test_failed_fused_tick_leaves_every_member_untouched(monkeypatch, fail_attr):
+    """A raising shared forward must not advance any member's state.
+
+    The executor publishes KV only after a successful forward, so a partially
+    applied tick would leave the pool claiming writes that never happened.
+    """
+    tf = _FakeTransformer()
+    a = _member(tf, seed=1, prompt=torch.ones(1, 3, 4))
+    b = _member(tf, seed=2, prompt=torch.ones(1, 3, 4) * 2)
+    members = {"A": a, "B": b}
+    tasks = [("A", (0, 0, 0)), ("B", (0, 0, 0))]
+    kvs = [object(), object()]
+
+    monkeypatch.setattr(tf, fail_attr, _failing_forward)
+    with pytest.raises(RuntimeError, match="fused forward failure"):
+        _run_batches(members, tasks, kvs, max_batch_size=2)
+
+    for req in ("A", "B"):
+        assert members[req].finished == {}, req
+        # The live map may be pre-created per member, but no chunk may advance.
+        assert members[req]._live.get(req, {}) == {}, req

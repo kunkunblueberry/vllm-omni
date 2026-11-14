@@ -16,8 +16,6 @@ from vllm_omni.diffusion.models.causvid_wan.async_stream_decode import (
     _start_local,
 )
 from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import CausVidWanPipeline
-from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -102,41 +100,6 @@ def test_local_cancel_stops_consumer_without_join(monkeypatch):
     # A missed stop sentinel would leave the consumer blocked past cancel's 5s join.
     assert not consumers[0].is_alive()
     assert decoder.chunks <= 1
-
-
-def test_pipeline_forward_cancels_stream_job_when_cell_compute_fails(monkeypatch):
-    """Creating a stream job then failing in the cell loop must cancel the job."""
-    from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
-
-    pipeline = CausVidWanPipeline.__new__(CausVidWanPipeline)
-    pipeline._chunk_ctx = SimpleNamespace()
-    cancelled: list[bool] = []
-    job = SimpleNamespace(cancel=lambda: cancelled.append(True))
-    # forward() requires a WanCell adapter; fields are unused when compute is mocked.
-    adapter = WanCell.__new__(WanCell)
-
-    monkeypatch.setattr(
-        pipeline,
-        "admit_cell_request",
-        lambda _req, **_kwargs: (adapter, "kv-1", False, job),
-    )
-
-    def _boom_cell(**_kwargs):
-        raise RuntimeError("compute boom")
-
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan.run_cell_pipeline",
-        _boom_cell,
-    )
-
-    req = OmniDiffusionRequest(
-        prompt="x",
-        request_id="stream-fail",
-        sampling_params=OmniDiffusionSamplingParams(extra_args={"stream_decode": True}),
-    )
-    with pytest.raises(RuntimeError, match="compute boom"):
-        pipeline.forward(req)
-    assert cancelled == [True]
 
 
 def test_stream_decode_cancelled_if_wancell_fails(monkeypatch):
